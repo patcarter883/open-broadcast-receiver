@@ -70,7 +70,7 @@ ExternalProject_Add(project_rist
         GIT_TAG origin/master
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rist
         BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/rist-build
-        BUILD_COMMAND mkdir -p ${CMAKE_CURRENT_BINARY_DIR}/rist-build COMMAND cd ${CMAKE_CURRENT_BINARY_DIR}/rist-build COMMAND meson -Dbuiltin_mbedtls=true -Dbuiltin_cjson=true -Dbuiltin_lz4=true --default-library=static ${CMAKE_CURRENT_SOURCE_DIR}/rist COMMAND ninja
+        BUILD_COMMAND mkdir -p ${CMAKE_CURRENT_BINARY_DIR}/rist-build COMMAND cd ${CMAKE_CURRENT_BINARY_DIR}/rist-build COMMAND meson -Dbuiltin_mbedtls=true -Dbuiltin_cjson=true -Dbuiltin_lz4=true --default-library=static -Dc_args=-Wno-overlength-strings ${CMAKE_CURRENT_SOURCE_DIR}/rist COMMAND ninja
         GIT_PROGRESS 1
         STEP_TARGETS build
         EXCLUDE_FROM_ALL TRUE

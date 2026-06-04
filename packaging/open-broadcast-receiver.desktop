@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=open-broadcast-receiver
+Exec=open-broadcast-receiver
+Icon=open-broadcast-receiver
+Categories=AudioVideo;Network;

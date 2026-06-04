@@ -41,6 +41,12 @@ auto print_usage(const char* argv0) -> void
       << "  --bind <host>           HTTP bind address (default 0.0.0.0)\n"
       << "  --token <secret>        Bearer token for the control API\n"
       << "                          (empty => DEV no-auth mode; not for production)\n"
+      << "  --buffer-min <ms>       RIST recovery buffer floor (default 1000)\n"
+      << "  --buffer-max <ms>       RIST recovery buffer ceiling (default 5000)\n"
+      << "  --rtt-min <ms>          RIST recovery RTT min (default 40)\n"
+      << "  --rtt-max <ms>          RIST recovery RTT max (default 500)\n"
+      << "  --reorder-buffer <ms>   RIST reorder hold-off (default 30; keep well\n"
+      << "                          below buffer-min or retransmission is starved)\n"
       << "  --help                  Show this help\n\n"
       << "All stream control (start/stop/status) is performed over the HTTP\n"
       << "control API by open-broadcast-encoder. See docs/CONTRACT.md.\n";
@@ -69,6 +75,13 @@ auto main(int argc, char** argv) -> int
   int rist_port = k_default_rist_port;
   std::string bind_host = "0.0.0.0";
   std::string token;
+  // RIST recovery tuning (ms). Operator-authoritative over the /start body's
+  // ingest block, like --rist-port. Defaults come from receiver_defaults.
+  int buffer_min = receiver_defaults::buffer_min_ms;
+  int buffer_max = receiver_defaults::buffer_max_ms;
+  int rtt_min = receiver_defaults::rtt_min_ms;
+  int rtt_max = receiver_defaults::rtt_max_ms;
+  int reorder_buffer = receiver_defaults::reorder_buffer_ms;
 
   for (int idx = 1; idx < argc; ++idx) {
     const std::string_view arg = argv[idx];
@@ -104,6 +117,26 @@ auto main(int argc, char** argv) -> int
         return 2;
       }
       token = argv[++idx];
+    } else if (arg == "--buffer-min") {
+      if (!next(buffer_min)) {
+        return 2;
+      }
+    } else if (arg == "--buffer-max") {
+      if (!next(buffer_max)) {
+        return 2;
+      }
+    } else if (arg == "--rtt-min") {
+      if (!next(rtt_min)) {
+        return 2;
+      }
+    } else if (arg == "--rtt-max") {
+      if (!next(rtt_max)) {
+        return 2;
+      }
+    } else if (arg == "--reorder-buffer") {
+      if (!next(reorder_buffer)) {
+        return 2;
+      }
     } else {
       std::cerr << "Unknown argument: " << arg << "\n";
       print_usage(argv[0]);
@@ -131,19 +164,24 @@ auto main(int argc, char** argv) -> int
 
   control.set_handlers(
       // --- start ---
-      [&ctx, &lifecycle, rist_port](const receiver_config& body_cfg,
-                                    std::string& err_code,
-                                    std::string& err_msg,
-                                    int& http_status) -> bool
+      [&ctx, &lifecycle, rist_port, buffer_min, buffer_max, rtt_min, rtt_max,
+       reorder_buffer](const receiver_config& body_cfg,
+                       std::string& err_code,
+                       std::string& err_msg,
+                       int& http_status) -> bool
       {
         std::lock_guard<std::mutex> life(lifecycle);
 
-        // The operator-chosen --rist-port is authoritative for the listen
-        // socket; the body's ingest carries the recovery tuning. (DECISIONS
-        // open question #2.) Apply it up front so idempotency compares the
-        // *effective* config.
+        // The operator-chosen --rist-port and recovery flags are authoritative
+        // for the listen socket and retransmission window. Apply up front so
+        // idempotency compares the *effective* config.
         receiver_config cfg = body_cfg;
         cfg.ingest.rist_listen = std::format("rist://@[::]:{}", rist_port);
+        cfg.ingest.buffer_min = buffer_min;
+        cfg.ingest.buffer_max = buffer_max;
+        cfg.ingest.rtt_min = rtt_min;
+        cfg.ingest.rtt_max = rtt_max;
+        cfg.ingest.reorder_buffer = reorder_buffer;
 
         if (ctx.state.is_running.load(std::memory_order_acquire)) {
           std::string current_session;

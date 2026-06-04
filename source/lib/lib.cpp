@@ -262,6 +262,23 @@ auto to_string(codec cod) noexcept -> const char*
   return "h264";
 }
 
+auto to_string(audio_codec cod) noexcept -> const char*
+{
+  switch (cod) {
+    case audio_codec::aac:
+      return "aac";
+    case audio_codec::opus:
+      return "opus";
+    case audio_codec::ac3:
+      return "ac3";
+    case audio_codec::eac3:
+      return "eac3";
+    case audio_codec::mp2:
+      return "mp2";
+  }
+  return "aac";
+}
+
 auto to_string(encoder enc) noexcept -> const char*
 {
   switch (enc) {

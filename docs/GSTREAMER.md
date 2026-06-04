@@ -67,12 +67,16 @@ Notes:
 
 ## 2. Video copy (passthrough) chain — ends at `vtee`
 
-Parser is chosen from `source.codec` (deterministic, no decodebin in copy mode):
+Parser is chosen from the **detected** input codec, not `source.codec`. The
+receiver first runs a short detection pipeline (`appsrc ! tsparse ! tsdemux` with
+fakesinks) and reads the codec off the tsdemux pad caps before building the real
+pipeline; `source.codec` is only a fallback if detection times out
+(`restream::start_detection` / `finish_detection_and_launch`).
 
 ```
-demux. ! h264parse ! tee name=vtee       # source.codec == h264
-demux. ! h265parse ! tee name=vtee       # source.codec == h265
-demux. ! av1parse  ! tee name=vtee       # source.codec == av1
+demux. ! h264parse ! tee name=vtee       # detected video/x-h264
+demux. ! h265parse ! tee name=vtee       # detected video/x-h265
+demux. ! av1parse  ! tee name=vtee       # detected video/x-av1
 ```
 Optionally insert `queue silent=true` between `demux.` and the parse for buffering.
 
@@ -86,10 +90,22 @@ those post-tee parsers to re-insert SPS/PPS/VPS for mid-stream joiners.
 
 ## 3. Audio copy chain — ends at `atee`
 
-Codec-independent (the encoder always emits AAC):
+The input audio codec is also **detected** from the tsdemux pad caps. The encoder
+emits AAC today, so AAC is the common case and passes straight through
+(`aacparse`):
 ```
 demux. ! aacparse ! tee name=atee
 # or: demux. ! queue silent=true ! aacparse ! tee name=atee
+```
+The output audio codec is always AAC (RTMP/SRT/RIST muxers expect it). A non-AAC
+input (Opus / AC-3 / E-AC-3 / MPEG-1-2 audio) is therefore transcoded to AAC even
+in copy mode — the demux pad caps select the audio pad (`audio_caps`), the parser
+(`audio_parse`) and decoder (`audio_decoder`) match the detected codec, then
+`audioconvert ! audioresample ! avenc_aac` re-encodes:
+```
+demux. ! audio/x-opus  ! ... ! opusparse     ! avdec_opus     ! audioconvert ! audioresample ! avenc_aac ! tee name=atee
+demux. ! audio/x-ac3   ! ... ! ac3parse      ! avdec_ac3      ! audioconvert ! audioresample ! avenc_aac ! tee name=atee
+demux. ! audio/mpeg    ! ... ! mpegaudioparse ! avdec_mp2float ! audioconvert ! audioresample ! avenc_aac ! tee name=atee
 ```
 As with video, **do not** lock `stream-format` before the tee: defer the raw-vs-adts conversion to a per-branch
 `aacparse` after each `atee` src pad (flvmux needs `audio/mpeg,mpegversion=4,stream-format=raw`; mpegtsmux accepts

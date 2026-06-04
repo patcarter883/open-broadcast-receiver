@@ -61,6 +61,10 @@ target_include_directories(open-broadcast-receiver_exe PUBLIC SYSTEM
   ${RIST_INSTALL_DIR}/include/rist-cpp
   ${GSTREAMER_INCLUDE_DIRS})
 
+target_link_options(open-broadcast-receiver_exe PRIVATE -Wl,--as-needed)
+
 target_include_directories(open-broadcast-receiver_exe PUBLIC
   ${CMAKE_CURRENT_LIST_DIR}/source
   ${CMAKE_CURRENT_LIST_DIR}/external)
+
+install(TARGETS open-broadcast-receiver_exe RUNTIME DESTINATION bin)

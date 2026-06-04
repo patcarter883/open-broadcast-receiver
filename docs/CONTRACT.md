@@ -137,7 +137,7 @@ the encoder's `output_config` defaults (lib.h:94-106).
 `source`:
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `codec` | enum codec | `"h264"` | the elementary stream the encoder is sending; selects the receive-side parser/decoder |
+| `codec` | enum codec | `"h264"` | a **hint** of the elementary stream the encoder is sending. The receiver detects the actual video **and** audio codec from the incoming MPEG-TS (tsdemux pad caps) and uses that to select the parser/decoder; `source.codec` is only the fallback if detection times out. The audio codec is never declared — it is always detected (AAC/Opus/AC-3/E-AC-3/MPEG-1-2 audio), and any non-AAC input is transcoded to AAC. |
 
 `outputs[]` (one per destination):
 | Field | Type | Required | Default | Notes |

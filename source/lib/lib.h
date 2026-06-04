@@ -31,6 +31,19 @@ enum class codec : std::uint8_t
   av1
 };
 
+// Audio codecs the receiver can ingest. Unlike `codec` (video), this is NOT
+// part of the control-plane contract: it is *detected* from the incoming
+// MPEG-TS, never declared by the encoder. The output audio codec is always AAC
+// (what RTMP/SRT/RIST muxers expect), so a non-AAC input is transcoded.
+enum class audio_codec : std::uint8_t
+{
+  aac,
+  opus,
+  ac3,
+  eac3,
+  mp2
+};
+
 enum class encoder : std::uint8_t
 {
   amd,
@@ -75,11 +88,15 @@ struct receiver_defaults
   static constexpr int audio_bitrate_kbps = 128;
   static constexpr int latency_ms = 200;
   static constexpr int bandwidth = 6000;
-  static constexpr int buffer_min_ms = 245;
+  // Recovery buffer floor must leave room for several retransmit rounds over a
+  // high-RTT mobile link. The reorder hold-off must be a SMALL fraction of the
+  // buffer (librist default 15 ms) — a large reorder value eats the recovery
+  // window and effectively disables retransmission (no NACKs → unrecovered loss).
+  static constexpr int buffer_min_ms = 1000;
   static constexpr int buffer_max_ms = 5000;
   static constexpr int rtt_min_ms = 40;
   static constexpr int rtt_max_ms = 500;
-  static constexpr int reorder_buffer_ms = 240;
+  static constexpr int reorder_buffer_ms = 30;
 };
 
 // ---------------------------------------------------------------------------
@@ -176,6 +193,7 @@ struct app_context
 // ---------------------------------------------------------------------------
 
 auto to_string(codec cod) noexcept -> const char*;
+auto to_string(audio_codec cod) noexcept -> const char*;
 auto to_string(encoder enc) noexcept -> const char*;
 auto to_string(output_proto proto) noexcept -> const char*;
 
