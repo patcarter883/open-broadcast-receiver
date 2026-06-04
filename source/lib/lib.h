@@ -202,7 +202,7 @@ auto parse_encoder(std::string_view str, encoder& out) noexcept -> bool;
 auto parse_output_proto(std::string_view str, output_proto& out) noexcept -> bool;
 
 // Build the RIST listener URL the receiver hands to initReceiver. Mirrors the
-// encoder's recovery params and appends timing-mode=2. The base (scheme +
+// encoder's recovery params and appends timing-mode=1 (ARRIVAL). The base (scheme +
 // "@host:port") is taken from ingest.rist_listen up to any '?'. Fixes the
 // original ndi-rist-server missing-'&' bug. NOTE: it does NOT append a
 // profile= URL param — librist's URL parser rejects it; the ADVANCED profile

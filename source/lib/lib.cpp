@@ -432,8 +432,15 @@ auto build_listener_url(const ingest_config& ingest) -> std::string
   // rejects it ("Unknown or invalid parameter profile") and fails the whole
   // listener. The profile is set via RISTNetReceiverSettings.mProfile instead.
   return std::format(
+      // timing-mode=1 (ARRIVAL), NOT 2 (RTC): in RTC mode librist drops every
+      // data packet while time_offset==0 (rist-common.c:607), and that offset is
+      // only bootstrapped from an RTCP Sender Report carrying a real NTP source
+      // clock — which this sender does not provide (ts_ntp=0). The result is the
+      // receiver never enqueues packets, so gap detection / NACK never runs and
+      // lost/retransmitted counters stay at 0. ARRIVAL paces on receive time and
+      // bootstraps time_offset from the first packet. Must match the encoder.
       "{}?bandwidth={}&buffer-min={}&buffer-max={}&rtt-min={}&rtt-max={}&"
-      "reorder-buffer={}&timing-mode=2",
+      "reorder-buffer={}&timing-mode=1",
       base,
       ingest.bandwidth,
       ingest.buffer_min,
