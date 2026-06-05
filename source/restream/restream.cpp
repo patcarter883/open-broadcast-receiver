@@ -765,9 +765,10 @@ auto restream::bus_loop() -> void
         gchar* dbg = nullptr;
         gst_message_parse_error(msg, &err, &dbg);
         const std::string text = std::format(
-            "Restream pipeline error from {}: {}",
+            "Restream pipeline error from {}: {}{}",
             GST_OBJECT_NAME(msg->src),
-            err != nullptr ? err->message : "(unknown)");
+            err != nullptr ? err->message : "(unknown)",
+            dbg != nullptr ? std::format(" [{}]", dbg) : "");
         log(text + "\n");
         // Don't surface detection-phase errors as the session error — that
         // pipeline is throwaway and may emit benign not-linked noise.
