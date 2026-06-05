@@ -295,12 +295,17 @@ auto restream::build_pipeline_string(const receiver_config& cfg,
   // clock so the two devices stay time-aligned for the downstream consumer.
   return std::format(
       "{0}"
+      // NB: device values are NOT single-quoted — gst_parse_launch does not
+      // strip single quotes around v4l2sink/alsasink `device=` (the literal
+      // quotes end up in the device name and the open fails). The values are
+      // already validated quote/space-free by is_pipeline_safe (validate_sink),
+      // and contain no gst-special chars, so bare interpolation is safe.
       "demux. ! {1} ! queue ! {2} ! {3} ! {4} ! "
       "queue leaky=downstream max-size-buffers=4 ! "
-      "v4l2sink name=vsink device='{5}' sync=true "
+      "v4l2sink name=vsink device={5} sync=true "
       "demux. ! {6} ! queue ! {7} ! "
       "queue leaky=downstream max-size-time=200000000 ! "
-      "alsasink name=asink device='{8}' sync=true ",
+      "alsasink name=asink device={8} sync=true ",
       k_ts_source,                      // 0
       video_caps(in_video),             // 1
       video_parse(in_video),            // 2
