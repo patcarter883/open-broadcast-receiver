@@ -47,9 +47,18 @@ auto print_usage(const char* argv0) -> void
       << "  --rtt-max <ms>          RIST recovery RTT max (default 500)\n"
       << "  --reorder-buffer <ms>   RIST reorder hold-off (default 30; keep well\n"
       << "                          below buffer-min or retransmission is starved)\n"
+      << "  --v4l2-device <path>    v4l2loopback device for raw video output\n"
+      << "                          (default /dev/video10)\n"
+      << "  --audio-device <dev>    ALSA snd-aloop device for PCM audio output\n"
+      << "                          (default hw:Loopback,0,0)\n"
+      << "  --pixel-format <fmt>    raw video pixel format (default NV12)\n"
+      << "  --no-hw-decode          force software decode (default: prefer\n"
+      << "                          NVDEC/VA/QSV when present)\n"
       << "  --help                  Show this help\n\n"
-      << "All stream control (start/stop/status) is performed over the HTTP\n"
-      << "control API by open-broadcast-encoder. See docs/CONTRACT.md.\n";
+      << "The receiver decodes the incoming RIST stream and writes uncompressed\n"
+      << "video + PCM audio to local loopback devices for a restreaming package\n"
+      << "(e.g. datarhei/restreamer) to encode and restream. Stream control\n"
+      << "(start/stop/status) is over the HTTP API. See docs/CONTRACT.md.\n";
 }
 
 auto parse_port(const char* str, int& out) -> bool
@@ -82,6 +91,12 @@ auto main(int argc, char** argv) -> int
   int rtt_min = receiver_defaults::rtt_min_ms;
   int rtt_max = receiver_defaults::rtt_max_ms;
   int reorder_buffer = receiver_defaults::reorder_buffer_ms;
+  // Raw-handoff sink targets (host infrastructure; see raw_sink_config). The
+  // receiver decodes to these local loopback devices for datarhei/restreamer.
+  std::string v4l2_device = "/dev/video10";
+  std::string audio_device = "hw:Loopback,0,0";
+  std::string pixel_format = "NV12";
+  bool prefer_hw_decode = true;
 
   for (int idx = 1; idx < argc; ++idx) {
     const std::string_view arg = argv[idx];
@@ -137,6 +152,26 @@ auto main(int argc, char** argv) -> int
       if (!next(reorder_buffer)) {
         return 2;
       }
+    } else if (arg == "--v4l2-device") {
+      if (idx + 1 >= argc) {
+        std::cerr << "Missing value for --v4l2-device\n";
+        return 2;
+      }
+      v4l2_device = argv[++idx];
+    } else if (arg == "--audio-device") {
+      if (idx + 1 >= argc) {
+        std::cerr << "Missing value for --audio-device\n";
+        return 2;
+      }
+      audio_device = argv[++idx];
+    } else if (arg == "--pixel-format") {
+      if (idx + 1 >= argc) {
+        std::cerr << "Missing value for --pixel-format\n";
+        return 2;
+      }
+      pixel_format = argv[++idx];
+    } else if (arg == "--no-hw-decode") {
+      prefer_hw_decode = false;
     } else {
       std::cerr << "Unknown argument: " << arg << "\n";
       print_usage(argv[0]);
@@ -165,10 +200,11 @@ auto main(int argc, char** argv) -> int
   control.set_handlers(
       // --- start ---
       [&ctx, &lifecycle, rist_port, buffer_min, buffer_max, rtt_min, rtt_max,
-       reorder_buffer](const receiver_config& body_cfg,
-                       std::string& err_code,
-                       std::string& err_msg,
-                       int& http_status) -> bool
+       reorder_buffer, v4l2_device, audio_device, pixel_format,
+       prefer_hw_decode](const receiver_config& body_cfg,
+                         std::string& err_code,
+                         std::string& err_msg,
+                         int& http_status) -> bool
       {
         std::lock_guard<std::mutex> life(lifecycle);
 
@@ -182,6 +218,12 @@ auto main(int argc, char** argv) -> int
         cfg.ingest.rtt_min = rtt_min;
         cfg.ingest.rtt_max = rtt_max;
         cfg.ingest.reorder_buffer = reorder_buffer;
+        // Raw-sink targets are operator-authoritative (CLI), like --rist-port.
+        // Applied before the idempotency compare so it sees the effective config.
+        cfg.sink.video_device = v4l2_device;
+        cfg.sink.audio_device = audio_device;
+        cfg.sink.pixel_format = pixel_format;
+        cfg.sink.prefer_hw_decode = prefer_hw_decode;
 
         if (ctx.state.is_running.load(std::memory_order_acquire)) {
           std::string current_session;
@@ -279,6 +321,9 @@ auto main(int argc, char** argv) -> int
   std::cout << "open-broadcast-receiver listening: control http://" << bind_host
             << ":" << control_port << "  rist @[::]:" << rist_port
             << (token.empty() ? "  [DEV no-auth]" : "  [token auth]") << "\n";
+  std::cout << "Decoded handoff: video -> " << v4l2_device << " (" << pixel_format
+            << ", " << (prefer_hw_decode ? "hw" : "sw") << " decode)  audio -> "
+            << audio_device << " (PCM)\n";
   std::cout << "Idle until POST /start. Ctrl-C to quit." << std::endl;
 
   int sig = 0;

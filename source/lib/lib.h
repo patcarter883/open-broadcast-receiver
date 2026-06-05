@@ -8,7 +8,6 @@
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <vector>
 
 // Forward declarations of the runtime components owned by app_context. Their
 // full definitions live in their own modules; app_context is only ever
@@ -31,10 +30,9 @@ enum class codec : std::uint8_t
   av1
 };
 
-// Audio codecs the receiver can ingest. Unlike `codec` (video), this is NOT
-// part of the control-plane contract: it is *detected* from the incoming
-// MPEG-TS, never declared by the encoder. The output audio codec is always AAC
-// (what RTMP/SRT/RIST muxers expect), so a non-AAC input is transcoded.
+// Audio codecs the receiver can ingest. NOT part of the control-plane contract:
+// it is *detected* from the incoming MPEG-TS, never declared by the encoder.
+// The receiver always decodes audio to PCM for the raw handoff (see restream).
 enum class audio_codec : std::uint8_t
 {
   aac,
@@ -42,24 +40,6 @@ enum class audio_codec : std::uint8_t
   ac3,
   eac3,
   mp2
-};
-
-enum class encoder : std::uint8_t
-{
-  amd,
-  qsv,
-  nvenc,
-  software
-};
-
-// Output transport for a restream destination. `rtmps` shares the RTMP/flvmux
-// branch with a TLS URL; `srt`/`rist` use mpegtsmux.
-enum class output_proto : std::uint8_t
-{
-  rtmp,
-  rtmps,
-  srt,
-  rist
 };
 
 // ---------------------------------------------------------------------------
@@ -82,11 +62,6 @@ static_assert(sizeof(wan_telemetry) == sizeof(uint8_t) + sizeof(uint32_t),
 
 struct receiver_defaults
 {
-  static constexpr int video_bitrate_kbps = 4300;
-  static constexpr int video_width = 2560;
-  static constexpr int video_height = 1440;
-  static constexpr int audio_bitrate_kbps = 128;
-  static constexpr int latency_ms = 200;
   static constexpr int bandwidth = 6000;
   // Recovery buffer floor must leave room for several retransmit rounds over a
   // high-RTT mobile link. The reorder hold-off must be a SMALL fraction of the
@@ -100,41 +75,8 @@ struct receiver_defaults
 };
 
 // ---------------------------------------------------------------------------
-// Configuration (deserialised from POST /start; see docs/CONTRACT.md §4)
+// Configuration
 // ---------------------------------------------------------------------------
-
-struct video_disposition
-{
-  bool reencode = false;  // false => copy/passthrough
-  codec out_codec = codec::h264;
-  encoder enc = encoder::software;
-  int bitrate_kbps = receiver_defaults::video_bitrate_kbps;
-  bool upscale = false;
-  int width = receiver_defaults::video_width;
-  int height = receiver_defaults::video_height;
-  auto operator==(const video_disposition&) const -> bool = default;
-};
-
-struct audio_disposition
-{
-  bool reencode = false;  // false => copy aac
-  int bitrate_kbps = receiver_defaults::audio_bitrate_kbps;
-  auto operator==(const audio_disposition&) const -> bool = default;
-};
-
-struct destination
-{
-  std::string id;
-  output_proto proto = output_proto::rtmp;
-  std::string url;
-  std::string key_or_streamid;
-  int latency_ms = receiver_defaults::latency_ms;  // srt only
-  int sender_buffer = 0;                           // rist only (0 => omit)
-  std::string cname;                               // rist only
-  video_disposition video;
-  audio_disposition audio;
-  auto operator==(const destination&) const -> bool = default;
-};
 
 struct ingest_config
 {
@@ -148,13 +90,28 @@ struct ingest_config
   auto operator==(const ingest_config&) const -> bool = default;
 };
 
+// Where the decoded, uncompressed media is handed off to the local restreaming
+// package (datarhei/restreamer). Video goes to a v4l2loopback device as raw
+// frames; audio goes to an ALSA snd-aloop device as PCM. These are host
+// infrastructure set once via CLI, NOT part of the /start control body — so
+// they are identical across sessions and never affect idempotency. See
+// docs/CONTRACT.md and docs/GSTREAMER.md.
+struct raw_sink_config
+{
+  std::string video_device = "/dev/video10";    // v4l2loopback (v4l2sink)
+  std::string audio_device = "hw:Loopback,0,0";  // snd-aloop (alsasink)
+  std::string pixel_format = "NV12";  // raw video pixel format for the device
+  bool prefer_hw_decode = true;       // prefer NVDEC/VA/QSV over software decode
+  auto operator==(const raw_sink_config&) const -> bool = default;
+};
+
 struct receiver_config
 {
   int schema_version = 1;
   std::string session_id;
   ingest_config ingest;
-  codec in_codec = codec::h264;  // the codec arriving over RIST (source.codec)
-  std::vector<destination> destinations;
+  codec in_codec = codec::h264;  // the codec arriving over RIST (source.codec hint)
+  raw_sink_config sink;          // operator-set (CLI); not from /start
   auto operator==(const receiver_config&) const -> bool = default;
 };
 
@@ -166,12 +123,16 @@ struct receiver_state
 {
   std::atomic_bool is_running {false};
 
-  // Guards cfg, session_id, started_at and last_bus_error.
+  // Guards cfg, session_id, started_at, last_bus_error and the detected codecs.
   std::mutex mutex;
   receiver_config cfg;
   std::string session_id;
   std::chrono::steady_clock::time_point started_at;
   std::string last_bus_error;
+  // Codecs detected off the live MPEG-TS once phase-1 detection settles; empty
+  // until then. Surfaced (read-only) by GET /status.
+  std::string detected_video;
+  std::string detected_audio;
 
   // Telemetry mirror (also sent over RIST OOB). Lock-free for /status reads.
   std::atomic<int> link_quality {0};
@@ -194,12 +155,8 @@ struct app_context
 
 auto to_string(codec cod) noexcept -> const char*;
 auto to_string(audio_codec cod) noexcept -> const char*;
-auto to_string(encoder enc) noexcept -> const char*;
-auto to_string(output_proto proto) noexcept -> const char*;
 
 auto parse_codec(std::string_view str, codec& out) noexcept -> bool;
-auto parse_encoder(std::string_view str, encoder& out) noexcept -> bool;
-auto parse_output_proto(std::string_view str, output_proto& out) noexcept -> bool;
 
 // Build the RIST listener URL the receiver hands to initReceiver. Mirrors the
 // encoder's recovery params and appends timing-mode=1 (ARRIVAL). The base (scheme +
@@ -228,8 +185,8 @@ auto parse_authority(const std::string& url,
 struct validation_result
 {
   bool ok = true;
-  std::string error_code;  // e.g. "bad_url", "rtmp_codec_unsupported"
-  std::string field;       // e.g. "outputs[0].url"
+  std::string error_code;  // e.g. "out_of_range", "bad_url"
+  std::string field;       // e.g. "ingest.bandwidth"
   std::string message;
 };
 

@@ -81,21 +81,6 @@ auto get_int(const json& obj,
   return val.get<int>();
 }
 
-auto get_bool(const json& obj,
-              const char* key,
-              bool def,
-              const std::string& field_pfx) -> bool
-{
-  if (!obj.contains(key)) {
-    return def;
-  }
-  const json& val = obj.at(key);
-  if (!val.is_boolean()) {
-    perr("invalid_schema", field_pfx + "." + key, "must be a boolean");
-  }
-  return val.get<bool>();
-}
-
 auto codec_field(const std::string& str,
                  const std::string& field) -> codec
 {
@@ -156,101 +141,10 @@ auto parse_start_body(const json& jbody) -> receiver_config
       require_string(jbody.at("source"), "codec", "source.codec"),
       "source.codec");
 
-  if (!jbody.contains("outputs") || !jbody.at("outputs").is_array()) {
-    perr("invalid_schema", "outputs", "required array");
-  }
-  const json& outs = jbody.at("outputs");
-  if (outs.empty()) {
-    perr("invalid_schema", "outputs", "at least one output is required");
-  }
-
-  for (std::size_t idx = 0; idx < outs.size(); ++idx) {
-    const json& out_item = outs.at(idx);
-    const std::string pfx = "outputs[" + std::to_string(idx) + "]";
-    if (!out_item.is_object()) {
-      perr("invalid_schema", pfx, "must be an object");
-    }
-
-    destination dst;
-    dst.id = require_string(out_item, "id", pfx + ".id");
-
-    const std::string type = require_string(out_item, "type", pfx + ".type");
-    if (!parse_output_proto(type, dst.proto)) {
-      perr("bad_enum",
-           pfx + ".type",
-           "invalid type (expected rtmp|rtmps|srt|rist)");
-    }
-    dst.url = require_string(out_item, "url", pfx + ".url");
-    dst.key_or_streamid = get_string(out_item, "key_or_streamid", "", pfx);
-
-    if (out_item.contains("params")) {
-      const json& params_json = out_item.at("params");
-      if (!params_json.is_object()) {
-        perr("invalid_schema", pfx + ".params", "must be an object");
-      }
-      dst.latency_ms =
-          get_int(params_json, "latency_ms", dst.latency_ms, pfx + ".params");
-      dst.sender_buffer =
-          get_int(params_json, "sender_buffer", dst.sender_buffer, pfx + ".params");
-      dst.cname = get_string(params_json, "cname", "", pfx + ".params");
-    }
-
-    if (!out_item.contains("video") || !out_item.at("video").is_object()) {
-      perr("invalid_schema", pfx + ".video", "required object");
-    }
-    const json& video_json = out_item.at("video");
-    const std::string vmode =
-        require_string(video_json, "mode", pfx + ".video.mode");
-    if (vmode != "copy" && vmode != "reencode") {
-      perr("bad_enum", pfx + ".video.mode", "must be copy|reencode");
-    }
-    dst.video.reencode = (vmode == "reencode");
-    dst.video.out_codec = codec_field(
-        require_string(video_json, "codec", pfx + ".video.codec"),
-        pfx + ".video.codec");
-    if (video_json.contains("encoder")) {
-      if (!video_json.at("encoder").is_string()
-          || !parse_encoder(video_json.at("encoder").get<std::string>(),
-                            dst.video.enc))
-      {
-        perr("bad_enum",
-             pfx + ".video.encoder",
-             "invalid encoder (expected amd|qsv|nvenc|software)");
-      }
-    }
-    dst.video.bitrate_kbps =
-        get_int(video_json, "bitrate_kbps", dst.video.bitrate_kbps, pfx + ".video");
-    dst.video.upscale = get_bool(video_json, "upscale", false, pfx + ".video");
-    dst.video.width =
-        get_int(video_json, "width", dst.video.width, pfx + ".video");
-    dst.video.height =
-        get_int(video_json, "height", dst.video.height, pfx + ".video");
-
-    if (out_item.contains("audio")) {
-      const json& audio_json = out_item.at("audio");
-      if (!audio_json.is_object()) {
-        perr("invalid_schema", pfx + ".audio", "must be an object");
-      }
-      const std::string amode =
-          get_string(audio_json, "mode", "copy", pfx + ".audio");
-      if (amode != "copy" && amode != "reencode") {
-        perr("bad_enum", pfx + ".audio.mode", "must be copy|reencode");
-      }
-      dst.audio.reencode = (amode == "reencode");
-      const std::string acodec =
-          get_string(audio_json, "codec", "aac", pfx + ".audio");
-      if (acodec != "aac") {
-        perr("bad_enum", pfx + ".audio.codec", "only aac is supported");
-      }
-      dst.audio.bitrate_kbps = get_int(audio_json,
-                                        "bitrate_kbps",
-                                        dst.audio.bitrate_kbps,
-                                        pfx + ".audio");
-    }
-
-    cfg.destinations.push_back(std::move(dst));
-  }
-
+  // No `outputs[]`: the receiver now DECODES and hands the uncompressed result
+  // to the local restreaming package via fixed loopback devices (configured by
+  // the operator via CLI, see raw_sink_config / main.cpp). restreamer owns all
+  // further encoding + restreaming. See docs/CONTRACT.md.
   return cfg;
 }
 
@@ -314,19 +208,25 @@ auto control_server::build_status_json() const -> std::string
   if (!m_ctx.state.is_running.load(std::memory_order_acquire)) {
     out["state"] = "stopped";
     out["session_id"] = nullptr;
-    out["outputs"] = json::array();
+    out["sink"] = nullptr;
     return out.dump();
   }
 
   std::string sid;
   std::string last_err;
-  std::vector<destination> dests;
+  std::string vdev;
+  std::string adev;
+  std::string det_v;
+  std::string det_a;
   std::chrono::steady_clock::time_point started;
   {
     std::lock_guard<std::mutex> guard(m_ctx.state.mutex);
     sid = m_ctx.state.session_id;
     last_err = m_ctx.state.last_bus_error;
-    dests = m_ctx.state.cfg.destinations;
+    vdev = m_ctx.state.cfg.sink.video_device;
+    adev = m_ctx.state.cfg.sink.audio_device;
+    det_v = m_ctx.state.detected_video;
+    det_a = m_ctx.state.detected_audio;
     started = m_ctx.state.started_at;
   }
 
@@ -341,21 +241,15 @@ auto control_server::build_status_json() const -> std::string
   tel["worst_case_rtt_ms"] = m_ctx.state.worst_rtt.load(std::memory_order_relaxed);
   out["telemetry"] = tel;
 
-  json arr = json::array();
-  for (const destination& dst : dests) {
-    json obj;
-    obj["id"] = dst.id;
-    obj["type"] = to_string(dst.proto);  // url / key_or_streamid are NOT exposed
-    obj["state"] = last_err.empty() ? "connected" : "error";
-    if (dst.video.reencode) {
-      obj["bitrate_kbps"] = dst.video.bitrate_kbps;
-    } else {
-      obj["bitrate_kbps"] = nullptr;
-    }
-    obj["last_error"] = last_err.empty() ? json(nullptr) : json(last_err);
-    arr.push_back(std::move(obj));
-  }
-  out["outputs"] = std::move(arr);
+  // The single decode->loopback handoff. Detected codecs are null until phase-1
+  // detection settles. Device paths are not secret.
+  json sink;
+  sink["video_device"] = vdev;
+  sink["audio_device"] = adev;
+  sink["video_codec"] = det_v.empty() ? json(nullptr) : json(det_v);
+  sink["audio_codec"] = det_a.empty() ? json(nullptr) : json(det_a);
+  sink["state"] = last_err.empty() ? "running" : "error";
+  out["sink"] = std::move(sink);
   out["last_bus_error"] = last_err.empty() ? json(nullptr) : json(last_err);
   return out.dump();
 }
@@ -425,14 +319,11 @@ auto control_server::setup_routes() -> void
                  body["schema_version"] = 1;
                  body["session_id"] = cfg.session_id;
                  body["state"] = "running";
-                 json out_arr = json::array();
-                 for (const destination& dst : cfg.destinations) {
-                   json obj;
-                   obj["id"] = dst.id;
-                   obj["state"] = "connecting";
-                   out_arr.push_back(std::move(obj));
-                 }
-                 body["outputs"] = std::move(out_arr);
+                 json sink;
+                 sink["video_device"] = cfg.sink.video_device;
+                 sink["audio_device"] = cfg.sink.audio_device;
+                 sink["state"] = "connecting";
+                 body["sink"] = std::move(sink);
                  res.status = 200;
                  res.set_content(body.dump(), "application/json");
                } else {

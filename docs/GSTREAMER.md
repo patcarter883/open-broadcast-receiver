@@ -1,307 +1,145 @@
-# GSTREAMER.md — verified receiver pipeline templates
+# GSTREAMER.md — receiver decode→raw-handoff pipeline
 
-Date: 2026-05-30
-Box: GStreamer 1.28.3, gcc 16. "Verified locally" = tested on this box. "Deployment-only" = element absent here but
-the pipeline string must still be generatable. All tests referenced (TEST A–H) are from the GStreamer research pass.
+Date: 2026-06-05
+Deployment box: stream2 — Ubuntu 26.04, kernel pinned 6.8.0-124, NVIDIA A40 vGPU (NVENC/NVDEC via `nvcodec`),
+GStreamer 1.28.x. "Verified" below = exercised on stream2 (Phase 0 handoff spike, 2026-06-05).
 
-The receiver builds **one** `gst_parse_launch` pipeline per session: input chain → video (copy|reencode) ending in
-`tee name=vtee` → audio (copy|reencode) ending in `tee name=atee` → one output-template fragment per destination.
-One pipeline, one bus, one state machine, unified teardown (matches encoder `encode.cpp` lifecycle).
+> **Role (v1, 2026-06-05).** The receiver DECODES the incoming RIST/MPEG-TS stream and writes the **uncompressed**
+> result to local loopback devices for a separate restreaming package (datarhei/restreamer) to encode + restream:
+> raw video → **v4l2loopback** (`v4l2sink`), PCM audio → **ALSA snd-aloop** (`alsasink`). The receiver no longer
+> encodes or muxes to RTMP/SRT/RIST. One `gst_parse_launch` pipeline, one bus, one teardown.
+
+The receiver builds **one** pipeline per session: input chain (appsrc → tsdemux) → a video branch
+(parse → decode → system-memory raw → `v4l2sink`) and an audio branch (parse → decode → PCM → `alsasink`).
 
 ---
 
-## 0. Element availability on this box
+## 0. Element availability
 
-PRESENT (testable locally): `appsrc`, `queue`, `queue2`, `tsparse`, `tsdemux`, `tee`, `h264parse`, `h265parse`,
-`av1parse`, `aacparse`, `avdec_h264`, `avdec_h265`, `av1dec`, `avdec_aac`, `decodebin3`, `parsebin`, `x264enc`,
-`x265enc`, `avenc_aac`, `videoconvert`, `videoscale`, `videoconvertscale`, `audioconvert`, `audioresample`,
-`flvmux`, `rtmp2sink`, `rtmpsink`, `mpegtsmux`, `rtpmp2tpay`, `srtsink`, `ristsink`.
+Required on the deployment box (validated at start via registry lookup; missing ⇒ control-plane `encoder_unavailable`,
+CONTRACT §4):
 
-PRESENT — **AMD VA-API HW** (verified 2026-06-05 on a Radeon RX 9070 XT via mesa `radeonsi`): `vah264dec`,
-`vah264enc`, `vah265dec`, `vah265enc`, `vaav1dec`, `vaav1enc`, `vapostproc` (plus `vacompositor`, `vadeinterlace`,
-`vavp9dec`, `vajpegdec`). The receiver's `amd` family therefore runs on VA on Linux — full GPU `va*dec → va*enc` with
-frames kept in VA memory — and falls back to `amf*` only when `vah264enc` is absent (Windows builds).
+- **Codec-independent (checked synchronously before detection):** `v4l2sink` (gst-plugins-good), `alsasink`
+  (gst-plugins-base / `gstreamer1.0-alsa`), `videoconvert`, `audioconvert`, `audioresample`.
+- **Input chain:** `appsrc`, `queue`/`queue2`, `tsparse`, `tsdemux`.
+- **Video decoders (one of, by detected codec + `--no-hw-decode`):** NVDEC `nvh264dec`/`nvh265dec`/`nvav1dec` +
+  `cudadownload` (preferred on stream2); VA `vah264dec`/… + `vapostproc`; QSV `qsv*dec` + `vapostproc`; software
+  `avdec_h264`/`avdec_h265`/`av1dec`.
+- **Audio parse/decode (by detected codec):** `aacparse`+`avdec_aac`, `opusparse`+`avdec_opus`,
+  `ac3parse`+`avdec_ac3`/`avdec_eac3`, `mpegaudioparse`+`avdec_mp2float`.
 
-ABSENT here — **deployment-box-only** (strings must still be generatable, cannot be tested locally): `nvh264enc`,
-`nvh265enc`, `nvav1enc`, `nvh264dec`, `nvh265dec`, `nvav1dec`, `amfh264enc`, `amfh265enc`, `amfav1enc` (AMF has no
-Linux GStreamer plugin on this box — the AMD path uses VA above), `qsvh264enc`, `qsvh265enc`, `qsvav1enc` (and
-`qsv*dec`), `cudascale`, `cudaconvertscale`, `cudaupload`/`cudadownload`,
-**and `rav1enc`** (so software AV1 *encode* is also deployment-only; only AV1 *decode* `av1dec` is present).
-
-**Implication.** Fully testable locally: all copy paths, software h264/h265 reencode, and all three output protocols
-(rtmp/srt/rist). The receiver MUST build encoder/decoder fragments from templates without requiring the element to
-exist at build time, and at start-up validate the requested encoder/decoder family via registry lookup, returning a
-control-plane error (`encoder_unavailable`, see CONTRACT §4) rather than emitting an unparseable string.
+Host modules (not GStreamer; see deployment notes): `v4l2loopback` (DKMS, out-of-tree — builds against the pinned
+kernel) and `snd-aloop` (in-tree).
 
 ---
 
 ## 1. Input chain (RISTNetReceiver appsrc → MPEG-TS demux)
 
-The RIST wrapper hands raw 188-byte TS (exactly what the encoder's `mpegtsmux alignment=7 + appsink` produced).
-Use the wire-compatible idiom from `ndi-rist-server/main copy.cpp` (verified):
+The RIST wrapper hands raw 188-byte TS (exactly what the encoder's `mpegtsmux alignment=7 + appsink` produced). Shared
+by both the detection and real pipelines (`k_ts_source`):
 
 ```
-appsrc name=videosrc emit-signals=false block=true is-live=true do-timestamp=true format=time
-       stream-type=0 max-bytes=0
+appsrc name=videosrc is-live=true do-timestamp=true format=time stream-type=0
+       max-bytes=4194304 block=true emit-signals=false
   ! queue2
   ! tsparse set-timestamps=true alignment=7
   ! tsdemux name=demux
 ```
 
-Set caps in C **after** `gst_parse_launch`, **before** PLAYING, on the `videosrc` element:
+Set caps in C **after** `gst_parse_launch`, **before** PLAYING, on `videosrc`:
 ```c
 GstCaps* caps = gst_caps_new_simple("video/mpegts",
                                     "systemstream", G_TYPE_BOOLEAN, TRUE,
-                                    "packetsize",   G_TYPE_INT,     188,
-                                    NULL);
+                                    "packetsize",   G_TYPE_INT,     188, NULL);
 gst_app_src_set_caps(GST_APP_SRC(videosrc), caps);
-gst_caps_unref(caps);
 ```
-Do **not** use `application/x-rtp,media=video,...MP2T` caps (that was the `main.cpp` udpsrc+rtpmp2tdepay path). Here the
-RIST wrapper delivers raw TS.
-
 Notes:
-- `alignment=7` matches the encoder mux alignment (7×188 per buffer) for clean push boundaries.
-- `block=true` gives flow back-pressure into the RIST `networkDataCallback` (desirable; do not hold any RIST mutex
-  while blocked — you do not).
-- `tsdemux` exposes **sometimes-pads** (dynamic). `gst_parse_launch` defers `demux.` linking until pads appear; this
-  works (TEST E) but branches only negotiate once the first TS packets arrive. Do **not** assert demux pad linkage at
-  parse time. Grab named elements (`vtee`, `videncoder`, sinks), never demux pads.
-- The push recipe (memdup copy + `gst_app_src_push_buffer`, return 0 to keep the RIST connection) is in IMPL_PLAN.
+- `alignment=7` matches the encoder mux alignment (7×188 per buffer).
+- `block=true` gives flow back-pressure into the RIST `networkDataCallback`.
+- `tsdemux` exposes **sometimes-pads** (dynamic). `gst_parse_launch` defers `demux.` linking until pads appear; do
+  **not** assert demux pad linkage at parse time. The push recipe (memdup copy + `gst_app_src_push_buffer`, always
+  return 0 to keep the RIST connection) is in `restream::push_buffer`.
 
 ---
 
-## 2. Video copy (passthrough) chain — ends at `vtee`
+## 2. Codec detection (phase 1)
 
-Parser is chosen from the **detected** input codec, not `source.codec`. The
-receiver first runs a short detection pipeline (`appsrc ! tsparse ! tsdemux` with
-fakesinks) and reads the codec off the tsdemux pad caps before building the real
-pipeline; `source.codec` is only a fallback if detection times out
-(`restream::start_detection` / `finish_detection_and_launch`).
-
-```
-demux. ! h264parse ! tee name=vtee       # detected video/x-h264
-demux. ! h265parse ! tee name=vtee       # detected video/x-h265
-demux. ! av1parse  ! tee name=vtee       # detected video/x-av1
-```
-Optionally insert `queue silent=true` between `demux.` and the parse for buffering.
-
-**DECISIVE RULE (TEST A failed; TEST D/E passed):** the single shared parser feeding the tee CANNOT serve byte-stream
-(mpegts/rist) and avc (flv) simultaneously — the tee pushes identical buffers and caps negotiation deadlocks
-(`not-negotiated`). Therefore the copy chain **ends at `vtee`**, and a **second, per-branch parser sits AFTER each tee
-src pad** in the output template to negotiate the muxer-specific `stream-format`. Add `config-interval=1` (or `-1`) on
-those post-tee parsers to re-insert SPS/PPS/VPS for mid-stream joiners.
+Before committing to a decode pipeline, a throwaway pipeline (`k_ts_source` + three `fakesink`s) is fed by the same
+`push_buffer` path; `tsdemux` pad caps reveal the real video **and** audio codecs (`record_caps`). Detection ends on
+`no-more-pads`, both codecs found, or a 5 s timeout (falls back to the declared `source.codec` for video, AAC for
+audio). The detected codecs select the parser + decoder for phase 2 and are published to `GET /status`
+(`restream::finish_detection_and_launch`).
 
 ---
 
-## 3. Audio copy chain — ends at `atee`
+## 3. Video branch — decode → system-memory raw → v4l2sink
 
-The input audio codec is also **detected** from the tsdemux pad caps. The encoder
-emits AAC today, so AAC is the common case and passes straight through
-(`aacparse`):
+The decoder is chosen at launch from the detected codec and `--no-hw-decode` (`choose_video_decoder`): probe the
+registry for NVDEC, then VA, then QSV; else the libav software decoder. GPU output is brought to **system memory** for
+the v4l2 device (`raw_download`), since a separate-process FFmpeg consumer cannot share GPU surfaces — the realistic
+"raw" path is decoded CPU frames at the configured `--pixel-format` (default **NV12**, NVDEC-native — no conversion).
+
 ```
-demux. ! aacparse ! tee name=atee
-# or: demux. ! queue silent=true ! aacparse ! tee name=atee
+# NVDEC (preferred on stream2)
+demux. ! video/x-h264 ! queue ! h264parse ! nvh264dec ! cudadownload ! videoconvert ! video/x-raw,format=NV12 !
+        queue leaky=downstream max-size-buffers=4 ! v4l2sink name=vsink device='/dev/video10' sync=true
+# VA-API
+demux. ! video/x-h264 ! queue ! h264parse ! vah264dec ! vapostproc ! video/x-raw,format=NV12 ! ... ! v4l2sink ...
+# software
+demux. ! video/x-h264 ! queue ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=NV12 ! ... ! v4l2sink ...
 ```
-The output audio codec is always AAC (RTMP/SRT/RIST muxers expect it). A non-AAC
-input (Opus / AC-3 / E-AC-3 / MPEG-1-2 audio) is therefore transcoded to AAC even
-in copy mode — the demux pad caps select the audio pad (`audio_caps`), the parser
-(`audio_parse`) and decoder (`audio_decoder`) match the detected codec, then
-`audioconvert ! audioresample ! avenc_aac` re-encodes:
+- The `video/x-h26x` caps after `demux.` select the dynamic video pad (parser matches the **detected** codec).
+- `cudadownload ! videoconvert` (CUDA) / `vapostproc` (VA) / `videoconvert` (sw) all yield plain
+  `video/x-raw,format=NV12` in system memory; `videoconvert` is a no-op for already-NV12 8-bit content.
+- `v4l2sink sync=true` paces to the pipeline clock (real-time); v4l2loopback drops old frames if no reader, so the
+  sink does not stall the pipeline.
+
+## 4. Audio branch — decode → PCM → alsasink
+
+Audio is always decoded to PCM (`audio_decode_fragment`); `audioconvert`/`audioresample` normalise any source
+layout/rate to the device's fixed format:
 ```
-demux. ! audio/x-opus  ! ... ! opusparse     ! avdec_opus     ! audioconvert ! audioresample ! avenc_aac ! tee name=atee
-demux. ! audio/x-ac3   ! ... ! ac3parse      ! avdec_ac3      ! audioconvert ! audioresample ! avenc_aac ! tee name=atee
-demux. ! audio/mpeg    ! ... ! mpegaudioparse ! avdec_mp2float ! audioconvert ! audioresample ! avenc_aac ! tee name=atee
+demux. ! audio/mpeg ! queue ! aacparse ! avdec_aac ! audioconvert ! audioresample !
+        audio/x-raw,format=S16LE,channels=2,rate=48000 !
+        queue leaky=downstream max-size-time=200000000 ! alsasink name=asink device='hw:Loopback,0,0' sync=true
 ```
-As with video, **do not** lock `stream-format` before the tee: defer the raw-vs-adts conversion to a per-branch
-`aacparse` after each `atee` src pad (flvmux needs `audio/mpeg,mpegversion=4,stream-format=raw`; mpegtsmux accepts
-adts or raw — TEST G confirms aacparse negotiates raw for flvmux automatically). Use
-`queue max-size-time=5000000000` on branches feeding muxers to absorb A/V interleave skew.
+(`audio/x-opus`→`opusparse`+`avdec_opus`, `audio/x-ac3`→`ac3parse`+`avdec_ac3`, `audio/x-eac3`→`ac3parse`+
+`avdec_eac3`, `audio/mpeg` mpegversion 1→`mpegaudioparse`+`avdec_mp2float`.)
 
 ---
 
-## 4. Video reencode matrix — DECODE → (optional upscale) → ENCODE → `vtee`
+## 5. Full pipeline (assembled by `build_pipeline_string`)
 
-Fragments below mirror the encoder's `kEncoderTemplates[encoder][codec]` (`encode.cpp:197-253`): encoder element named
-`videncoder`, `bitrate={BR}` (kbps), terminating in the output parse with `config-interval=1` (except av1). `{BR}` is
-`video.bitrate_kbps`. Insert the upscale fragment (§6) between decode and encode when `upscale=true`.
-
-### encoder = software (h264/h265 verified locally via TEST F; av1 encode deployment-only — rav1enc absent here)
-| codec | fragment |
-|-------|----------|
-| h264 | `demux. ! h264parse ! avdec_h264 ! videoconvert ! x264enc name=videncoder bitrate={BR} speed-preset=fast tune=zerolatency key-int-max=120 ! video/x-h264,profile=high ! h264parse config-interval=1 ! tee name=vtee` |
-| h265 | `demux. ! h265parse ! avdec_h265 ! videoconvert ! x265enc name=videncoder bitrate={BR} speed-preset=fast tune=zerolatency key-int-max=120 ! video/x-h265 ! h265parse config-interval=1 ! tee name=vtee` |
-| av1  | `demux. ! av1parse ! av1dec ! videoconvert ! rav1enc name=videncoder bitrate={BR} speed-preset=8 tile-cols=2 tile-rows=2 ! video/x-av1 ! av1parse ! tee name=vtee` |
-
-### encoder = nvenc (deployment-only)
-Same-vendor CUDA dec→enc links directly; **no `videoconvert` between** `nvXdec`→`nvXenc` (that would force a
-download/upload and break `(memory:CUDAMemory)` caps). Insert `cudaconvertscale`/`cudadownload` only to leave GPU or
-rescale.
-| codec | fragment |
-|-------|----------|
-| h264 | `demux. ! h264parse ! nvh264dec ! nvh264enc name=videncoder bitrate={BR} rc-mode=cbr-hq preset=low-latency-hq gop-size=120 ! h264parse config-interval=1 ! tee name=vtee` |
-| h265 | `demux. ! h265parse ! nvh265dec ! nvh265enc name=videncoder bitrate={BR} rc-mode=cbr-hq preset=low-latency-hq gop-size=120 ! h265parse config-interval=1 ! tee name=vtee` |
-| av1  | `demux. ! av1parse ! nvav1dec ! nvav1enc name=videncoder bitrate={BR} rc-mode=cbr preset=low-latency-hq gop-size=120 ! av1parse ! tee name=vtee` |
-
-### encoder = amd (VA-API verified locally on RX 9070 XT; AMF is the Windows fallback)
-On Linux the `amd` family uses **VA-API**: same-vendor `va*dec → va*enc` keep frames in VA memory and link
-**directly** (no `videoconvert`); insert `vapostproc` only to rescale (§6). The receiver falls back to the AMF
-fragments (`avdec_* ! videoconvert ! amf*enc`) only when `vah264enc` is absent (Windows builds). **`av1parse` has no
-`config-interval` property in 1.28.3 — do NOT append it to the AV1 output parser** (applies to every family's AV1 row).
-| codec | fragment (Linux / VA) |
-|-------|----------|
-| h264 | `demux. ! h264parse ! vah264dec ! vah264enc name=videncoder bitrate={BR} rate-control=cbr target-usage=4 key-int-max=120 b-frames=0 ! video/x-h264,profile=high ! h264parse config-interval=1 ! tee name=vtee` |
-| h265 | `demux. ! h265parse ! vah265dec ! vah265enc name=videncoder bitrate={BR} rate-control=cbr target-usage=4 key-int-max=120 b-frames=0 ! video/x-h265 ! h265parse config-interval=1 ! tee name=vtee` |
-| av1  | `demux. ! av1parse ! vaav1dec ! vaav1enc name=videncoder bitrate={BR} rate-control=cbr target-usage=4 key-int-max=120 ! video/x-av1 ! av1parse ! tee name=vtee` |
-
-### encoder = qsv (deployment-only)
-Same-vendor `qsv*dec`→`qsv*enc` trade `(memory:VAMemory)`/DMABuf and link directly. If the decode element is absent,
-fall back to `avdec_* ! videoconvert ! qsv*enc`.
-| codec | fragment |
-|-------|----------|
-| h264 | `demux. ! h264parse ! qsvh264dec ! qsvh264enc name=videncoder bitrate={BR} rate-control=cbr target-usage=1 gop-size=120 ! video/x-h264,profile=high ! h264parse config-interval=1 ! tee name=vtee` |
-| h265 | `demux. ! h265parse ! qsvh265dec ! qsvh265enc name=videncoder bitrate={BR} rate-control=cbr target-usage=1 gop-size=120 ! video/x-h265 ! h265parse config-interval=1 ! tee name=vtee` |
-| av1  | `demux. ! av1parse ! qsvav1dec ! qsvav1enc name=videncoder bitrate={BR} rate-control=cbr target-usage=1 gop-size=120 ! video/x-av1 ! av1parse ! tee name=vtee` |
+```
+<k_ts_source>
+demux. ! <video-caps> ! queue ! <vparse> ! <vdecoder> ! <download> ! videoconvert ! video/x-raw,format=NV12 !
+        queue leaky=downstream max-size-buffers=4 ! v4l2sink name=vsink device='<v4l2-device>' sync=true
+demux. ! <audio-caps> ! queue ! <aparse> ! <adecoder> ! audioconvert ! audioresample !
+        audio/x-raw,format=S16LE,channels=2,rate=48000 !
+        queue leaky=downstream max-size-time=200000000 ! alsasink name=asink device='<audio-device>' sync=true
+```
+Single consumer per stream — **no tee**. Device paths are single-quoted and validated (`is_pipeline_safe`); the pixel
+format is a validated bare token interpolated into the caps.
 
 ---
 
-## 5. Audio reencode chain — ends at `atee` (always software, encoder-family-independent)
+## 6. Pitfalls (ranked)
 
-There is no hardware AAC encoder; always `avenc_aac` (TEST F: `avdec_aac` present, OK):
-```
-demux. ! aacparse ! avdec_aac ! audioconvert ! audioresample ! avenc_aac name=audencoder bitrate={BR_bps} ! tee name=atee
-```
-- `{BR_bps}` = `audio.bitrate_kbps * 1000` (avenc_aac wants bits/s); omit `bitrate=` to accept the default.
-- `audioresample`+`audioconvert` are mandatory before `avenc_aac` (it needs standard sample rates/layout).
-- Do **not** add an `aacparse` before `atee` that locks `stream-format` — defer per-branch `aacparse` to each output.
-
----
-
-## 6. Upscale fragment (reencode-only; omitted when `upscale=false`)
-
-Inserted between decode and encode. Copy mode cannot rescale.
-
-- **Software (testable here):** `! videoscale ! video/x-raw,width={W},height={H} !`
-  or single element `! videoconvertscale ! video/x-raw,width={W},height={H} !` (replaces videoconvert+videoscale).
-- **CUDA (nvenc path, deployment-only):** keep frames on GPU —
-  `nvh264dec ! cudaconvertscale ! video/x-raw(memory:CUDAMemory),width={W},height={H} ! nvh264enc ...`
-  (`cudascale` also works where present).
-- **QSV/VA:** `vapostproc ! video/x-raw(memory:VAMemory),width={W},height={H} !`.
-
-`{W}`/`{H}` are `video.width`/`video.height` (even, bounds per CONTRACT §4).
-
----
-
-## 7. Output templates (one per destination; `{N}` = unique index)
-
-Every per-output element is uniquely named with `{N}` (`flvmux0`, `mpegtsmux1`, `ristsink2`, …) so
-`gst_bin_get_by_name` / per-output stats work. `VPARSE` = `h264parse`/`h265parse`/`av1parse` matching the **output**
-video codec.
-
-### type = rtmp / rtmps  (verified TEST D)
-```
-vtee. ! queue ! h264parse config-interval=1 ! flvmux{N}.
-atee. ! queue max-size-time=5000000000 ! aacparse ! flvmux{N}.
-flvmux name=flvmux{N} streamable=true skip-backwards-streams=true
-  ! queue
-  ! rtmp2sink name=rtmpsink{N} location='{URL}/{KEY}'
-```
-- `flvmux` request pads are linked implicitly: a video-caps branch auto-requests the `video` pad, an audio-caps branch
-  the `audio` pad (resolved by caps; this is why the per-branch parser must precede the mux).
-- `rtmp2sink` (modern, async-connect) preferred; legacy `rtmpsink location='url/key' live=true` also works.
-- **CONSTRAINT (§9): flvmux carries ONLY H.264(avc)+AAC(raw). No H.265, no AV1.** `rtmps://` URLs use the same
-  template with the `rtmps` scheme.
-
-### type = srt  (verified TEST B/H)
-```
-vtee. ! queue ! VPARSE config-interval=1 ! mpegtsmux{N}.
-atee. ! queue max-size-time=5000000000 ! aacparse ! mpegtsmux{N}.
-mpegtsmux name=mpegtsmux{N} alignment=7
-  ! queue
-  ! srtsink name=srtsink{N} uri='srt://{HOST}:{PORT}' mode=caller wait-for-connection=false streamid={STREAMID}
-```
-- `mpegtsmux` carries h264/h265/av1 + AAC (no codec restriction). `alignment=7` for network streaming.
-- `mode=caller wait-for-connection=false` so an absent SRT consumer does not block startup.
-- `{HOST}`/`{PORT}` parsed from `url`; `{STREAMID}` from `key_or_streamid`; `latency` from `params.latency_ms` may be
-  appended to the uri (`?latency={ms}`).
-
-### type = rist  (verified TEST H)
-```
-vtee. ! queue ! VPARSE config-interval=1 ! mpegtsmux{N}.
-atee. ! queue max-size-time=5000000000 ! aacparse ! mpegtsmux{N}.
-mpegtsmux name=mpegtsmux{N} alignment=7
-  ! rtpmp2tpay
-  ! ristsink name=ristsink{N} address={HOST} port={PORT} sender-buffer={BUF} cname={CNAME}
-```
-- Mirrors the encoder's own RIST input format: `mpegtsmux ! rtpmp2tpay` (produces `application/x-rtp media=video
-  payload=33 MP2T`) `! ristsink` (Always sink pad, `application/x-rtp`).
-- **`port` MUST be even** (RTCP uses `port+1`); an odd port silently misbehaves.
-- `{BUF}` from `params.sender_buffer`; `{CNAME}` from `params.cname`. No codec restriction (mpegtsmux).
-
----
-
-## 8. Pad-linking rules (validated on 1.28.3)
-
-1. **One pipeline, one `gst_parse_launch` string** with tee + multiple muxers is the recommended approach (TEST A–F).
-   Concatenate: input chain + video chain ending `tee name=vtee` + audio chain ending `tee name=atee` + per-output
-   fragments.
-2. **tee request src pads:** write `vtee. ! queue ! ...` once per consumer; each occurrence auto-requests a new
-   `src_%u` pad. No explicit pad names. Set `tee allow-not-linked=true` only if a tee may momentarily have zero
-   consumers.
-3. **Muxer request sink pads:** the bare `name.` form (`mpegtsmux.` / `flvmux.`) auto-requests a sink pad and the muxer
-   picks video-vs-audio pad template **by the caps of the incoming branch** — hence a per-branch parser must precede
-   the muxer to fix caps (TEST D/E).
-4. **QUEUE placement is mandatory:** a `queue` immediately after each tee src pad (decouples branches so one slow output
-   cannot block the others) AND immediately before each network sink (decouples muxer from socket I/O). Use
-   `max-size-time` on audio branches. For live restream resilience consider `queue leaky=downstream` on output branches
-   so a stalled endpoint drops rather than back-pressuring the shared tee/appsrc (and thereby the RIST input).
-5. **DECISIVE rule:** parsers go AFTER the tee, per-branch, never before (see §2/§3). One shared pre-tee parser causes
-   `GST_FLOW_NOT_NEGOTIATED` the moment two outputs disagree on `stream-format`.
-
----
-
-## 9. Codec/container constraints
-
-**flvmux / all RTMP output:** verified from sink-pad caps on this box — video pad lists `video/x-h264` ONLY (no
-`video/x-h265`, no `video/x-av1`); audio `audio/mpeg, mpegversion=4|2, stream-format=raw` (AAC). Vanilla flvmux 1.28
-has no HEVC/AV1 mapping (enhanced-RTMP unsupported upstream).
-
-Consequences (enforced in control logic — CONTRACT §4):
-- H.264 copy or H.264 reencode → RTMP: always fine.
-- H.265/AV1 (copied or reencoded) + RTMP output: **INVALID**. v1 rejects with `rtmp_codec_unsupported`. (v2 option:
-  force an H.264 reencode sub-branch off the demux feeding only flvmux, while mpegts/SRT/RIST outputs still copy the
-  original codec — a second `vtee` fed by an H.264 reencoder.)
-- AAC into flvmux: `aacparse` converts adts→raw automatically (TEST G).
-
-**mpegtsmux (SRT and RIST):** sink caps include `video/x-h264`, `video/x-h265`, `video/x-av1` + AAC — no codec
-restriction.
-
----
-
-## 10. Pitfalls (ranked)
-
-1. **TEE/PARSER ORDERING** — never share one parser across outputs; put `h264parse`/`aacparse` AFTER each tee src pad.
-   The single most likely bug (TEST A failed; TEST D/E passed).
-2. **RTMP CODEC** — flvmux cannot carry H.265/AV1; detect codec+protocol mismatch in control logic, do not emit an
-   unlinkable pipeline.
-3. **appsrc CAPS in C** — set `video/mpegts,systemstream=true,packetsize=188` via `gst_app_src_set_caps` after parse,
-   before PLAYING. Use `emit-signals=false` + the C push API (not raw caps in the launch string).
-4. **tsdemux sometimes-pads** — deferred linking; do not assert at parse time.
-5. **QUEUES** — missing post-tee queues serialize branches; one blocked sink stalls the whole pipeline and
-   back-pressures the RIST appsrc, dropping the incoming stream. Add `queue` (consider `leaky=downstream`) on every
-   output branch.
-6. **ristsink even port** — odd ports misbehave; `srtsink`/`ristsink` use `wait-for-connection=false`/non-blocking so
-   an absent downstream does not freeze startup.
-7. **HW dec→enc memory** — same-vendor pairs keep frames in GPU/VA memory and link directly; do NOT insert plain
-   `videoconvert` between them. Use `cudaconvertscale`/`cudadownload` only to leave GPU or rescale. Mixed (software
-   decode → hw encode) DOES need `videoconvert`.
-8. **avenc_aac negotiation** — always precede with `audioresample ! audioconvert`.
-9. **config-interval=1 (or -1)** on the OUTPUT video parser re-inserts SPS/PPS/VPS for late-joining consumers (CDNs,
-   SRT pulls).
-10. **Deployment-box element validation** — nvenc/amf/qsv and rav1enc are absent here; validate the requested
-    encoder/decoder via registry lookup at start and return `encoder_unavailable` (CONTRACT §4), never emit an
-    unparseable string.
-11. **flvmux for live** — set `streamable=true` and consider `skip-backwards-streams=true`.
-12. **One pipeline / one bus** — keep all outputs in one `gst_parse_launch`; teardown is set-NULL + unref in reverse.
-    Runtime add/remove of an output requires dynamic tee pad block/request/release/sync — the simple path is
-    rebuild-and-restart on output-set changes.
+1. **Module load order / exclusive_caps.** Load `v4l2loopback exclusive_caps=1` so the device presents as a *capture*
+   device to the FFmpeg reader once `v4l2sink` (output) has opened it; load `snd-aloop` (in-tree). The reader uses the
+   **paired** ALSA subdevice (write `hw:Loopback,0,0` → read `hw:Loopback,1,0`).
+2. **GPU→CPU is mandatory across processes.** Keep no `(memory:CUDAMemory)`/`(memory:VAMemory)` caps on the way to the
+   sink — `cudadownload`/`vapostproc` must land frames in system memory, or `v4l2sink` cannot consume them.
+3. **Bounded leaky queues before each sink.** Raw video is huge; cap the video queue by buffers
+   (`max-size-buffers=4 leaky=downstream`) and audio by time so a stalled device drops frames instead of
+   back-pressuring the shared demux/appsrc (and thereby the RIST ingest). v4l2loopback also drops on its own.
+4. **tsdemux sometimes-pads** — deferred linking; do not assert at parse time. Grab named elements (`vsink`, `asink`),
+   never demux pads.
+5. **appsrc caps in C** — set `video/mpegts,systemstream=true,packetsize=188` via `gst_app_src_set_caps` after parse,
+   before PLAYING. Use `emit-signals=false` + the C push API.
+6. **A/V sync across two devices.** Both sinks `sync=true` to the single pipeline clock; the downstream FFmpeg consumer
+   resynchronises the two device inputs on ingest. Verify glass-to-glass alignment on a sustained run.
+7. **Compiler/kernel pin.** The deployment box's NVDEC/`nvcodec` + `v4l2loopback` depend on the pinned 6.8 kernel and
+   the matched NVIDIA driver — do not boot a different kernel (see the deployment notes / project memory).
+8. **Registry validation** — validate the codec-independent sink elements synchronously at `/start`, and the
+   codec-specific decoder once detection has run; never emit an unparseable pipeline (return `encoder_unavailable`).

@@ -1,6 +1,7 @@
 #include "restream/restream.h"
 
 #include <chrono>
+#include <cstdint>
 #include <format>
 #include <string>
 #include <vector>
@@ -52,260 +53,94 @@ auto video_caps(codec cod) noexcept -> const char*
   return "video/x-h264";
 }
 
-// AMD HW path: VA-API (Linux/mesa) when present, else AMF (Windows builds).
-// Per-codec elements are still validated in first_missing_element(); this only
-// chooses the family. vah264enc presence is the sentinel for the VA path.
-auto amd_uses_va() noexcept -> bool
+// True if a GStreamer element factory of this name exists in the registry.
+auto element_present(const char* name) noexcept -> bool
 {
-  static const bool va = [] {
-    GstElementFactory* fac = gst_element_factory_find("vah264enc");
-    if (fac != nullptr) {
-      gst_object_unref(fac);
-      return true;
+  GstElementFactory* fac = gst_element_factory_find(name);
+  if (fac != nullptr) {
+    gst_object_unref(fac);
+    return true;
+  }
+  return false;
+}
+
+// Memory domain a decoder's frames live in — determines how we bring them back
+// to system memory for the v4l2 device.
+enum class dec_domain : std::uint8_t
+{
+  sys,   // libav software decode: already system memory
+  cuda,  // NVDEC: CUDA device memory
+  va     // VA-API / QSV: VA surface / DMABuf
+};
+
+struct video_dec
+{
+  std::string element;
+  dec_domain domain;
+};
+
+// Pick the best available decoder for the detected codec. When prefer_hw, probe
+// the registry for NVDEC, then VA-API, then QSV (all GPU); otherwise — or when
+// none is present — fall back to the libav software decoder.
+auto choose_video_decoder(codec cod, bool prefer_hw) -> video_dec
+{
+  if (prefer_hw) {
+    const char* nv = cod == codec::h264 ? "nvh264dec"
+        : cod == codec::h265            ? "nvh265dec"
+                                        : "nvav1dec";
+    if (element_present(nv)) {
+      return {.element = nv, .domain = dec_domain::cuda};
     }
-    return false;
-  }();
-  return va;
+    const char* vaapi = cod == codec::h264 ? "vah264dec"
+        : cod == codec::h265               ? "vah265dec"
+                                           : "vaav1dec";
+    if (element_present(vaapi)) {
+      return {.element = vaapi, .domain = dec_domain::va};
+    }
+    const char* qsv = cod == codec::h264 ? "qsvh264dec"
+        : cod == codec::h265             ? "qsvh265dec"
+                                         : "qsvav1dec";
+    if (element_present(qsv)) {
+      return {.element = qsv, .domain = dec_domain::va};
+    }
+  }
+  const char* sw = cod == codec::h264 ? "avdec_h264"
+      : cod == codec::h265            ? "avdec_h265"
+                                      : "av1dec";
+  return {.element = sw, .domain = dec_domain::sys};
 }
 
-// Decoder element for (encoder family, source codec).
-auto video_decoder(encoder enc, codec cod) noexcept -> const char*
+// The extra element a GPU decode domain needs to reach system memory (used by
+// the registry availability check); empty for software decode.
+auto download_element(dec_domain domain) noexcept -> const char*
 {
-  switch (enc) {
-    case encoder::nvenc:
-      return cod == codec::h264 ? "nvh264dec"
-          : cod == codec::h265  ? "nvh265dec"
-                                : "nvav1dec";
-    case encoder::qsv:
-      return cod == codec::h264 ? "qsvh264dec"
-          : cod == codec::h265  ? "qsvh265dec"
-                                : "qsvav1dec";
-    case encoder::amd:
-      if (amd_uses_va()) {
-        return cod == codec::h264 ? "vah264dec"
-            : cod == codec::h265  ? "vah265dec"
-                                  : "vaav1dec";
-      }
-      [[fallthrough]];
-    case encoder::software:
+  switch (domain) {
+    case dec_domain::cuda:
+      return "cudadownload";
+    case dec_domain::va:
+      return "vapostproc";
+    case dec_domain::sys:
     default:
-      return cod == codec::h264 ? "avdec_h264"
-          : cod == codec::h265  ? "avdec_h265"
-                                : "av1dec";
+      return "";
   }
 }
 
-// Just the encoder element factory name (for registry availability checks).
-auto video_encoder_element(encoder enc, codec cod) noexcept -> const char*
+// The fragment that turns a decoder's output into plain system-memory raw video
+// at `pix` (e.g. NV12), ready for v4l2sink. GPU domains need an explicit
+// download; software decode just needs a (no-op for matching formats)
+// videoconvert.
+auto raw_download(dec_domain domain, const std::string& pix) -> std::string
 {
-  switch (enc) {
-    case encoder::amd:
-      if (amd_uses_va()) {
-        return cod == codec::h264 ? "vah264enc"
-            : cod == codec::h265  ? "vah265enc"
-                                  : "vaav1enc";
-      }
-      return cod == codec::h264 ? "amfh264enc"
-          : cod == codec::h265  ? "amfh265enc"
-                                : "amfav1enc";
-    case encoder::qsv:
-      return cod == codec::h264 ? "qsvh264enc"
-          : cod == codec::h265  ? "qsvh265enc"
-                                : "qsvav1enc";
-    case encoder::nvenc:
-      return cod == codec::h264 ? "nvh264enc"
-          : cod == codec::h265  ? "nvh265enc"
-                                : "nvav1enc";
-    case encoder::software:
+  switch (domain) {
+    case dec_domain::cuda:
+      return std::format("cudadownload ! videoconvert ! video/x-raw,format={}",
+                         pix);
+    case dec_domain::va:
+      return std::format("vapostproc ! video/x-raw,format={}", pix);
+    case dec_domain::sys:
     default:
-      return cod == codec::h264 ? "x264enc"
-          : cod == codec::h265  ? "x265enc"
-                                : "rav1enc";
+      return std::format("videoconvert ! video/x-raw,format={}", pix);
   }
-}
-
-// Full encoder fragment: <enc element> name=videncoder{idx} <params> ! <caps> !
-// <out parse> config-interval=1. Mirrors the encoder's kEncoderTemplates.
-auto encoder_fragment(encoder enc,
-                      codec cod,
-                      std::size_t idx,
-                      int bitrate) -> std::string
-{
-  switch (enc) {
-    case encoder::amd:
-      if (amd_uses_va()) {
-        switch (cod) {
-          case codec::h264:
-            return std::format(
-                "vah264enc name=videncoder{0} bitrate={1} rate-control=cbr "
-                "target-usage=4 key-int-max=120 b-frames=0 ! "
-                "video/x-h264,profile=high ! h264parse config-interval=1",
-                idx, bitrate);
-          case codec::h265:
-            return std::format(
-                "vah265enc name=videncoder{0} bitrate={1} rate-control=cbr "
-                "target-usage=4 key-int-max=120 b-frames=0 ! video/x-h265 ! "
-                "h265parse config-interval=1",
-                idx, bitrate);
-          case codec::av1:
-            return std::format(
-                "vaav1enc name=videncoder{0} bitrate={1} rate-control=cbr "
-                "target-usage=4 key-int-max=120 ! video/x-av1 ! av1parse",
-                idx, bitrate);
-        }
-        break;
-      }
-      switch (cod) {
-        case codec::h264:
-          return std::format(
-              "amfh264enc name=videncoder{0} bitrate={1} rate-control=cbr "
-              "usage=low-latency preset=quality pre-encode=true "
-              "pa-hqmb-mode=auto ! video/x-h264,profile=high ! h264parse "
-              "config-interval=1",
-              idx, bitrate);
-        case codec::h265:
-          return std::format(
-              "amfh265enc name=videncoder{0} bitrate={1} rate-control=cbr "
-              "usage=low-latency preset=quality pre-encode=true "
-              "pa-hqmb-mode=auto ! video/x-h265 ! h265parse config-interval=1",
-              idx, bitrate);
-        case codec::av1:
-          return std::format(
-              "amfav1enc name=videncoder{0} bitrate={1} rate-control=cbr "
-              "usage=low-latency preset=high-quality pre-encode=true "
-              "pa-hqmb-mode=auto ! video/x-av1 ! av1parse",
-              idx, bitrate);
-      }
-      break;
-    case encoder::qsv:
-      switch (cod) {
-        case codec::h264:
-          return std::format(
-              "qsvh264enc name=videncoder{0} bitrate={1} rate-control=cbr "
-              "target-usage=1 gop-size=120 ! video/x-h264,profile=high ! "
-              "h264parse config-interval=1",
-              idx, bitrate);
-        case codec::h265:
-          return std::format(
-              "qsvh265enc name=videncoder{0} bitrate={1} rate-control=cbr "
-              "target-usage=1 gop-size=120 ! video/x-h265 ! h265parse "
-              "config-interval=1",
-              idx, bitrate);
-        case codec::av1:
-          return std::format(
-              "qsvav1enc name=videncoder{0} bitrate={1} rate-control=cbr "
-              "target-usage=1 gop-size=120 ! video/x-av1 ! av1parse",
-              idx, bitrate);
-      }
-      break;
-    case encoder::nvenc:
-      switch (cod) {
-        case codec::h264:
-          return std::format(
-              "nvh264enc name=videncoder{0} bitrate={1} rc-mode=cbr-hq "
-              "preset=low-latency-hq gop-size=120 ! h264parse config-interval=1",
-              idx, bitrate);
-        case codec::h265:
-          return std::format(
-              "nvh265enc name=videncoder{0} bitrate={1} rc-mode=cbr-hq "
-              "preset=low-latency-hq gop-size=120 ! h265parse config-interval=1",
-              idx, bitrate);
-        case codec::av1:
-          return std::format(
-              "nvav1enc name=videncoder{0} bitrate={1} rc-mode=cbr "
-              "preset=low-latency-hq gop-size=120 ! av1parse",
-              idx, bitrate);
-      }
-      break;
-    case encoder::software:
-    default:
-      switch (cod) {
-        case codec::h264:
-          return std::format(
-              "x264enc name=videncoder{0} bitrate={1} speed-preset=fast "
-              "tune=zerolatency key-int-max=120 ! video/x-h264,profile=high ! "
-              "h264parse config-interval=1",
-              idx, bitrate);
-        case codec::h265:
-          return std::format(
-              "x265enc name=videncoder{0} bitrate={1} speed-preset=fast "
-              "tune=zerolatency key-int-max=120 ! video/x-h265 ! h265parse "
-              "config-interval=1",
-              idx, bitrate);
-        case codec::av1:
-          return std::format(
-              "rav1enc name=videncoder{0} bitrate={1} speed-preset=8 "
-              "tile-cols=2 tile-rows=2 ! video/x-av1 ! av1parse",
-              idx, bitrate);
-      }
-      break;
-  }
-  return {};
-}
-
-// Connector between decoder and encoder (handles memory domain + upscale).
-auto decode_to_encode_connector(encoder enc,
-                                 bool upscale,
-                                 int width,
-                                 int height) -> std::string
-{
-  switch (enc) {
-    case encoder::nvenc:
-      if (upscale) {
-        return std::format(
-            " ! cudaconvertscale ! "
-            "video/x-raw(memory:CUDAMemory),width={},height={} ! ",
-            width, height);
-      }
-      return " ! ";
-    case encoder::qsv:
-      if (upscale) {
-        return std::format(
-            " ! vapostproc ! "
-            "video/x-raw(memory:VAMemory),width={},height={} ! ",
-            width, height);
-      }
-      return " ! ";
-    case encoder::amd:
-      if (amd_uses_va()) {
-        // Same-vendor VA dec->enc: frames stay in VA memory, link directly;
-        // only vapostproc to rescale. No plain videoconvert between va*dec/enc.
-        if (upscale) {
-          return std::format(
-              " ! vapostproc ! "
-              "video/x-raw(memory:VAMemory),width={},height={} ! ",
-              width, height);
-        }
-        return " ! ";
-      }
-      [[fallthrough]];
-    case encoder::software:
-    default:
-      if (upscale) {
-        return std::format(
-            " ! videoconvert ! videoscale ! video/x-raw,width={},height={} ! ",
-            width, height);
-      }
-      return " ! videoconvert ! ";
-  }
-}
-
-// The video processing fragment between the source tee and the muxer.
-auto video_proc(const destination& dst,
-                codec in_codec,
-                std::size_t idx) -> std::string
-{
-  if (!dst.video.reencode) {
-    // Copy/passthrough: re-parse to set the muxer stream-format + reinsert
-    // SPS/PPS/VPS for late joiners. Parser matches the source codec.
-    return std::format("{} config-interval=1", video_parse(in_codec));
-  }
-  const std::string dec = video_decoder(dst.video.enc, in_codec);
-  const std::string conn = decode_to_encode_connector(
-      dst.video.enc, dst.video.upscale, dst.video.width, dst.video.height);
-  const std::string enc_frag =
-      encoder_fragment(dst.video.enc, dst.video.out_codec, idx, dst.video.bitrate_kbps);
-  return std::format("{} ! {}{}{}", video_parse(in_codec), dec, conn, enc_frag);
 }
 
 // ---- audio element-name helpers --------------------------------------------
@@ -363,100 +198,19 @@ auto audio_decoder(audio_codec cod) noexcept -> const char*
   return "avdec_aac";
 }
 
-// The output audio codec is always AAC (RTMP/SRT/RIST muxers expect it), so the
-// audio branch only passes through when the input is already AAC *and* copy was
-// requested. A non-AAC input under copy mode is transparently transcoded to AAC
-// (the only correct option for e.g. RTMP) — finish_detection_and_launch() logs
-// this upgrade.
-auto audio_proc(const destination& dst, audio_codec in_audio, std::size_t idx)
-    -> std::string
+// The audio branch always DECODES to PCM (uncompressed) for the raw handoff:
+// <parse> ! <decoder> ! audioconvert ! audioresample ! S16LE/48k stereo caps.
+// The detected codec selects the parser + decoder; audioconvert/audioresample
+// normalise to the device's fixed format regardless of the source layout/rate.
+auto audio_decode_fragment(audio_codec in_audio) -> std::string
 {
-  const bool passthrough = !dst.audio.reencode && in_audio == audio_codec::aac;
-  if (passthrough) {
-    return "aacparse";
-  }
   return std::format(
       "{} ! {} ! audioconvert ! audioresample ! "
-      "avenc_aac name=audencoder{} bitrate={}",
+      "audio/x-raw,format=S16LE,channels=2,rate=48000",
       audio_parse(in_audio),
-      audio_decoder(in_audio),
-      idx,
-      dst.audio.bitrate_kbps * 1000);
+      audio_decoder(in_audio));
 }
 
-// Muxer + sink fragment for one destination. mux_name is filled with the
-// muxer element name so the video/audio branches can link into it. When
-// `redact` is true, secrets (stream key / streamid / cname) are replaced with a
-// placeholder for safe logging. Every interpolated value is single-quoted so an
-// (already validated) value cannot break out of the gst_parse_launch property.
-auto output_sink(const destination& dst,
-                  std::size_t idx,
-                  std::string& mux_name,
-                  bool redact) -> std::string
-{
-  const std::string key = redact && !dst.key_or_streamid.empty()
-      ? std::string {"***"}
-      : dst.key_or_streamid;
-  const std::string cname =
-      redact && !dst.cname.empty() ? std::string {"***"} : dst.cname;
-
-  switch (dst.proto) {
-    case output_proto::rtmp:
-    case output_proto::rtmps: {
-      mux_name = std::format("flvmux{}", idx);
-      const std::string loc =
-          key.empty() ? dst.url : std::format("{}/{}", dst.url, key);
-      return std::format(
-          "flvmux name={0} streamable=true ! queue ! "
-          "rtmp2sink name=osink{1} location='{2}'",
-          mux_name, idx, loc);
-    }
-    case output_proto::srt: {
-      mux_name = std::format("mpegtsmux{}", idx);
-      // enable-custom-mappings=true: AV1 (and VP9) have no standardised
-      // MPEG-TS stream type — mpegtsmux refuses them otherwise ("AV1 requires
-      // enabling custom mapping"). The flag is a no-op for H.264/H.265/AAC.
-      std::string sink = std::format(
-          "mpegtsmux name={0} alignment=7 enable-custom-mappings=true ! queue ! "
-          "srtsink name=osink{1} uri='{2}' mode=caller "
-          "wait-for-connection=false latency={3}",
-          mux_name, idx, dst.url, dst.latency_ms);
-      if (!key.empty()) {
-        sink += std::format(" streamid='{}'", key);
-      }
-      return sink;
-    }
-    case output_proto::rist:
-    default: {
-      mux_name = std::format("mpegtsmux{}", idx);
-      std::string host;
-      int port = 0;
-      // validated upstream (validate_config); fall back defensively.
-      if (!parse_authority(dst.url, host, port)) {
-        host = "127.0.0.1";
-        port = 5000;
-      }
-      // ristsink does NOT accept single-quoted property values in
-      // gst_parse_launch (unlike rtmp2sink/srtsink) — `address='1.2.3.4'` is a
-      // parse error. So address/cname are interpolated UNQUOTED; injection is
-      // instead prevented by validate_config, which requires the host (and a
-      // non-empty cname) to be a clean token with no whitespace/meta chars.
-      // enable-custom-mappings=true so AV1/VP9 can be muxed (see srt branch);
-      // a no-op for H.264/H.265/AAC.
-      std::string sink = std::format(
-          "mpegtsmux name={0} alignment=7 enable-custom-mappings=true ! "
-          "rtpmp2tpay ! ristsink name=osink{1} address={2} port={3}",
-          mux_name, idx, host, port);
-      if (dst.sender_buffer > 0) {
-        sink += std::format(" sender-buffer={}", dst.sender_buffer);
-      }
-      if (!cname.empty()) {
-        sink += std::format(" cname={}", cname);
-      }
-      return sink;
-    }
-  }
-}
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -484,109 +238,78 @@ auto restream::first_missing_element(const receiver_config& cfg,
                                      codec in_video,
                                      audio_codec in_audio) const -> std::string
 {
-  // A non-AAC input is always decoded + re-encoded to AAC, even under copy mode
-  // (see audio_proc) — so the audio decoder is needed whenever reencode is set
-  // OR the input is not AAC.
-  const bool audio_transcode = in_audio != audio_codec::aac;
+  // Decode-only handoff: the video decoder (+ its GPU->system download element)
+  // and the audio parser/decoder depend on the detected input codecs; the
+  // convert/resample and the two device sinks are codec-independent.
+  const video_dec vdec =
+      choose_video_decoder(in_video, cfg.sink.prefer_hw_decode);
   std::vector<std::string> needed;
-  for (const destination& dst : cfg.destinations) {
-    if (dst.video.reencode) {
-      needed.emplace_back(video_decoder(dst.video.enc, in_video));
-      needed.emplace_back(video_encoder_element(dst.video.enc, dst.video.out_codec));
-      if (dst.video.upscale) {
-        if (dst.video.enc == encoder::nvenc) {
-          needed.emplace_back("cudaconvertscale");
-        } else if (dst.video.enc == encoder::qsv ||
-                   (dst.video.enc == encoder::amd && amd_uses_va())) {
-          needed.emplace_back("vapostproc");
-        }
-      }
-    }
-    if (dst.audio.reencode || audio_transcode) {
-      needed.emplace_back(audio_decoder(in_audio));
-      needed.emplace_back("avenc_aac");
-    }
+  needed.emplace_back(vdec.element);
+  if (const char* dl = download_element(vdec.domain); dl[0] != '\0') {
+    needed.emplace_back(dl);
   }
+  needed.emplace_back(video_parse(in_video));
+  needed.emplace_back(audio_parse(in_audio));
+  needed.emplace_back(audio_decoder(in_audio));
+  needed.insert(needed.end(),
+                {"videoconvert", "audioconvert", "audioresample", "v4l2sink",
+                 "alsasink"});
   for (const std::string& name : needed) {
-    GstElementFactory* fac = gst_element_factory_find(name.c_str());
-    if (fac == nullptr) {
+    if (!element_present(name.c_str())) {
       return name;
     }
-    gst_object_unref(fac);
   }
   return {};
 }
 
-auto restream::first_missing_output_element(const receiver_config& cfg) const
+auto restream::first_missing_output_element(const receiver_config& /*cfg*/) const
     -> std::string
 {
-  // Only the elements that do NOT depend on the (not-yet-detected) input codec:
-  // the output video encoder, the AAC output encoder, and any upscale converter.
-  // The input decoders are validated in phase 2 once detection has run.
-  std::vector<std::string> needed;
-  for (const destination& dst : cfg.destinations) {
-    if (dst.video.reencode) {
-      needed.emplace_back(
-          video_encoder_element(dst.video.enc, dst.video.out_codec));
-      if (dst.video.upscale) {
-        if (dst.video.enc == encoder::nvenc) {
-          needed.emplace_back("cudaconvertscale");
-        } else if (dst.video.enc == encoder::qsv ||
-                   (dst.video.enc == encoder::amd && amd_uses_va())) {
-          needed.emplace_back("vapostproc");
-        }
-      }
-    }
-    if (dst.audio.reencode) {
-      needed.emplace_back("avenc_aac");
-    }
-  }
-  for (const std::string& name : needed) {
-    GstElementFactory* fac = gst_element_factory_find(name.c_str());
-    if (fac == nullptr) {
+  // Codec-independent sink elements, checkable synchronously before detection.
+  // The decoder (input-codec dependent) is validated in phase 2.
+  for (const char* name :
+       {"v4l2sink", "alsasink", "videoconvert", "audioconvert", "audioresample"})
+  {
+    if (!element_present(name)) {
       return name;
     }
-    gst_object_unref(fac);
   }
   return {};
 }
 
 auto restream::build_pipeline_string(const receiver_config& cfg,
                                      codec in_video,
-                                     audio_codec in_audio,
-                                     bool redact) -> std::string
+                                     audio_codec in_audio) -> std::string
 {
-  // Source + per-stream source fan-out tees. Caps filters after demux select
-  // the correct (dynamic) tsdemux pad without locking stream-format, so each
-  // per-output parser can negotiate the muxer it feeds independently. The caps
-  // come from runtime detection (start_detection), not the declared config.
-  std::string pipeline_str = std::format(
-      "{}demux. ! {} ! queue ! tee name=vsrc "
-      "demux. ! {} ! queue ! tee name=asrc ",
-      k_ts_source,
-      video_caps(in_video),
-      audio_caps(in_audio));
+  const video_dec vdec =
+      choose_video_decoder(in_video, cfg.sink.prefer_hw_decode);
+  const std::string vdownload = raw_download(vdec.domain, cfg.sink.pixel_format);
 
-  for (std::size_t idx = 0; idx < cfg.destinations.size(); ++idx) {
-    const destination& dst = cfg.destinations[idx];
-    std::string mux_name;
-    const std::string sink = output_sink(dst, idx, mux_name, redact);
-
-    // video branch: source tee -> processing -> muxer. leaky=downstream so a
-    // single stalled endpoint drops buffers on its own branch instead of
-    // back-pressuring the shared tee/appsrc (and thereby the RIST ingest).
-    pipeline_str += std::format("vsrc. ! queue leaky=downstream ! {} ! {}. ",
-                                video_proc(dst, in_video, idx),
-                                mux_name);
-    // audio branch: source tee -> processing -> muxer
-    pipeline_str += std::format(
-        "asrc. ! queue leaky=downstream max-size-time=5000000000 ! {} ! {}. ",
-        audio_proc(dst, in_audio, idx),
-        mux_name);
-    // muxer + sink
-    pipeline_str += sink + " ";
-  }
-  return pipeline_str;
+  // Single consumer per stream (no tee). A caps filter after demux selects the
+  // correct (dynamic) tsdemux pad; the caps come from runtime detection
+  // (start_detection), not the declared config. Video: parse -> decode ->
+  // system-memory raw -> v4l2loopback. Audio: parse -> decode -> PCM ->
+  // snd-aloop. A bounded leaky=downstream queue before each sink drops frames if
+  // the loopback device stalls instead of back-pressuring the shared
+  // demux/appsrc (and thereby the RIST ingest). Both sinks sync to the pipeline
+  // clock so the two devices stay time-aligned for the downstream consumer.
+  return std::format(
+      "{0}"
+      "demux. ! {1} ! queue ! {2} ! {3} ! {4} ! "
+      "queue leaky=downstream max-size-buffers=4 ! "
+      "v4l2sink name=vsink device='{5}' sync=true "
+      "demux. ! {6} ! queue ! {7} ! "
+      "queue leaky=downstream max-size-time=200000000 ! "
+      "alsasink name=asink device='{8}' sync=true ",
+      k_ts_source,                      // 0
+      video_caps(in_video),             // 1
+      video_parse(in_video),            // 2
+      vdec.element,                     // 3
+      vdownload,                        // 4: <download> ! videoconvert ! caps
+      cfg.sink.video_device,            // 5
+      audio_caps(in_audio),             // 6
+      audio_decode_fragment(in_audio),  // 7: parse ! dec ! convert ! caps
+      cfg.sink.audio_device);           // 8
 }
 
 auto restream::start(const receiver_config& cfg,
@@ -828,6 +551,13 @@ auto restream::finish_detection_and_launch() -> void
       to_string(in_audio),
       audio_found ? "" : " (fallback: assumed AAC)"));
 
+  // Publish the detected codecs for GET /status (read-only mirror).
+  if (m_state != nullptr) {
+    std::lock_guard<std::mutex> sguard(m_state->mutex);
+    m_state->detected_video = to_string(in_video);
+    m_state->detected_audio = to_string(in_audio);
+  }
+
   // Tear down the detection pipeline (without the "stopped" log / cleaned_up
   // bookkeeping clear_pipeline_state() would do — we are rebuilding, not
   // stopping).
@@ -866,10 +596,8 @@ auto restream::finish_detection_and_launch() -> void
   }
 
   const std::string pipeline_str =
-      build_pipeline_string(m_cfg, in_video, in_audio, /*redact=*/false);
-  log("Restream pipeline:\n"
-      + build_pipeline_string(m_cfg, in_video, in_audio, /*redact=*/true)
-      + "\n");
+      build_pipeline_string(m_cfg, in_video, in_audio);
+  log("Restream pipeline:\n" + pipeline_str + "\n");
 
   GError* error = nullptr;
   m_pipeline = gst_parse_launch(pipeline_str.c_str(), &error);
@@ -906,29 +634,6 @@ auto restream::finish_detection_and_launch() -> void
                                       nullptr);
   gst_app_src_set_caps(GST_APP_SRC(m_appsrc), caps);
   gst_caps_unref(caps);
-
-  // rtmp2sink has a known issue in some GStreamer versions where setting
-  // `location` via gst_parse_launch doesn't propagate to the internal
-  // connection object before the element tries to connect. Set it
-  // programmatically here (after parse_launch, before PLAYING) to guarantee
-  // the host is visible when the async connect fires.
-  for (std::size_t idx = 0; idx < m_cfg.destinations.size(); ++idx) {
-    const destination& dst = m_cfg.destinations[idx];
-    if (dst.proto != output_proto::rtmp && dst.proto != output_proto::rtmps) {
-      continue;
-    }
-    const std::string sink_name = std::format("osink{}", idx);
-    GstElement* sink =
-        gst_bin_get_by_name(GST_BIN(m_pipeline), sink_name.c_str());
-    if (sink == nullptr) {
-      continue;
-    }
-    const std::string loc = dst.key_or_streamid.empty()
-        ? dst.url
-        : std::format("{}/{}", dst.url, dst.key_or_streamid);
-    g_object_set(G_OBJECT(sink), "location", loc.c_str(), nullptr);
-    gst_object_unref(sink);
-  }
 
   m_bus = gst_element_get_bus(m_pipeline);
 

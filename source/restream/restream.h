@@ -16,10 +16,11 @@
 #include "lib/lib.h"
 
 // restream owns the single GStreamer pipeline that receives the demuxed
-// MPEG-TS (pushed in via appsrc by the RIST receiver), then for each
-// configured destination either copies or reencodes video/audio and muxes to
-// RTMP / SRT / RIST. One pipeline, one bus, one teardown — mirroring the
-// encoder's encode-class lifecycle discipline. See docs/GSTREAMER.md.
+// MPEG-TS (pushed in via appsrc by the RIST receiver), DECODES video + audio,
+// and hands the uncompressed result to the local restreaming package
+// (datarhei/restreamer): raw video frames to a v4l2loopback device and PCM
+// audio to an ALSA snd-aloop device. One pipeline, one bus, one teardown.
+// See docs/GSTREAMER.md.
 class restream
 {
 public:
@@ -52,12 +53,11 @@ public:
   }
 
 private:
-  // Build the real restream pipeline string for the *detected* input codecs
-  // (video over RIST + the demuxed audio). `redact` masks secrets for logging.
+  // Build the decode->raw-sink pipeline string for the *detected* input codecs
+  // (video over RIST + the demuxed audio). No secrets to redact (device paths).
   auto build_pipeline_string(const receiver_config& cfg,
                              codec in_video,
-                             audio_codec in_audio,
-                             bool redact = false) -> std::string;
+                             audio_codec in_audio) -> std::string;
   // Returns "" if all elements required for the detected codecs are present,
   // else the missing element name (for an encoder_unavailable error).
   auto first_missing_element(const receiver_config& cfg,

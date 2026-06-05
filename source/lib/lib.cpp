@@ -25,43 +25,6 @@ constexpr int k_buffer_max_max = 60000;
 constexpr int k_rtt_min_max = 10000;
 constexpr int k_rtt_max_max = 60000;
 constexpr int k_reorder_max = 10000;
-constexpr int k_video_bitrate_min = 1000;
-constexpr int k_video_bitrate_max = 60000;
-constexpr int k_dim_min = 16;
-constexpr int k_dim_max_width = 7680;
-constexpr int k_dim_max_height = 4320;
-constexpr int k_audio_bitrate_min = 32;
-constexpr int k_audio_bitrate_max = 512;
-constexpr int k_latency_max = 8000;
-constexpr int k_sender_buffer_max = 10000;
-
-auto expected_scheme(output_proto proto) noexcept -> const char*
-{
-  switch (proto) {
-    case output_proto::rtmp:
-      return "rtmp://";
-    case output_proto::rtmps:
-      return "rtmps://";
-    case output_proto::srt:
-      return "srt://";
-    case output_proto::rist:
-      return "rist://";
-  }
-  return "";
-}
-
-auto valid_host(std::string_view host) noexcept -> bool
-{
-  if (host.empty()) {
-    return false;
-  }
-  return std::ranges::all_of(host, [](char chr) noexcept -> bool {
-    const auto byte = static_cast<unsigned char>(chr);
-    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')
-        || (byte >= '0' && byte <= '9') || chr == '.' || chr == '-' || chr == '_'
-        || chr == ':' || chr == '[' || chr == ']';
-  });
-}
 
 auto fail(std::string code,
           std::string field,
@@ -73,6 +36,21 @@ auto fail(std::string code,
     .field = std::move(field),
     .message = std::move(msg)
   };
+}
+
+// A bare token: ASCII alphanumerics, '_' and '-' only (pixel-format names like
+// NV12 / I420 / YUY2). Used to keep CLI-supplied values that are interpolated
+// UNQUOTED-ish into caps strings free of any pipeline-meta characters.
+auto is_token(std::string_view str) noexcept -> bool
+{
+  if (str.empty()) {
+    return false;
+  }
+  return std::ranges::all_of(str, [](char chr) noexcept -> bool {
+    const auto byte = static_cast<unsigned char>(chr);
+    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')
+        || (byte >= '0' && byte <= '9') || chr == '_' || chr == '-';
+  });
 }
 
 auto validate_ingest(const ingest_config& ing) -> validation_result
@@ -106,141 +84,22 @@ auto validate_ingest(const ingest_config& ing) -> validation_result
   return {};
 }
 
-auto validate_srt_rist_host(const destination& dst,
-                              const std::string& pfx) -> validation_result
+// The raw-sink targets are operator-supplied (CLI) and interpolated into the
+// gst_parse_launch string (device paths single-quoted, pixel format into caps),
+// so they must be free of quote-escape / control characters.
+auto validate_sink(const raw_sink_config& sink) -> validation_result
 {
-  std::string host;
-  int port = 0;
-  if (!parse_authority(dst.url, host, port)) {
-    return fail("bad_url", pfx + ".url", "could not parse host:port from url");
+  if (sink.video_device.empty() || !is_pipeline_safe(sink.video_device)) {
+    return fail("bad_url", "sink.video_device", "invalid v4l2 device path");
   }
-  if (!valid_host(host)) {
-    return fail("bad_url", pfx + ".url", "url host contains invalid characters");
+  if (sink.audio_device.empty() || !is_pipeline_safe(sink.audio_device)) {
+    return fail("bad_url", "sink.audio_device", "invalid alsa device");
   }
-  if (dst.proto == output_proto::rist && (port % 2) != 0) {
-    return fail("out_of_range",
-                pfx + ".url",
-                "rist port must be even (RTCP uses port+1)");
-  }
-  // ristsink cname is interpolated UNQUOTED, so a non-empty cname must be a
-  // clean token too.
-  if (dst.proto == output_proto::rist && !dst.cname.empty()
-      && !valid_host(dst.cname))
-  {
-    return fail("bad_url", pfx + ".params.cname", "cname must be a token");
-  }
-  return {};
-}
-
-auto validate_video_reencode(const destination& dst,
-                              const std::string& pfx) -> validation_result
-{
-  if (dst.video.bitrate_kbps < k_video_bitrate_min
-      || dst.video.bitrate_kbps > k_video_bitrate_max)
-  {
-    return fail("out_of_range",
-                pfx + ".video.bitrate_kbps",
-                "must be 1000..60000");
-  }
-  if (!dst.video.upscale) {
-    return {};
-  }
-  if (dst.video.width < k_dim_min || dst.video.width > k_dim_max_width
-      || (dst.video.width % 2) != 0)
-  {
-    return fail("out_of_range", pfx + ".video.width", "must be even, 16..7680");
-  }
-  if (dst.video.height < k_dim_min || dst.video.height > k_dim_max_height
-      || (dst.video.height % 2) != 0)
-  {
-    return fail("out_of_range",
-                pfx + ".video.height",
-                "must be even, 16..4320");
-  }
-  return {};
-}
-
-auto validate_destination(const destination& dst,
-                           std::size_t idx,
-                           codec in_codec) -> validation_result
-{
-  const std::string pfx = std::format("outputs[{}]", idx);
-
-  if (dst.id.empty()) {
-    return fail("invalid_schema", pfx + ".id", "output id is required");
-  }
-
-  if (!dst.url.starts_with(expected_scheme(dst.proto))) {
-    return fail("bad_url",
-                pfx + ".url",
-                std::format("url scheme must match type '{}'",
-                            to_string(dst.proto)));
-  }
-  if (!is_pipeline_safe(dst.url)) {
-    return fail("bad_url", pfx + ".url", "url contains forbidden characters");
-  }
-  if (!is_pipeline_safe(dst.key_or_streamid)) {
-    return fail("bad_url",
-                pfx + ".key_or_streamid",
-                "key_or_streamid contains forbidden characters");
-  }
-  if (!is_pipeline_safe(dst.cname)) {
-    return fail("bad_url", pfx + ".cname", "cname contains forbidden characters");
-  }
-
-  if (dst.proto == output_proto::srt || dst.proto == output_proto::rist) {
-    if (auto res = validate_srt_rist_host(dst, pfx); !res.ok) {
-      return res;
-    }
-  }
-
-  const codec eff_codec = dst.video.reencode ? dst.video.out_codec : in_codec;
-
-  if (!dst.video.reencode && dst.video.out_codec != in_codec) {
+  if (!is_token(sink.pixel_format)) {
     return fail("bad_enum",
-                pfx + ".video.codec",
-                "copy mode requires video.codec == source.codec");
+                "sink.pixel_format",
+                "pixel format must be a bare token (e.g. NV12)");
   }
-
-  // RTMP/flvmux carries only H.264 (+AAC). See docs/GSTREAMER.md §9.
-  if ((dst.proto == output_proto::rtmp || dst.proto == output_proto::rtmps)
-      && eff_codec != codec::h264)
-  {
-    return fail(
-        "rtmp_codec_unsupported",
-        pfx + ".video.codec",
-        "RTMP/flvmux can only carry H.264; choose h264 (reencode) or a "
-        "non-RTMP output for this codec");
-  }
-
-  if (dst.video.reencode) {
-    if (auto res = validate_video_reencode(dst, pfx); !res.ok) {
-      return res;
-    }
-  }
-
-  if (dst.audio.reencode
-      && (dst.audio.bitrate_kbps < k_audio_bitrate_min
-          || dst.audio.bitrate_kbps > k_audio_bitrate_max))
-  {
-    return fail(
-        "out_of_range", pfx + ".audio.bitrate_kbps", "must be 32..512");
-  }
-
-  if (dst.proto == output_proto::srt
-      && (dst.latency_ms < 0 || dst.latency_ms > k_latency_max))
-  {
-    return fail("out_of_range",
-                pfx + ".params.latency_ms",
-                "must be 0..8000");
-  }
-  if (dst.proto == output_proto::rist
-      && (dst.sender_buffer < 0 || dst.sender_buffer > k_sender_buffer_max))
-  {
-    return fail(
-        "out_of_range", pfx + ".params.sender_buffer", "must be 0..10000");
-  }
-
   return {};
 }
 }  // namespace
@@ -279,36 +138,6 @@ auto to_string(audio_codec cod) noexcept -> const char*
   return "aac";
 }
 
-auto to_string(encoder enc) noexcept -> const char*
-{
-  switch (enc) {
-    case encoder::amd:
-      return "amd";
-    case encoder::qsv:
-      return "qsv";
-    case encoder::nvenc:
-      return "nvenc";
-    case encoder::software:
-      return "software";
-  }
-  return "software";
-}
-
-auto to_string(output_proto proto) noexcept -> const char*
-{
-  switch (proto) {
-    case output_proto::rtmp:
-      return "rtmp";
-    case output_proto::rtmps:
-      return "rtmps";
-    case output_proto::srt:
-      return "srt";
-    case output_proto::rist:
-      return "rist";
-  }
-  return "rtmp";
-}
-
 auto parse_codec(std::string_view str, codec& out) noexcept -> bool
 {
   if (str == "h264") {
@@ -317,38 +146,6 @@ auto parse_codec(std::string_view str, codec& out) noexcept -> bool
     out = codec::h265;
   } else if (str == "av1") {
     out = codec::av1;
-  } else {
-    return false;
-  }
-  return true;
-}
-
-auto parse_encoder(std::string_view str, encoder& out) noexcept -> bool
-{
-  if (str == "amd") {
-    out = encoder::amd;
-  } else if (str == "qsv") {
-    out = encoder::qsv;
-  } else if (str == "nvenc") {
-    out = encoder::nvenc;
-  } else if (str == "software") {
-    out = encoder::software;
-  } else {
-    return false;
-  }
-  return true;
-}
-
-auto parse_output_proto(std::string_view str, output_proto& out) noexcept -> bool
-{
-  if (str == "rtmp") {
-    out = output_proto::rtmp;
-  } else if (str == "rtmps") {
-    out = output_proto::rtmps;
-  } else if (str == "srt") {
-    out = output_proto::srt;
-  } else if (str == "rist") {
-    out = output_proto::rist;
   } else {
     return false;
   }
@@ -475,16 +272,8 @@ auto validate_config(const receiver_config& cfg) -> validation_result
     return res;
   }
 
-  if (cfg.destinations.empty()) {
-    return fail("invalid_schema", "outputs", "at least one output is required");
-  }
-
-  for (std::size_t idx = 0; idx < cfg.destinations.size(); ++idx) {
-    if (auto res = validate_destination(cfg.destinations.at(idx), idx, cfg.in_codec);
-        !res.ok)
-    {
-      return res;
-    }
+  if (const auto res = validate_sink(cfg.sink); !res.ok) {
+    return res;
   }
 
   return {};
