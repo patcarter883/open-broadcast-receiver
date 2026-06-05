@@ -17,9 +17,15 @@ PRESENT (testable locally): `appsrc`, `queue`, `queue2`, `tsparse`, `tsdemux`, `
 `x265enc`, `avenc_aac`, `videoconvert`, `videoscale`, `videoconvertscale`, `audioconvert`, `audioresample`,
 `flvmux`, `rtmp2sink`, `rtmpsink`, `mpegtsmux`, `rtpmp2tpay`, `srtsink`, `ristsink`.
 
+PRESENT — **AMD VA-API HW** (verified 2026-06-05 on a Radeon RX 9070 XT via mesa `radeonsi`): `vah264dec`,
+`vah264enc`, `vah265dec`, `vah265enc`, `vaav1dec`, `vaav1enc`, `vapostproc` (plus `vacompositor`, `vadeinterlace`,
+`vavp9dec`, `vajpegdec`). The receiver's `amd` family therefore runs on VA on Linux — full GPU `va*dec → va*enc` with
+frames kept in VA memory — and falls back to `amf*` only when `vah264enc` is absent (Windows builds).
+
 ABSENT here — **deployment-box-only** (strings must still be generatable, cannot be tested locally): `nvh264enc`,
-`nvh265enc`, `nvav1enc`, `nvh264dec`, `nvh265dec`, `nvav1dec`, `amfh264enc`, `amfh265enc`, `amfav1enc`, `qsvh264enc`,
-`qsvh265enc`, `qsvav1enc` (and `qsv*dec`), `cudascale`, `cudaconvertscale`, `cudaupload`/`cudadownload`,
+`nvh265enc`, `nvav1enc`, `nvh264dec`, `nvh265dec`, `nvav1dec`, `amfh264enc`, `amfh265enc`, `amfav1enc` (AMF has no
+Linux GStreamer plugin on this box — the AMD path uses VA above), `qsvh264enc`, `qsvh265enc`, `qsvav1enc` (and
+`qsv*dec`), `cudascale`, `cudaconvertscale`, `cudaupload`/`cudadownload`,
 **and `rav1enc`** (so software AV1 *encode* is also deployment-only; only AV1 *decode* `av1dec` is present).
 
 **Implication.** Fully testable locally: all copy paths, software h264/h265 reencode, and all three output protocols
@@ -135,16 +141,18 @@ rescale.
 |-------|----------|
 | h264 | `demux. ! h264parse ! nvh264dec ! nvh264enc name=videncoder bitrate={BR} rc-mode=cbr-hq preset=low-latency-hq gop-size=120 ! h264parse config-interval=1 ! tee name=vtee` |
 | h265 | `demux. ! h265parse ! nvh265dec ! nvh265enc name=videncoder bitrate={BR} rc-mode=cbr-hq preset=low-latency-hq gop-size=120 ! h265parse config-interval=1 ! tee name=vtee` |
-| av1  | `demux. ! av1parse ! nvav1dec ! nvav1enc name=videncoder bitrate={BR} rc-mode=cbr preset=low-latency-hq gop-size=120 ! av1parse config-interval=1 ! tee name=vtee` |
+| av1  | `demux. ! av1parse ! nvav1dec ! nvav1enc name=videncoder bitrate={BR} rc-mode=cbr preset=low-latency-hq gop-size=120 ! av1parse ! tee name=vtee` |
 
-### encoder = amd (deployment-only)
-AMF has no Linux GStreamer hardware decoder element; decode with `avdec_*`/`av1dec` (or VA decoders if available),
-then `amf*enc`. `videoconvert` IS needed (software decode → hw encode crosses memory).
-| codec | fragment |
+### encoder = amd (VA-API verified locally on RX 9070 XT; AMF is the Windows fallback)
+On Linux the `amd` family uses **VA-API**: same-vendor `va*dec → va*enc` keep frames in VA memory and link
+**directly** (no `videoconvert`); insert `vapostproc` only to rescale (§6). The receiver falls back to the AMF
+fragments (`avdec_* ! videoconvert ! amf*enc`) only when `vah264enc` is absent (Windows builds). **`av1parse` has no
+`config-interval` property in 1.28.3 — do NOT append it to the AV1 output parser** (applies to every family's AV1 row).
+| codec | fragment (Linux / VA) |
 |-------|----------|
-| h264 | `demux. ! h264parse ! avdec_h264 ! videoconvert ! amfh264enc name=videncoder bitrate={BR} rate-control=cbr usage=low-latency preset=quality pre-encode=true pa-hqmb-mode=auto ! video/x-h264,profile=high ! h264parse config-interval=1 ! tee name=vtee` |
-| h265 | `demux. ! h265parse ! avdec_h265 ! videoconvert ! amfh265enc name=videncoder bitrate={BR} rate-control=cbr usage=low-latency preset=quality pre-encode=true pa-hqmb-mode=auto ! video/x-h265 ! h265parse config-interval=1 ! tee name=vtee` |
-| av1  | `demux. ! av1parse ! av1dec ! videoconvert ! amfav1enc name=videncoder bitrate={BR} rate-control=cbr usage=low-latency preset=high-quality pre-encode=true pa-hqmb-mode=auto ! video/x-av1 ! av1parse config-interval=1 ! tee name=vtee` |
+| h264 | `demux. ! h264parse ! vah264dec ! vah264enc name=videncoder bitrate={BR} rate-control=cbr target-usage=4 key-int-max=120 b-frames=0 ! video/x-h264,profile=high ! h264parse config-interval=1 ! tee name=vtee` |
+| h265 | `demux. ! h265parse ! vah265dec ! vah265enc name=videncoder bitrate={BR} rate-control=cbr target-usage=4 key-int-max=120 b-frames=0 ! video/x-h265 ! h265parse config-interval=1 ! tee name=vtee` |
+| av1  | `demux. ! av1parse ! vaav1dec ! vaav1enc name=videncoder bitrate={BR} rate-control=cbr target-usage=4 key-int-max=120 ! video/x-av1 ! av1parse ! tee name=vtee` |
 
 ### encoder = qsv (deployment-only)
 Same-vendor `qsv*dec`→`qsv*enc` trade `(memory:VAMemory)`/DMABuf and link directly. If the decode element is absent,
@@ -153,7 +161,7 @@ fall back to `avdec_* ! videoconvert ! qsv*enc`.
 |-------|----------|
 | h264 | `demux. ! h264parse ! qsvh264dec ! qsvh264enc name=videncoder bitrate={BR} rate-control=cbr target-usage=1 gop-size=120 ! video/x-h264,profile=high ! h264parse config-interval=1 ! tee name=vtee` |
 | h265 | `demux. ! h265parse ! qsvh265dec ! qsvh265enc name=videncoder bitrate={BR} rate-control=cbr target-usage=1 gop-size=120 ! video/x-h265 ! h265parse config-interval=1 ! tee name=vtee` |
-| av1  | `demux. ! av1parse ! qsvav1dec ! qsvav1enc name=videncoder bitrate={BR} rate-control=cbr target-usage=1 gop-size=120 ! video/x-av1 ! av1parse config-interval=1 ! tee name=vtee` |
+| av1  | `demux. ! av1parse ! qsvav1dec ! qsvav1enc name=videncoder bitrate={BR} rate-control=cbr target-usage=1 gop-size=120 ! video/x-av1 ! av1parse ! tee name=vtee` |
 
 ---
 

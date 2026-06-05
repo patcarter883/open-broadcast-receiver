@@ -52,6 +52,22 @@ auto video_caps(codec cod) noexcept -> const char*
   return "video/x-h264";
 }
 
+// AMD HW path: VA-API (Linux/mesa) when present, else AMF (Windows builds).
+// Per-codec elements are still validated in first_missing_element(); this only
+// chooses the family. vah264enc presence is the sentinel for the VA path.
+auto amd_uses_va() noexcept -> bool
+{
+  static const bool va = [] {
+    GstElementFactory* fac = gst_element_factory_find("vah264enc");
+    if (fac != nullptr) {
+      gst_object_unref(fac);
+      return true;
+    }
+    return false;
+  }();
+  return va;
+}
+
 // Decoder element for (encoder family, source codec).
 auto video_decoder(encoder enc, codec cod) noexcept -> const char*
 {
@@ -65,6 +81,12 @@ auto video_decoder(encoder enc, codec cod) noexcept -> const char*
           : cod == codec::h265  ? "qsvh265dec"
                                 : "qsvav1dec";
     case encoder::amd:
+      if (amd_uses_va()) {
+        return cod == codec::h264 ? "vah264dec"
+            : cod == codec::h265  ? "vah265dec"
+                                  : "vaav1dec";
+      }
+      [[fallthrough]];
     case encoder::software:
     default:
       return cod == codec::h264 ? "avdec_h264"
@@ -78,6 +100,11 @@ auto video_encoder_element(encoder enc, codec cod) noexcept -> const char*
 {
   switch (enc) {
     case encoder::amd:
+      if (amd_uses_va()) {
+        return cod == codec::h264 ? "vah264enc"
+            : cod == codec::h265  ? "vah265enc"
+                                  : "vaav1enc";
+      }
       return cod == codec::h264 ? "amfh264enc"
           : cod == codec::h265  ? "amfh265enc"
                                 : "amfav1enc";
@@ -106,6 +133,28 @@ auto encoder_fragment(encoder enc,
 {
   switch (enc) {
     case encoder::amd:
+      if (amd_uses_va()) {
+        switch (cod) {
+          case codec::h264:
+            return std::format(
+                "vah264enc name=videncoder{0} bitrate={1} rate-control=cbr "
+                "target-usage=4 key-int-max=120 b-frames=0 ! "
+                "video/x-h264,profile=high ! h264parse config-interval=1",
+                idx, bitrate);
+          case codec::h265:
+            return std::format(
+                "vah265enc name=videncoder{0} bitrate={1} rate-control=cbr "
+                "target-usage=4 key-int-max=120 b-frames=0 ! video/x-h265 ! "
+                "h265parse config-interval=1",
+                idx, bitrate);
+          case codec::av1:
+            return std::format(
+                "vaav1enc name=videncoder{0} bitrate={1} rate-control=cbr "
+                "target-usage=4 key-int-max=120 ! video/x-av1 ! av1parse",
+                idx, bitrate);
+        }
+        break;
+      }
       switch (cod) {
         case codec::h264:
           return std::format(
@@ -124,7 +173,7 @@ auto encoder_fragment(encoder enc,
           return std::format(
               "amfav1enc name=videncoder{0} bitrate={1} rate-control=cbr "
               "usage=low-latency preset=high-quality pre-encode=true "
-              "pa-hqmb-mode=auto ! video/x-av1 ! av1parse config-interval=1",
+              "pa-hqmb-mode=auto ! video/x-av1 ! av1parse",
               idx, bitrate);
       }
       break;
@@ -145,8 +194,7 @@ auto encoder_fragment(encoder enc,
         case codec::av1:
           return std::format(
               "qsvav1enc name=videncoder{0} bitrate={1} rate-control=cbr "
-              "target-usage=1 gop-size=120 ! video/x-av1 ! av1parse "
-              "config-interval=1",
+              "target-usage=1 gop-size=120 ! video/x-av1 ! av1parse",
               idx, bitrate);
       }
       break;
@@ -165,7 +213,7 @@ auto encoder_fragment(encoder enc,
         case codec::av1:
           return std::format(
               "nvav1enc name=videncoder{0} bitrate={1} rc-mode=cbr "
-              "preset=low-latency-hq gop-size=120 ! av1parse config-interval=1",
+              "preset=low-latency-hq gop-size=120 ! av1parse",
               idx, bitrate);
       }
       break;
@@ -219,6 +267,18 @@ auto decode_to_encode_connector(encoder enc,
       }
       return " ! ";
     case encoder::amd:
+      if (amd_uses_va()) {
+        // Same-vendor VA dec->enc: frames stay in VA memory, link directly;
+        // only vapostproc to rescale. No plain videoconvert between va*dec/enc.
+        if (upscale) {
+          return std::format(
+              " ! vapostproc ! "
+              "video/x-raw(memory:VAMemory),width={},height={} ! ",
+              width, height);
+        }
+        return " ! ";
+      }
+      [[fallthrough]];
     case encoder::software:
     default:
       if (upscale) {
@@ -436,7 +496,8 @@ auto restream::first_missing_element(const receiver_config& cfg,
       if (dst.video.upscale) {
         if (dst.video.enc == encoder::nvenc) {
           needed.emplace_back("cudaconvertscale");
-        } else if (dst.video.enc == encoder::qsv) {
+        } else if (dst.video.enc == encoder::qsv ||
+                   (dst.video.enc == encoder::amd && amd_uses_va())) {
           needed.emplace_back("vapostproc");
         }
       }
@@ -470,7 +531,8 @@ auto restream::first_missing_output_element(const receiver_config& cfg) const
       if (dst.video.upscale) {
         if (dst.video.enc == encoder::nvenc) {
           needed.emplace_back("cudaconvertscale");
-        } else if (dst.video.enc == encoder::qsv) {
+        } else if (dst.video.enc == encoder::qsv ||
+                   (dst.video.enc == encoder::amd && amd_uses_va())) {
           needed.emplace_back("vapostproc");
         }
       }
