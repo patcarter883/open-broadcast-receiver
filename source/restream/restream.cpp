@@ -28,8 +28,15 @@ constexpr auto k_detect_hard_timeout = std::chrono::seconds {30};
 // Shared front of both the detection and the real pipeline: appsrc fed by the
 // RIST receiver -> tsparse -> tsdemux. Kept in one place so the two pipelines
 // cannot drift (same appsrc tuning, same demux name "demux").
+// NOTE: appsrc has do-timestamp DISABLED on purpose. tsparse set-timestamps=true
+// re-derives buffer timestamps from the stream PCR, so it is the single timestamp
+// authority. Letting appsrc ALSO stamp from the arrival/running clock made the two
+// disagree across a RIST recovery/reorder, producing a one-off DTS discontinuity
+// that the downstream muxer (and datarhei's ffmpeg) latched as a high-water mark
+// -> a permanent flood of "Non-monotonic DTS ... changing to N" warnings. Trust
+// PCR only.
 constexpr const char* k_ts_source =
-    "appsrc name=videosrc is-live=true do-timestamp=true format=time "
+    "appsrc name=videosrc is-live=true format=time "
     "stream-type=0 max-bytes=4194304 block=true emit-signals=false "
     "! queue2 ! tsparse set-timestamps=true alignment=7 ! tsdemux name=demux ";
 
