@@ -92,20 +92,19 @@ auto validate_ingest(const ingest_config& ing) -> validation_result
 }
 
 // The on-GPU re-encode settings come from the encoder (bitrate/upscale/dims) and
-// the operator (rtmp_location/preset). The RTMP location is single-quoted into
-// the rtmp2sink `location=` property and the preset goes bare into nvh264enc, so
-// both must be free of quote-escape / control characters. RTMP carries H264 only
-// (stream2 has no nvh265enc / nvav1enc), so out_codec is pinned to h264.
+// the operator (udp_host/udp_port/preset). The host and preset go bare into the
+// udpsink/nvh264enc pipeline string, so both must be free of whitespace /
+// quote-escape / control characters. The output is H264 only (stream2 has no
+// nvh265enc / nvav1enc), so out_codec is pinned to h264.
 auto validate_reencode(const reencode_config& re) -> validation_result
 {
-  if (re.rtmp_location.empty()
-      || (!re.rtmp_location.starts_with("rtmp://")
-          && !re.rtmp_location.starts_with("rtmps://"))
-      || !is_pipeline_safe(re.rtmp_location))
-  {
-    return fail("bad_url",
-                "reencode.rtmp_location",
-                "must be a quote-safe rtmp:// or rtmps:// URL");
+  if (re.udp_host.empty() || !is_pipeline_safe(re.udp_host)) {
+    return fail("bad_host",
+                "reencode.udp_host",
+                "must be a non-empty pipeline-safe host/IP");
+  }
+  if (re.udp_port < 1 || re.udp_port > 65535) {
+    return fail("out_of_range", "reencode.udp_port", "must be 1..65535");
   }
   if (re.bitrate_kbps < k_video_bitrate_min
       || re.bitrate_kbps > k_video_bitrate_max)

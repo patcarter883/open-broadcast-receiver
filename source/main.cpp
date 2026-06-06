@@ -50,8 +50,9 @@ auto print_usage(const char* argv0) -> void
       << "  --rtt-max <ms>          RIST recovery RTT max (default 500)\n"
       << "  --reorder-buffer <ms>   RIST reorder hold-off (default 30; keep well\n"
       << "                          below buffer-min or retransmission is starved)\n"
-      << "  --rtmp-location <url>   RTMP push URL for the on-GPU H264 publish\n"
-      << "                          (default the datarhei blue.stream ingest)\n"
+      << "  --udp-host <host>       MPEG-TS/UDP sink host for the H264 publish\n"
+      << "                          (default 127.0.0.1; datarhei udp ingest)\n"
+      << "  --udp-port <port>       MPEG-TS/UDP sink port (default 12000)\n"
       << "  --bitrate <kbps>        on-GPU H264 encode bitrate (default 4300;\n"
       << "                          1000..60000)\n"
       << "  --upscale               insert cudascale to encode at --width x\n"
@@ -64,7 +65,7 @@ auto print_usage(const char* argv0) -> void
       << "                          NVDEC/VA/QSV when present)\n"
       << "  --help                  Show this help\n\n"
       << "The receiver decodes the incoming RIST stream, re-encodes H264 on the\n"
-      << "GPU (NVENC) and pushes a single RTMP publish to a restreaming package\n"
+      << "GPU (NVENC) and pushes a single MPEG-TS/UDP stream to a restreaming package\n"
       << "(e.g. datarhei/restreamer), which fans it out by codec copy. AAC audio\n"
       << "is passed through. The restream pipeline AUTO-STARTS on the first RIST\n"
       << "connection using the encode settings above (no POST /start required);\n"
@@ -118,11 +119,12 @@ auto main(int argc, char** argv) -> int
   int rtt_min = receiver_defaults::rtt_min_ms;
   int rtt_max = receiver_defaults::rtt_max_ms;
   int reorder_buffer = receiver_defaults::reorder_buffer_ms;
-  // On-GPU re-encode infrastructure (host-set; see reencode_config). The RTMP
-  // push URL targets the local restreaming package (datarhei). The encode
+  // On-GPU re-encode infrastructure (host-set; see reencode_config). The MPEG-TS/
+  // UDP sink targets the local restreaming package (datarhei). The encode
   // settings (bitrate/upscale/dims) come from the encoder via /start; only this
-  // location + the decode preference are operator-authoritative here.
-  std::string rtmp_location = reencode_config {}.rtmp_location;
+  // target + the decode preference are operator-authoritative here.
+  std::string udp_host = reencode_config {}.udp_host;
+  int udp_port = reencode_config {}.udp_port;
   bool prefer_hw_decode = true;
   // On-GPU encode settings for AUTO-START. The receiver no longer waits for the
   // encoder's /start to supply these — it auto-starts on the first RIST
@@ -187,12 +189,18 @@ auto main(int argc, char** argv) -> int
       if (!next(reorder_buffer)) {
         return 2;
       }
-    } else if (arg == "--rtmp-location") {
+    } else if (arg == "--udp-host") {
       if (idx + 1 >= argc) {
-        std::cerr << "Missing value for --rtmp-location\n";
+        std::cerr << "Missing value for --udp-host\n";
         return 2;
       }
-      rtmp_location = argv[++idx];
+      udp_host = argv[++idx];
+    } else if (arg == "--udp-port") {
+      if (idx + 1 >= argc || !parse_int(argv[idx + 1], udp_port, 1, 65535)) {
+        std::cerr << "Invalid or missing value for --udp-port\n";
+        return 2;
+      }
+      ++idx;
     } else if (arg == "--bitrate") {
       if (idx + 1 >= argc || !parse_int(argv[idx + 1], bitrate, 1, 1000000)) {
         std::cerr << "Invalid or missing value for --bitrate\n";
@@ -252,7 +260,7 @@ auto main(int argc, char** argv) -> int
                      std::string&,
                      int&)>
       do_start = [&ctx, &lifecycle, rist_port, buffer_min, buffer_max, rtt_min,
-                  rtt_max, reorder_buffer, rtmp_location, prefer_hw_decode](
+                  rtt_max, reorder_buffer, udp_host, udp_port, prefer_hw_decode](
                      const receiver_config& body_cfg,
                      std::string& err_code,
                      std::string& err_msg,
@@ -270,11 +278,12 @@ auto main(int argc, char** argv) -> int
     cfg.ingest.rtt_min = rtt_min;
     cfg.ingest.rtt_max = rtt_max;
     cfg.ingest.reorder_buffer = reorder_buffer;
-    // The RTMP push URL and decode preference are operator-authoritative
+    // The UDP sink target and decode preference are operator-authoritative
     // (CLI), like --rist-port. Applied before the idempotency compare so it
     // sees the effective config. The encode settings (bitrate/upscale/dims)
     // come from the auto cfg (CLI defaults) or a /start body.
-    cfg.reencode.rtmp_location = rtmp_location;
+    cfg.reencode.udp_host = udp_host;
+    cfg.reencode.udp_port = udp_port;
     cfg.reencode.prefer_hw_decode = prefer_hw_decode;
 
     if (ctx.state.is_running.load(std::memory_order_acquire)) {
@@ -377,10 +386,8 @@ auto main(int argc, char** argv) -> int
   std::cout << "open-broadcast-receiver listening: control http://" << bind_host
             << ":" << control_port << "  rist @[::]:" << rist_port
             << (token.empty() ? "  [DEV no-auth]" : "  [token auth]") << "\n";
-  const std::string rtmp_redacted =
-      rtmp_location.substr(0, rtmp_location.find('?'));
-  std::cout << "On-GPU H264 encode -> RTMP " << rtmp_redacted << " ("
-            << (prefer_hw_decode ? "hw" : "sw")
+  std::cout << "On-GPU H264 encode -> MPEG-TS/UDP " << udp_host << ":" << udp_port
+            << " (" << (prefer_hw_decode ? "hw" : "sw")
             << " decode)  audio -> AAC passthrough\n";
 
   // --- AUTO-START config (the receiver's own defaults + CLI) ------------------
@@ -395,10 +402,10 @@ auto main(int argc, char** argv) -> int
   auto_cfg.reencode.upscale = upscale;
   auto_cfg.reencode.width = width;
   auto_cfg.reencode.height = height;
-  // rtmp_location / prefer_hw_decode are applied inside do_start from the CLI.
+  // udp_host/udp_port / prefer_hw_decode are applied inside do_start from the CLI.
 
   // Fail fast on bad CLI before we touch GStreamer. do_start applies the CLI
-  // ingest/rtmp overrides itself, so mirror them here for an accurate check.
+  // ingest/udp overrides itself, so mirror them here for an accurate check.
   {
     receiver_config check = auto_cfg;
     check.ingest.buffer_min = buffer_min;
@@ -406,7 +413,8 @@ auto main(int argc, char** argv) -> int
     check.ingest.rtt_min = rtt_min;
     check.ingest.rtt_max = rtt_max;
     check.ingest.reorder_buffer = reorder_buffer;
-    check.reencode.rtmp_location = rtmp_location;
+    check.reencode.udp_host = udp_host;
+    check.reencode.udp_port = udp_port;
     check.reencode.prefer_hw_decode = prefer_hw_decode;
     if (const auto res = validate_config(check); !res.ok) {
       std::cerr << "FATAL: invalid configuration (" << res.error_code << " @ "

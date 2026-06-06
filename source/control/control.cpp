@@ -156,8 +156,8 @@ auto parse_start_body(const json& jbody) -> receiver_config
       require_string(jbody.at("source"), "codec", "source.codec"),
       "source.codec");
 
-  // The receiver re-encodes ON THE GPU and pushes a single H264 RTMP publish to
-  // datarhei (rtmp_location is operator infrastructure, applied in main.cpp).
+  // The receiver re-encodes ON THE GPU and pushes a single H264 MPEG-TS/UDP
+  // stream to datarhei (udp_host/udp_port is operator infra, applied in main.cpp).
   // The encode settings come from the encoder's outputs[0].video block; only the
   // video sub-object is honoured (audio is AAC passthrough). See docs/CONTRACT.md.
   if (!jbody.contains("outputs") || !jbody.at("outputs").is_array()
@@ -220,18 +220,6 @@ auto error_body(const std::string& code,
   }
   err_json["message"] = message;
   return err_json;
-}
-
-// Redact a RTMP push URL's `?token=...` query so it never appears in a /status
-// or /start response. Everything up to (and including) the '?' is kept; the
-// query is replaced with a fixed marker.
-auto redact_rtmp(const std::string& url) -> std::string
-{
-  const std::size_t qpos = url.find('?');
-  if (qpos == std::string::npos) {
-    return url;
-  }
-  return url.substr(0, qpos) + "?token=***";
 }
 
 constexpr std::size_t k_max_body_bytes = 256 * 1024;
@@ -318,7 +306,7 @@ auto control_server::build_status_json() const -> std::string
   re_json["upscale"] = re.upscale;
   re_json["width"] = re.width;
   re_json["height"] = re.height;
-  re_json["rtmp_location"] = redact_rtmp(re.rtmp_location);
+  re_json["udp_target"] = re.udp_host + ":" + std::to_string(re.udp_port);
   re_json["video_codec"] = det_v.empty() ? json(nullptr) : json(det_v);
   re_json["audio_codec"] = det_a.empty() ? json(nullptr) : json(det_a);
   re_json["state"] = last_err.empty() ? "running" : "error";
@@ -398,8 +386,8 @@ auto control_server::setup_routes() -> void
                  re_json["upscale"] = cfg.reencode.upscale;
                  re_json["width"] = cfg.reencode.width;
                  re_json["height"] = cfg.reencode.height;
-                 re_json["rtmp_location"] =
-                     redact_rtmp(cfg.reencode.rtmp_location);
+                 re_json["udp_target"] = cfg.reencode.udp_host + ":"
+                     + std::to_string(cfg.reencode.udp_port);
                  re_json["state"] = "connecting";
                  body["reencode"] = std::move(re_json);
                  res.status = 200;

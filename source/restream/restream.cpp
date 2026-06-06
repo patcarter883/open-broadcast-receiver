@@ -14,9 +14,16 @@ namespace
 {
 constexpr int k_mpeg_ts_packet_size = 188;
 
-// How long to wait for tsdemux to expose the elementary-stream pads before
-// giving up on detection and falling back to the declared codec / AAC.
+// Soft window: once the VIDEO codec is known we wait at most this long for the
+// audio pad before launching (audio falls back to AAC). We do NOT fall back the
+// video codec at the soft timeout -- a wrong-codec pipeline (e.g. h264 built for
+// an av1 stream) silently stalls because the demux pad never links.
 constexpr auto k_detect_timeout = std::chrono::seconds {5};
+
+// Hard cap: only after this long with NO video codec detected do we give up and
+// launch with the declared fallback codec. Generous so a slow RIST handshake /
+// buffer fill on (re)connect does not race detection into a wrong guess.
+constexpr auto k_detect_hard_timeout = std::chrono::seconds {30};
 
 // Shared front of both the detection and the real pipeline: appsrc fed by the
 // RIST receiver -> tsparse -> tsdemux. Kept in one place so the two pipelines
@@ -183,7 +190,7 @@ auto restream::first_missing_element(const receiver_config& cfg,
     needed.insert(needed.end(), {"cudaconvert", "nvh264enc"});
   }
   needed.insert(needed.end(),
-                {"h264parse", "flvmux", "rtmp2sink", "aacparse"});
+                {"h264parse", "mpegtsmux", "udpsink", "aacparse"});
   for (const std::string& name : needed) {
     if (!element_present(name.c_str())) {
       return name;
@@ -199,7 +206,7 @@ auto restream::first_missing_output_element(const receiver_config& cfg) const
   // detection. The decoder (input-codec dependent) is validated in phase 2.
   // cudascale is only required when upscale is enabled.
   std::vector<std::string> needed = {
-      "nvh264enc", "cudaconvert", "h264parse", "flvmux", "rtmp2sink", "aacparse"};
+      "nvh264enc", "cudaconvert", "h264parse", "mpegtsmux", "udpsink", "aacparse"};
   if (cfg.reencode.upscale) {
     needed.emplace_back("cudascale");
   }
@@ -225,10 +232,15 @@ auto restream::build_pipeline_string(const receiver_config& cfg,
   const bool passthrough = !re.reencode && in_video == codec::h264;
 
   std::string video_branch;
+  // A queue between the video chain and the muxer is REQUIRED for mpegtsmux
+  // (an aggregator): while it holds a video buffer waiting for the audio pad,
+  // the encoder/parser would otherwise block, back up the post-demux queue and
+  // stall tsdemux's single demux loop -> audio never arrives -> deadlock. The
+  // queue lets the video branch run ahead so tsdemux keeps feeding both pads.
   if (passthrough) {
     // H264 in -> just parse and mux; no decode/encode, frames never touched.
     video_branch = std::format(
-        "demux. ! {0} ! queue ! {1} config-interval=1 ! mux. ",
+        "demux. ! {0} ! queue ! {1} config-interval=1 ! queue ! mux. ",
         video_caps(in_video),    // 0
         video_parse(in_video));  // 1
   } else {
@@ -246,7 +258,7 @@ auto restream::build_pipeline_string(const receiver_config& cfg,
     video_branch = std::format(
         "demux. ! {0} ! queue ! {1} ! {2} ! {3}cudaconvert ! "
         "nvh264enc bitrate={4} preset={5} gop-size={6} ! "
-        "h264parse config-interval=1 ! mux. ",
+        "h264parse config-interval=1 ! queue ! mux. ",
         video_caps(in_video),   // 0
         video_parse(in_video),  // 1
         vdec.element,           // 2
@@ -256,24 +268,25 @@ auto restream::build_pipeline_string(const receiver_config& cfg,
         re.gop_size);           // 6
   }
 
-  // Audio is AAC passthrough: aacparse (ADTS -> raw AAC) straight into flvmux.
-  // No decode/re-encode. flvmux is named "mux" so both branches request it.
-  // The RTMP location is interpolated BARE (no quotes): gst_parse_launch does not
-  // strip surrounding quotes (they become part of the value, so rtmp2sink would
-  // see "'rtmp://..." and fail with "Host is not set"). is_pipeline_safe
-  // (validate_reencode) guarantees the URL is free of whitespace/quote/backslash,
-  // and only the FIRST '=' after a property name is the separator, so the '?'/'='
-  // in the "?token=..." query pass through literally.
+  // Audio is AAC passthrough: aacparse (ADTS -> raw AAC) straight into mpegtsmux.
+  // No decode/re-encode. mpegtsmux is named "mux" so both branches request it.
+  // alignment=7 packs 7x188-byte TS packets (1316B) per buffer so each UDP
+  // datagram stays under a 1500-byte MTU (no IP fragmentation on the bridge).
+  // host/port are interpolated BARE; is_pipeline_safe (validate_reencode)
+  // guarantees udp_host is whitespace/quote free. UDP has no connection to drop,
+  // so a datarhei restart cannot error the pipeline (unlike rtmp2sink, which
+  // died on remote close and cascaded an error up to queue2/appsrc).
   return std::format(
       "{0}"
       "{1}"
       "demux. ! {2} ! aacparse ! queue ! mux. "
-      "flvmux name=mux streamable=true ! queue ! "
-      "rtmp2sink name=rtmpsink sync=false location={3} ",
+      "mpegtsmux name=mux alignment=7 ! queue ! "
+      "udpsink name=udpsink host={3} port={4} sync=false ",
       k_ts_source,            // 0
       video_branch,           // 1
       audio_caps(in_audio),   // 2
-      re.rtmp_location);      // 3
+      re.udp_host,            // 3
+      re.udp_port);           // 4
 }
 
 auto restream::start(const receiver_config& cfg,
@@ -684,11 +697,17 @@ auto restream::bus_loop() -> void
       bool done = false;
       {
         std::lock_guard<std::mutex> det(m_detect_mutex);
+        const auto elapsed =
+            std::chrono::steady_clock::now() - m_detect_started;
         const bool have_both = m_video_found && m_audio_found;
-        const bool timed_out =
-            (std::chrono::steady_clock::now() - m_detect_started)
-            >= k_detect_timeout;
-        done = m_no_more_pads || have_both || timed_out;
+        const bool soft = elapsed >= k_detect_timeout;
+        const bool hard = elapsed >= k_detect_hard_timeout;
+        // Launch when both codecs are known, or the demux finished its pads /
+        // the soft window elapsed AND the VIDEO codec is known (audio -> AAC).
+        // NEVER launch on the soft timeout without a real video codec: keep
+        // detecting until it is known, or the hard cap forces a last-resort
+        // fallback. A wrong-codec pipeline links no demux pad and stalls silently.
+        done = have_both || ((m_no_more_pads || soft) && m_video_found) || hard;
       }
       if (done) {
         finish_detection_and_launch();

@@ -19,8 +19,8 @@
 // MPEG-TS (pushed in via appsrc by the RIST receiver), re-encodes the video to
 // H264 ON THE GPU (NVDEC -> optional cudascale -> cudaconvert -> nvh264enc; or a
 // plain H264 parse passthrough in copy mode), passes the AAC audio through
-// (aacparse) and pushes a single RTMP publish (flvmux -> rtmp2sink) to the local
-// restreaming package (datarhei/restreamer), which fans it out by codec copy.
+// (aacparse) and pushes a single MPEG-TS/UDP stream (mpegtsmux -> udpsink) to the
+// local restreaming package (datarhei/restreamer), which fans it out by codec copy.
 // One pipeline, one bus, one teardown. See docs/GSTREAMER.md.
 class restream
 {

@@ -102,25 +102,26 @@ struct ingest_config
 };
 
 // How the receiver re-encodes the decoded video ON THE GPU and pushes a single
-// H264 RTMP publish to the local restreaming package (datarhei/restreamer),
+// H264 MPEG-TS/UDP publish to the local restreaming package (datarhei/restreamer),
 // which fans it out (codec copy) to YouTube/etc. Frames never leave CUDA memory
 // between NVDEC and nvh264enc. Most fields come from the encoder's
-// outputs[0].video over /start; rtmp_location + prefer_hw_decode are operator
+// outputs[0].video over /start; udp_host/udp_port + prefer_hw_decode are operator
 // infrastructure (CLI). On stream2 only nvh264enc exists, so out_codec is pinned
-// to h264. AAC audio is passed through (never decoded/re-encoded). See
+// to h264. AAC audio is passed through (never decoded/re-encoded). UDP has no
+// connection state, so a datarhei restart cannot error the pipeline. See
 // docs/CONTRACT.md and docs/GSTREAMER.md.
 struct reencode_config
 {
   bool reencode = true;               // false => H264 copy passthrough (no NVENC)
-  codec out_codec = codec::h264;      // RTMP carries H264 only (pinned on stream2)
+  codec out_codec = codec::h264;      // H264-only output (pinned on stream2)
   int bitrate_kbps = reencode_defaults::bitrate_kbps;
   bool upscale = false;               // insert cudascale only when true
   int width = reencode_defaults::width;
   int height = reencode_defaults::height;
   int gop_size = reencode_defaults::gop_size;
   std::string preset = "low-latency-hq";  // nvh264enc preset (bare token)
-  std::string rtmp_location =
-      "rtmp://127.0.0.1:1935/blue.stream?token=2e2mWs72wmWKmnr";
+  std::string udp_host = "127.0.0.1";     // MPEG-TS/UDP sink target (datarhei ingest)
+  int udp_port = 12000;                   // MPEG-TS/UDP sink target port
   bool prefer_hw_decode = true;       // prefer NVDEC/VA/QSV over software decode
   auto operator==(const reencode_config&) const -> bool = default;
 };
