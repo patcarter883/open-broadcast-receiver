@@ -32,7 +32,8 @@ enum class codec : std::uint8_t
 
 // Audio codecs the receiver can ingest. NOT part of the control-plane contract:
 // it is *detected* from the incoming MPEG-TS, never declared by the encoder.
-// The receiver always decodes audio to PCM for the raw handoff (see restream).
+// The receiver passes AAC through to RTMP (aacparse); other codecs have no audio
+// path (the source is expected to be AAC). See restream.
 enum class audio_codec : std::uint8_t
 {
   aac,
@@ -74,6 +75,16 @@ struct receiver_defaults
   static constexpr int reorder_buffer_ms = 30;
 };
 
+// Recommended defaults for the on-GPU re-encode (CONTRACT §4). The encoder's
+// outputs[0].video block overrides these per /start; absent fields keep these.
+struct reencode_defaults
+{
+  static constexpr int bitrate_kbps = 4300;
+  static constexpr int width = 2560;
+  static constexpr int height = 1440;
+  static constexpr int gop_size = 120;
+};
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -90,19 +101,28 @@ struct ingest_config
   auto operator==(const ingest_config&) const -> bool = default;
 };
 
-// Where the decoded, uncompressed media is handed off to the local restreaming
-// package (datarhei/restreamer). Video goes to a v4l2loopback device as raw
-// frames; audio goes to an ALSA snd-aloop device as PCM. These are host
-// infrastructure set once via CLI, NOT part of the /start control body — so
-// they are identical across sessions and never affect idempotency. See
+// How the receiver re-encodes the decoded video ON THE GPU and pushes a single
+// H264 RTMP publish to the local restreaming package (datarhei/restreamer),
+// which fans it out (codec copy) to YouTube/etc. Frames never leave CUDA memory
+// between NVDEC and nvh264enc. Most fields come from the encoder's
+// outputs[0].video over /start; rtmp_location + prefer_hw_decode are operator
+// infrastructure (CLI). On stream2 only nvh264enc exists, so out_codec is pinned
+// to h264. AAC audio is passed through (never decoded/re-encoded). See
 // docs/CONTRACT.md and docs/GSTREAMER.md.
-struct raw_sink_config
+struct reencode_config
 {
-  std::string video_device = "/dev/video10";    // v4l2loopback (v4l2sink)
-  std::string audio_device = "hw:Loopback,0,0";  // snd-aloop (alsasink)
-  std::string pixel_format = "NV12";  // raw video pixel format for the device
+  bool reencode = true;               // false => H264 copy passthrough (no NVENC)
+  codec out_codec = codec::h264;      // RTMP carries H264 only (pinned on stream2)
+  int bitrate_kbps = reencode_defaults::bitrate_kbps;
+  bool upscale = false;               // insert cudascale only when true
+  int width = reencode_defaults::width;
+  int height = reencode_defaults::height;
+  int gop_size = reencode_defaults::gop_size;
+  std::string preset = "low-latency-hq";  // nvh264enc preset (bare token)
+  std::string rtmp_location =
+      "rtmp://127.0.0.1:1935/blue.stream?token=2e2mWs72wmWKmnr";
   bool prefer_hw_decode = true;       // prefer NVDEC/VA/QSV over software decode
-  auto operator==(const raw_sink_config&) const -> bool = default;
+  auto operator==(const reencode_config&) const -> bool = default;
 };
 
 struct receiver_config
@@ -111,7 +131,7 @@ struct receiver_config
   std::string session_id;
   ingest_config ingest;
   codec in_codec = codec::h264;  // the codec arriving over RIST (source.codec hint)
-  raw_sink_config sink;          // operator-set (CLI); not from /start
+  reencode_config reencode;      // on-GPU encode + RTMP push (mixed CLI / /start)
   auto operator==(const receiver_config&) const -> bool = default;
 };
 

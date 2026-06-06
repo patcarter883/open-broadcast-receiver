@@ -81,6 +81,21 @@ auto get_int(const json& obj,
   return val.get<int>();
 }
 
+auto get_bool(const json& obj,
+              const char* key,
+              bool def,
+              const std::string& field_pfx) -> bool
+{
+  if (!obj.contains(key)) {
+    return def;
+  }
+  const json& val = obj.at(key);
+  if (!val.is_boolean()) {
+    perr("invalid_schema", field_pfx + "." + key, "must be a boolean");
+  }
+  return val.get<bool>();
+}
+
 auto codec_field(const std::string& str,
                  const std::string& field) -> codec
 {
@@ -141,10 +156,54 @@ auto parse_start_body(const json& jbody) -> receiver_config
       require_string(jbody.at("source"), "codec", "source.codec"),
       "source.codec");
 
-  // No `outputs[]`: the receiver now DECODES and hands the uncompressed result
-  // to the local restreaming package via fixed loopback devices (configured by
-  // the operator via CLI, see raw_sink_config / main.cpp). restreamer owns all
-  // further encoding + restreaming. See docs/CONTRACT.md.
+  // The receiver re-encodes ON THE GPU and pushes a single H264 RTMP publish to
+  // datarhei (rtmp_location is operator infrastructure, applied in main.cpp).
+  // The encode settings come from the encoder's outputs[0].video block; only the
+  // video sub-object is honoured (audio is AAC passthrough). See docs/CONTRACT.md.
+  if (!jbody.contains("outputs") || !jbody.at("outputs").is_array()
+      || jbody.at("outputs").empty())
+  {
+    perr("invalid_schema", "outputs", "required non-empty array");
+  }
+  const json& out0 = jbody.at("outputs").at(0);
+  if (!out0.is_object()) {
+    perr("invalid_schema", "outputs[0]", "must be an object");
+  }
+  if (!out0.contains("video") || !out0.at("video").is_object()) {
+    perr("invalid_schema", "outputs[0].video", "required object");
+  }
+  const json& vid = out0.at("video");
+
+  // mode: "reencode" (NVENC) or "copy" (H264 passthrough). Anything else is a
+  // schema error.
+  const std::string mode =
+      require_string(vid, "mode", "outputs[0].video.mode");
+  if (mode == "reencode") {
+    cfg.reencode.reencode = true;
+  } else if (mode == "copy") {
+    cfg.reencode.reencode = false;
+  } else {
+    perr("bad_enum",
+         "outputs[0].video.mode",
+         "must be \"reencode\" or \"copy\"");
+  }
+
+  cfg.reencode.out_codec = codec_field(
+      require_string(vid, "codec", "outputs[0].video.codec"),
+      "outputs[0].video.codec");
+  cfg.reencode.bitrate_kbps = get_int(
+      vid, "bitrate_kbps", cfg.reencode.bitrate_kbps, "outputs[0].video");
+  cfg.reencode.upscale =
+      get_bool(vid, "upscale", cfg.reencode.upscale, "outputs[0].video");
+  cfg.reencode.width =
+      get_int(vid, "width", cfg.reencode.width, "outputs[0].video");
+  cfg.reencode.height =
+      get_int(vid, "height", cfg.reencode.height, "outputs[0].video");
+
+  // outputs[0].video.encoder is parsed-and-ignored (the receiver always uses
+  // nvh264enc); outputs[0].audio is ignored (AAC passthrough), as are the
+  // output id/type/url/key_or_streamid/params (datarhei owns the fan-out).
+
   return cfg;
 }
 
@@ -161,6 +220,18 @@ auto error_body(const std::string& code,
   }
   err_json["message"] = message;
   return err_json;
+}
+
+// Redact a RTMP push URL's `?token=...` query so it never appears in a /status
+// or /start response. Everything up to (and including) the '?' is kept; the
+// query is replaced with a fixed marker.
+auto redact_rtmp(const std::string& url) -> std::string
+{
+  const std::size_t qpos = url.find('?');
+  if (qpos == std::string::npos) {
+    return url;
+  }
+  return url.substr(0, qpos) + "?token=***";
 }
 
 constexpr std::size_t k_max_body_bytes = 256 * 1024;
@@ -208,14 +279,13 @@ auto control_server::build_status_json() const -> std::string
   if (!m_ctx.state.is_running.load(std::memory_order_acquire)) {
     out["state"] = "stopped";
     out["session_id"] = nullptr;
-    out["sink"] = nullptr;
+    out["reencode"] = nullptr;
     return out.dump();
   }
 
   std::string sid;
   std::string last_err;
-  std::string vdev;
-  std::string adev;
+  reencode_config re;
   std::string det_v;
   std::string det_a;
   std::chrono::steady_clock::time_point started;
@@ -223,8 +293,7 @@ auto control_server::build_status_json() const -> std::string
     std::lock_guard<std::mutex> guard(m_ctx.state.mutex);
     sid = m_ctx.state.session_id;
     last_err = m_ctx.state.last_bus_error;
-    vdev = m_ctx.state.cfg.sink.video_device;
-    adev = m_ctx.state.cfg.sink.audio_device;
+    re = m_ctx.state.cfg.reencode;
     det_v = m_ctx.state.detected_video;
     det_a = m_ctx.state.detected_audio;
     started = m_ctx.state.started_at;
@@ -241,15 +310,19 @@ auto control_server::build_status_json() const -> std::string
   tel["worst_case_rtt_ms"] = m_ctx.state.worst_rtt.load(std::memory_order_relaxed);
   out["telemetry"] = tel;
 
-  // The single decode->loopback handoff. Detected codecs are null until phase-1
-  // detection settles. Device paths are not secret.
-  json sink;
-  sink["video_device"] = vdev;
-  sink["audio_device"] = adev;
-  sink["video_codec"] = det_v.empty() ? json(nullptr) : json(det_v);
-  sink["audio_codec"] = det_a.empty() ? json(nullptr) : json(det_a);
-  sink["state"] = last_err.empty() ? "running" : "error";
-  out["sink"] = std::move(sink);
+  // The single on-GPU encode + RTMP push. Detected codecs are null until phase-1
+  // detection settles. The RTMP location is token-redacted (not a secret URL).
+  json re_json;
+  re_json["mode"] = re.reencode ? "reencode" : "copy";
+  re_json["bitrate_kbps"] = re.bitrate_kbps;
+  re_json["upscale"] = re.upscale;
+  re_json["width"] = re.width;
+  re_json["height"] = re.height;
+  re_json["rtmp_location"] = redact_rtmp(re.rtmp_location);
+  re_json["video_codec"] = det_v.empty() ? json(nullptr) : json(det_v);
+  re_json["audio_codec"] = det_a.empty() ? json(nullptr) : json(det_a);
+  re_json["state"] = last_err.empty() ? "running" : "error";
+  out["reencode"] = std::move(re_json);
   out["last_bus_error"] = last_err.empty() ? json(nullptr) : json(last_err);
   return out.dump();
 }
@@ -319,11 +392,16 @@ auto control_server::setup_routes() -> void
                  body["schema_version"] = 1;
                  body["session_id"] = cfg.session_id;
                  body["state"] = "running";
-                 json sink;
-                 sink["video_device"] = cfg.sink.video_device;
-                 sink["audio_device"] = cfg.sink.audio_device;
-                 sink["state"] = "connecting";
-                 body["sink"] = std::move(sink);
+                 json re_json;
+                 re_json["mode"] = cfg.reencode.reencode ? "reencode" : "copy";
+                 re_json["bitrate_kbps"] = cfg.reencode.bitrate_kbps;
+                 re_json["upscale"] = cfg.reencode.upscale;
+                 re_json["width"] = cfg.reencode.width;
+                 re_json["height"] = cfg.reencode.height;
+                 re_json["rtmp_location"] =
+                     redact_rtmp(cfg.reencode.rtmp_location);
+                 re_json["state"] = "connecting";
+                 body["reencode"] = std::move(re_json);
                  res.status = 200;
                  res.set_content(body.dump(), "application/json");
                } else {

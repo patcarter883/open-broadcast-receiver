@@ -25,6 +25,13 @@ constexpr int k_buffer_max_max = 60000;
 constexpr int k_rtt_min_max = 10000;
 constexpr int k_rtt_max_max = 60000;
 constexpr int k_reorder_max = 10000;
+constexpr int k_video_bitrate_min = 1000;
+constexpr int k_video_bitrate_max = 60000;
+constexpr int k_dim_min = 16;
+constexpr int k_dim_max_width = 7680;
+constexpr int k_dim_max_height = 4320;
+constexpr int k_gop_min = 1;
+constexpr int k_gop_max = 600;
 
 auto fail(std::string code,
           std::string field,
@@ -84,21 +91,50 @@ auto validate_ingest(const ingest_config& ing) -> validation_result
   return {};
 }
 
-// The raw-sink targets are operator-supplied (CLI) and interpolated into the
-// gst_parse_launch string (device paths single-quoted, pixel format into caps),
-// so they must be free of quote-escape / control characters.
-auto validate_sink(const raw_sink_config& sink) -> validation_result
+// The on-GPU re-encode settings come from the encoder (bitrate/upscale/dims) and
+// the operator (rtmp_location/preset). The RTMP location is single-quoted into
+// the rtmp2sink `location=` property and the preset goes bare into nvh264enc, so
+// both must be free of quote-escape / control characters. RTMP carries H264 only
+// (stream2 has no nvh265enc / nvav1enc), so out_codec is pinned to h264.
+auto validate_reencode(const reencode_config& re) -> validation_result
 {
-  if (sink.video_device.empty() || !is_pipeline_safe(sink.video_device)) {
-    return fail("bad_url", "sink.video_device", "invalid v4l2 device path");
+  if (re.rtmp_location.empty()
+      || (!re.rtmp_location.starts_with("rtmp://")
+          && !re.rtmp_location.starts_with("rtmps://"))
+      || !is_pipeline_safe(re.rtmp_location))
+  {
+    return fail("bad_url",
+                "reencode.rtmp_location",
+                "must be a quote-safe rtmp:// or rtmps:// URL");
   }
-  if (sink.audio_device.empty() || !is_pipeline_safe(sink.audio_device)) {
-    return fail("bad_url", "sink.audio_device", "invalid alsa device");
+  if (re.bitrate_kbps < k_video_bitrate_min
+      || re.bitrate_kbps > k_video_bitrate_max)
+  {
+    return fail(
+        "out_of_range", "reencode.bitrate_kbps", "must be 1000..60000");
   }
-  if (!is_token(sink.pixel_format)) {
+  if (re.gop_size < k_gop_min || re.gop_size > k_gop_max) {
+    return fail("out_of_range", "reencode.gop_size", "must be 1..600");
+  }
+  if (!is_token(re.preset)) {
     return fail("bad_enum",
-                "sink.pixel_format",
-                "pixel format must be a bare token (e.g. NV12)");
+                "reencode.preset",
+                "preset must be a bare token (e.g. low-latency-hq)");
+  }
+  if (re.upscale) {
+    if (re.width % 2 != 0 || re.height % 2 != 0 || re.width < k_dim_min
+        || re.width > k_dim_max_width || re.height < k_dim_min
+        || re.height > k_dim_max_height)
+    {
+      return fail("out_of_range",
+                  "reencode.width",
+                  "upscale dims must be even, width 16..7680 height 16..4320");
+    }
+  }
+  if (re.out_codec != codec::h264) {
+    return fail("bad_enum",
+                "reencode.out_codec",
+                "rtmp output requires h264");
   }
   return {};
 }
@@ -229,15 +265,17 @@ auto build_listener_url(const ingest_config& ingest) -> std::string
   // rejects it ("Unknown or invalid parameter profile") and fails the whole
   // listener. The profile is set via RISTNetReceiverSettings.mProfile instead.
   return std::format(
-      // timing-mode=1 (ARRIVAL), NOT 2 (RTC): in RTC mode librist drops every
-      // data packet while time_offset==0 (rist-common.c:607), and that offset is
-      // only bootstrapped from an RTCP Sender Report carrying a real NTP source
-      // clock — which this sender does not provide (ts_ntp=0). The result is the
-      // receiver never enqueues packets, so gap detection / NACK never runs and
-      // lost/retransmitted counters stay at 0. ARRIVAL paces on receive time and
-      // bootstraps time_offset from the first packet. Must match the encoder.
+      // timing-mode=0 (SOURCE) — the librist default. NOT 1 (ARRIVAL), NOT 2
+      // (RTC). RTC drops every packet until an RTCP SR sets time_offset (the
+      // sender provides none, ts_ntp=0). ARRIVAL interpolates the arrival time
+      // of *retransmitted* packets and asserts packet_time < next->packet_time
+      // (rist-common.c); the extra retries of the encoder->rist2rist->receiver
+      // double hop violate that invariant and SIGABRT this receiver. SOURCE
+      // orders/paces by the monotonic source timestamp librist stamps on each
+      // packet (preserved across the relay) and never enters that path. Must
+      // match the encoder and rist2rist.
       "{}?bandwidth={}&buffer-min={}&buffer-max={}&rtt-min={}&rtt-max={}&"
-      "reorder-buffer={}&timing-mode=1",
+      "reorder-buffer={}&timing-mode=0",
       base,
       ingest.bandwidth,
       ingest.buffer_min,
@@ -272,7 +310,7 @@ auto validate_config(const receiver_config& cfg) -> validation_result
     return res;
   }
 
-  if (const auto res = validate_sink(cfg.sink); !res.ok) {
+  if (const auto res = validate_reencode(cfg.reencode); !res.ok) {
     return res;
   }
 

@@ -59,7 +59,24 @@ auto rist_receive::start(const receiver_config& cfg,
       [this](const std::string& addr, uint16_t port)
       -> std::shared_ptr<RISTNetReceiver::NetworkConnection>
   {
-    log("Encoder connecting from " + addr + ":" + std::to_string(port) + "\n");
+    // First connect vs RE-connect: if the encoder has connected before, the
+    // incoming stream may carry a different codec, so re-run detection +
+    // restart the restream pipeline. exchange() makes the first-connect
+    // detection race-free against concurrent librist workers.
+    const bool reconnect = m_was_connected.exchange(true, std::memory_order_acq_rel);
+    if (reconnect) {
+      log("Encoder reconnecting from " + addr + ":" + std::to_string(port)
+          + "; re-arming detection\n");
+      if (m_on_reconnect) {
+        // Signal only — the handler defers the actual stop()/start() to a
+        // supervisor thread; calling restream::stop() here would join the bus
+        // thread from a librist worker and risk deadlock.
+        m_on_reconnect();
+      }
+    } else {
+      log("Encoder connecting from " + addr + ":" + std::to_string(port)
+          + "\n");
+    }
     return std::make_shared<RISTNetReceiver::NetworkConnection>();
   };
 
@@ -183,6 +200,7 @@ auto rist_receive::stop() -> void
   }
   m_peer.store(nullptr, std::memory_order_release);
   m_started.store(false, std::memory_order_release);
+  m_was_connected.store(false, std::memory_order_release);
   if (m_state != nullptr) {
     m_state->have_peer.store(false, std::memory_order_relaxed);
   }

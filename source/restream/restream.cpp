@@ -1,5 +1,6 @@
 #include "restream/restream.h"
 
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <format>
@@ -64,8 +65,9 @@ auto element_present(const char* name) noexcept -> bool
   return false;
 }
 
-// Memory domain a decoder's frames live in — determines how we bring them back
-// to system memory for the v4l2 device.
+// Memory domain a decoder's frames live in. The on-GPU encode path requires
+// CUDA memory end to end (NVDEC -> cudascale/cudaconvert -> nvh264enc); the
+// other domains are kept only so the decoder picker can report them.
 enum class dec_domain : std::uint8_t
 {
   sys,   // libav software decode: already system memory
@@ -110,39 +112,6 @@ auto choose_video_decoder(codec cod, bool prefer_hw) -> video_dec
   return {.element = sw, .domain = dec_domain::sys};
 }
 
-// The extra element a GPU decode domain needs to reach system memory (used by
-// the registry availability check); empty for software decode.
-auto download_element(dec_domain domain) noexcept -> const char*
-{
-  switch (domain) {
-    case dec_domain::cuda:
-      return "cudadownload";
-    case dec_domain::va:
-      return "vapostproc";
-    case dec_domain::sys:
-    default:
-      return "";
-  }
-}
-
-// The fragment that turns a decoder's output into plain system-memory raw video
-// at `pix` (e.g. NV12), ready for v4l2sink. GPU domains need an explicit
-// download; software decode just needs a (no-op for matching formats)
-// videoconvert.
-auto raw_download(dec_domain domain, const std::string& pix) -> std::string
-{
-  switch (domain) {
-    case dec_domain::cuda:
-      return std::format("cudadownload ! videoconvert ! video/x-raw,format={}",
-                         pix);
-    case dec_domain::va:
-      return std::format("vapostproc ! video/x-raw,format={}", pix);
-    case dec_domain::sys:
-    default:
-      return std::format("videoconvert ! video/x-raw,format={}", pix);
-  }
-}
-
 // ---- audio element-name helpers --------------------------------------------
 
 // Caps used to pick the demuxed audio pad. AAC and MPEG-1/2 audio (mp2) both
@@ -163,52 +132,6 @@ auto audio_caps(audio_codec cod) noexcept -> const char*
       return "audio/x-eac3";
   }
   return "audio/mpeg";
-}
-
-auto audio_parse(audio_codec cod) noexcept -> const char*
-{
-  switch (cod) {
-    case audio_codec::aac:
-      return "aacparse";
-    case audio_codec::opus:
-      return "opusparse";
-    case audio_codec::ac3:
-    case audio_codec::eac3:
-      return "ac3parse";  // ac3parse handles both AC-3 and E-AC-3
-    case audio_codec::mp2:
-      return "mpegaudioparse";
-  }
-  return "aacparse";
-}
-
-auto audio_decoder(audio_codec cod) noexcept -> const char*
-{
-  switch (cod) {
-    case audio_codec::aac:
-      return "avdec_aac";
-    case audio_codec::opus:
-      return "avdec_opus";
-    case audio_codec::ac3:
-      return "avdec_ac3";
-    case audio_codec::eac3:
-      return "avdec_eac3";
-    case audio_codec::mp2:
-      return "avdec_mp2float";
-  }
-  return "avdec_aac";
-}
-
-// The audio branch always DECODES to PCM (uncompressed) for the raw handoff:
-// <parse> ! <decoder> ! audioconvert ! audioresample ! S16LE/48k stereo caps.
-// The detected codec selects the parser + decoder; audioconvert/audioresample
-// normalise to the device's fixed format regardless of the source layout/rate.
-auto audio_decode_fragment(audio_codec in_audio) -> std::string
-{
-  return std::format(
-      "{} ! {} ! audioconvert ! audioresample ! "
-      "audio/x-raw,format=S16LE,channels=2,rate=48000",
-      audio_parse(in_audio),
-      audio_decoder(in_audio));
 }
 
 }  // namespace
@@ -236,24 +159,31 @@ auto restream::log(const std::string& msg) const -> void
 
 auto restream::first_missing_element(const receiver_config& cfg,
                                      codec in_video,
-                                     audio_codec in_audio) const -> std::string
+                                     audio_codec /*in_audio*/) const -> std::string
 {
-  // Decode-only handoff: the video decoder (+ its GPU->system download element)
-  // and the audio parser/decoder depend on the detected input codecs; the
-  // convert/resample and the two device sinks are codec-independent.
-  const video_dec vdec =
-      choose_video_decoder(in_video, cfg.sink.prefer_hw_decode);
+  // On-GPU encode + RTMP push: the video decoder depends on the detected input
+  // codec; the upscale (cudascale) is conditional; the rest of the encode/mux/
+  // RTMP chain and the AAC passthrough are codec-independent. Copy mode (H264 in,
+  // reencode disabled) needs no decoder/encoder/scale — just the H264 parser.
+  const bool passthrough = !cfg.reencode.reencode && in_video == codec::h264;
   std::vector<std::string> needed;
-  needed.emplace_back(vdec.element);
-  if (const char* dl = download_element(vdec.domain); dl[0] != '\0') {
-    needed.emplace_back(dl);
-  }
   needed.emplace_back(video_parse(in_video));
-  needed.emplace_back(audio_parse(in_audio));
-  needed.emplace_back(audio_decoder(in_audio));
+  if (!passthrough) {
+    // The decode -> GPU scale/convert -> NVENC chain requires CUDA memory end to
+    // end, so a non-CUDA decoder cannot feed it — assert the picked decoder is
+    // NVDEC.
+    const video_dec vdec =
+        choose_video_decoder(in_video, cfg.reencode.prefer_hw_decode);
+    assert(vdec.domain == dec_domain::cuda
+           && "RTMP encode path requires an NVDEC (CUDA-memory) decoder");
+    needed.emplace_back(vdec.element);
+    if (cfg.reencode.upscale) {
+      needed.emplace_back("cudascale");
+    }
+    needed.insert(needed.end(), {"cudaconvert", "nvh264enc"});
+  }
   needed.insert(needed.end(),
-                {"videoconvert", "audioconvert", "audioresample", "v4l2sink",
-                 "alsasink"});
+                {"h264parse", "flvmux", "rtmp2sink", "aacparse"});
   for (const std::string& name : needed) {
     if (!element_present(name.c_str())) {
       return name;
@@ -262,15 +192,19 @@ auto restream::first_missing_element(const receiver_config& cfg,
   return {};
 }
 
-auto restream::first_missing_output_element(const receiver_config& /*cfg*/) const
+auto restream::first_missing_output_element(const receiver_config& cfg) const
     -> std::string
 {
-  // Codec-independent sink elements, checkable synchronously before detection.
-  // The decoder (input-codec dependent) is validated in phase 2.
-  for (const char* name :
-       {"v4l2sink", "alsasink", "videoconvert", "audioconvert", "audioresample"})
-  {
-    if (!element_present(name)) {
+  // Input-codec-independent output-side elements, checkable synchronously before
+  // detection. The decoder (input-codec dependent) is validated in phase 2.
+  // cudascale is only required when upscale is enabled.
+  std::vector<std::string> needed = {
+      "nvh264enc", "cudaconvert", "h264parse", "flvmux", "rtmp2sink", "aacparse"};
+  if (cfg.reencode.upscale) {
+    needed.emplace_back("cudascale");
+  }
+  for (const std::string& name : needed) {
+    if (!element_present(name.c_str())) {
       return name;
     }
   }
@@ -281,40 +215,65 @@ auto restream::build_pipeline_string(const receiver_config& cfg,
                                      codec in_video,
                                      audio_codec in_audio) -> std::string
 {
-  const video_dec vdec =
-      choose_video_decoder(in_video, cfg.sink.prefer_hw_decode);
-  const std::string vdownload = raw_download(vdec.domain, cfg.sink.pixel_format);
+  const reencode_config& re = cfg.reencode;
 
-  // Single consumer per stream (no tee). A caps filter after demux selects the
-  // correct (dynamic) tsdemux pad; the caps come from runtime detection
-  // (start_detection), not the declared config. Video: parse -> decode ->
-  // system-memory raw -> v4l2loopback. Audio: parse -> decode -> PCM ->
-  // snd-aloop. A bounded leaky=downstream queue before each sink drops frames if
-  // the loopback device stalls instead of back-pressuring the shared
-  // demux/appsrc (and thereby the RIST ingest). Both sinks sync to the pipeline
-  // clock so the two devices stay time-aligned for the downstream consumer.
+  // The video branch keeps frames in CUDA memory from NVDEC into nvh264enc: an
+  // optional cudascale (only when upscaling) then an unconditional cudaconvert
+  // (NVENC is picky about input pixel format) then NVENC. Copy mode is only a
+  // legitimate passthrough when the source is already H264 (RTMP carries H264
+  // only) and reencode is disabled; otherwise we always transcode to H264.
+  const bool passthrough = !re.reencode && in_video == codec::h264;
+
+  std::string video_branch;
+  if (passthrough) {
+    // H264 in -> just parse and mux; no decode/encode, frames never touched.
+    video_branch = std::format(
+        "demux. ! {0} ! queue ! {1} config-interval=1 ! mux. ",
+        video_caps(in_video),    // 0
+        video_parse(in_video));  // 1
+  } else {
+    const video_dec vdec =
+        choose_video_decoder(in_video, re.prefer_hw_decode);
+    // ARG vscale: empty unless upscaling, else cudascale into a CUDA-memory caps
+    // filter pinning the target width/height (stays on the GPU).
+    std::string vscale;
+    if (re.upscale) {
+      vscale = std::format(
+          "cudascale ! video/x-raw(memory:CUDAMemory),width={},height={} ! ",
+          re.width,
+          re.height);
+    }
+    video_branch = std::format(
+        "demux. ! {0} ! queue ! {1} ! {2} ! {3}cudaconvert ! "
+        "nvh264enc bitrate={4} preset={5} gop-size={6} ! "
+        "h264parse config-interval=1 ! mux. ",
+        video_caps(in_video),   // 0
+        video_parse(in_video),  // 1
+        vdec.element,           // 2
+        vscale,                 // 3: empty or "cudascale ! caps ! "
+        re.bitrate_kbps,        // 4
+        re.preset,              // 5
+        re.gop_size);           // 6
+  }
+
+  // Audio is AAC passthrough: aacparse (ADTS -> raw AAC) straight into flvmux.
+  // No decode/re-encode. flvmux is named "mux" so both branches request it.
+  // The RTMP location is interpolated BARE (no quotes): gst_parse_launch does not
+  // strip surrounding quotes (they become part of the value, so rtmp2sink would
+  // see "'rtmp://..." and fail with "Host is not set"). is_pipeline_safe
+  // (validate_reencode) guarantees the URL is free of whitespace/quote/backslash,
+  // and only the FIRST '=' after a property name is the separator, so the '?'/'='
+  // in the "?token=..." query pass through literally.
   return std::format(
       "{0}"
-      // NB: device values are NOT single-quoted — gst_parse_launch does not
-      // strip single quotes around v4l2sink/alsasink `device=` (the literal
-      // quotes end up in the device name and the open fails). The values are
-      // already validated quote/space-free by is_pipeline_safe (validate_sink),
-      // and contain no gst-special chars, so bare interpolation is safe.
-      "demux. ! {1} ! queue ! {2} ! {3} ! {4} ! "
-      "queue leaky=downstream max-size-buffers=4 ! "
-      "v4l2sink name=vsink device={5} sync=true "
-      "demux. ! {6} ! queue ! {7} ! "
-      "queue leaky=downstream max-size-time=200000000 ! "
-      "alsasink name=asink device={8} sync=true ",
-      k_ts_source,                      // 0
-      video_caps(in_video),             // 1
-      video_parse(in_video),            // 2
-      vdec.element,                     // 3
-      vdownload,                        // 4: <download> ! videoconvert ! caps
-      cfg.sink.video_device,            // 5
-      audio_caps(in_audio),             // 6
-      audio_decode_fragment(in_audio),  // 7: parse ! dec ! convert ! caps
-      cfg.sink.audio_device);           // 8
+      "{1}"
+      "demux. ! {2} ! aacparse ! queue ! mux. "
+      "flvmux name=mux streamable=true ! queue ! "
+      "rtmp2sink name=rtmpsink sync=false location={3} ",
+      k_ts_source,            // 0
+      video_branch,           // 1
+      audio_caps(in_audio),   // 2
+      re.rtmp_location);      // 3
 }
 
 auto restream::start(const receiver_config& cfg,
