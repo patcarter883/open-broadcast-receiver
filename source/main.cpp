@@ -294,20 +294,34 @@ auto main(int argc, char** argv) -> int
         current_session = ctx.state.session_id;
         current_cfg = ctx.state.cfg;
       }
-      if (current_session == cfg.session_id) {
-        if (current_cfg == cfg) {
-          http_status = 200;  // genuine idempotent retry
-          return true;
-        }
-        http_status = 409;
-        err_code = "already_running";
-        err_msg = "session is running with a different configuration";
+      // A repeat of the EXACT same /start (same session_id + identical config) is
+      // a genuine idempotent retry -> no-op. Anything else -- a NEW session_id
+      // (the encoder generates one each time the user presses Start) or a changed
+      // config -- RE-RUNS codec detection by restarting just the restream
+      // pipeline, applying the encoder's settings. This lets the end user trigger
+      // re-detection from the encoder UI without restarting the remote receiver.
+      // Only the restream pipeline cycles; the RIST listener stays bound and
+      // keeps feeding the shared appsrc (same primitive as the reconnect
+      // supervisor), so push_buffer is routed to the rebuilt pipeline.
+      if (current_session == cfg.session_id && current_cfg == cfg) {
+        http_status = 200;
+        return true;
+      }
+      ctx.restreamer->stop();
+      if (!ctx.restreamer->start(cfg, &ctx.state, err_code, err_msg)) {
+        ctx.state.is_running.store(false, std::memory_order_release);
+        http_status = (err_code == "encoder_unavailable") ? 400 : 500;
         return false;
       }
-      http_status = 409;
-      err_code = "already_running";
-      err_msg = "receiver is already running a different session";
-      return false;
+      {
+        std::lock_guard<std::mutex> guard(ctx.state.mutex);
+        ctx.state.cfg = cfg;
+        ctx.state.session_id = cfg.session_id;
+        ctx.state.started_at = std::chrono::steady_clock::now();
+        ctx.state.last_bus_error.clear();
+      }
+      http_status = 200;
+      return true;
     }
 
     if (!ctx.restreamer->start(cfg, &ctx.state, err_code, err_msg)) {
