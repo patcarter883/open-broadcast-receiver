@@ -6,3 +6,5 @@ compile_commands.json
 *.a
 /packaging/tools/
 /dist/
+squashfs-root/
+AppDir/

@@ -264,7 +264,8 @@ auto restream::build_pipeline_string(const receiver_config& cfg,
     }
     video_branch = std::format(
         "demux. ! {0} ! queue ! {1} ! {2} ! {3}cudaconvert ! "
-        "nvh264enc bitrate={4} preset={5} gop-size={6} ! "
+        "nvh264enc bitrate={4} preset={5} gop-size={6} bframes=4 b-adapt=true ! "
+        "video/x-h264,profile=high ! "
         "h264parse config-interval=1 ! queue ! mux. ",
         video_caps(in_video),   // 0
         video_parse(in_video),  // 1

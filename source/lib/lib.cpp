@@ -118,7 +118,7 @@ auto validate_reencode(const reencode_config& re) -> validation_result
   if (!is_token(re.preset)) {
     return fail("bad_enum",
                 "reencode.preset",
-                "preset must be a bare token (e.g. low-latency-hq)");
+                "preset must be a bare token (e.g. p5)");
   }
   if (re.upscale) {
     if (re.width % 2 != 0 || re.height % 2 != 0 || re.width < k_dim_min

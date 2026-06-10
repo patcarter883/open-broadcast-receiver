@@ -119,7 +119,10 @@ struct reencode_config
   int width = reencode_defaults::width;
   int height = reencode_defaults::height;
   int gop_size = reencode_defaults::gop_size;
-  std::string preset = "low-latency-hq";  // nvh264enc preset (bare token)
+  // nvh264enc preset (bare token). Must NOT be a low-latency tuned preset
+  // (low-latency-hq etc): NVENC low-latency tuning forces bframes to 0 and
+  // the pipeline pins bframes=4 / profile=high.
+  std::string preset = "p5";
   std::string udp_host = "127.0.0.1";     // MPEG-TS/UDP sink target (datarhei ingest)
   int udp_port = 12000;                   // MPEG-TS/UDP sink target port
   bool prefer_hw_decode = true;       // prefer NVDEC/VA/QSV over software decode
