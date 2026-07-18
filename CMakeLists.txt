@@ -16,9 +16,29 @@ set(CMAKE_BUILD_PARALLEL_LEVEL 16)
 
 include(cmake/variables.cmake)
 
-include(cmake/ExternalBuilds.cmake)
+# Tests-only mode: build just the pure-logic libraries (no GStreamer, no
+# vendored librist, no network) plus their unit tests. Used by the fast CI
+# lane and on dev boxes without the media stack installed.
+option(OBR_TESTS_ONLY "Build only pure-logic libs + unit tests" OFF)
 
 find_package(Threads REQUIRED)
+
+if(OBR_TESTS_ONLY)
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/lib)
+
+  add_library(ring_lib STATIC
+    ${CMAKE_CURRENT_LIST_DIR}/source/fanout/ring.h
+    ${CMAKE_CURRENT_LIST_DIR}/source/fanout/ring.cpp)
+  target_include_directories(ring_lib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/source)
+  target_compile_features(ring_lib PUBLIC cxx_std_20)
+
+  include(CTest)
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/test)
+  return()
+endif()
+
+include(cmake/ExternalBuilds.cmake)
+
 find_package(nlohmann_json 3.2 REQUIRED)
 
 find_package(PkgConfig REQUIRED)
@@ -29,9 +49,14 @@ find_package(PkgConfig REQUIRED)
     pkg_search_module(gstreamer-video REQUIRED IMPORTED_TARGET gstreamer-video-1.0>=1.28)
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/lib)
-add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/restream)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/fanout)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/receive)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/control)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/test)
+endif()
 
 # ---- Declare executable ----
 
@@ -44,8 +69,9 @@ target_compile_features(open-broadcast-receiver_exe PRIVATE cxx_std_20)
 
 target_link_libraries(open-broadcast-receiver_exe PRIVATE
   receiver_lib
+  ring_lib
+  fanout_lib
   receive_lib
-  restream_lib
   control_lib
   ristnet
   PkgConfig::gstreamer
