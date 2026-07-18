@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# Bonding-rig sender image: headless encoder stand-in (FIXPLAN M1.6) —
+# gst-launch test source muxing H.264+AAC TS, piped into rist_feed
+# (vendored RISTNetSender, ADVANCED profile, timing-mode=0).
+FROM ubuntu:24.04 AS build
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential cmake meson ninja-build pkg-config git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY external/rist-cpp external/rist-cpp
+COPY test/tools/rist_feed.cpp test/tools/rist_feed.cpp
+RUN cmake -S external/rist-cpp -B build-rist \
+      -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=/opt/rist \
+    && cmake --build build-rist -j"$(nproc)" --target install \
+    && g++ -std=c++20 -O2 -o /usr/local/bin/rist_feed test/tools/rist_feed.cpp \
+       -I/opt/rist/include -I/opt/rist/include/rist-cpp -I/opt/rist/include/librist \
+       /opt/rist/lib/libristnet.a /opt/rist/lib/librist.a -pthread
+
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/rist_feed /usr/local/bin/
+COPY test/rig/send.sh /usr/local/bin/send.sh
+RUN chmod +x /usr/local/bin/send.sh
+ENTRYPOINT ["send.sh"]

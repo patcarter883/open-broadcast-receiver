@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+# Bonding-rig receiver image (FIXPLAN M1.6).
+#
+# TIMING_MODE: leave "0" (production, SOURCE). The rig's red-proof stage
+# builds with TIMING_MODE=1 (ARRIVAL) and asserts the double-hop soak
+# CRASHES the receiver — proving the rig detects the original C1 defect —
+# before the timing-mode=0 run is required to pass.
+#
+# NOTE: uses the distro GStreamer (1.24 on noble); the production floor is
+# 1.28 — bump the base image when a 1.28 base is available.
+FROM ubuntu:24.04 AS build
+ARG TIMING_MODE=0
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential cmake meson ninja-build pkg-config git \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# Red-proof stage: force the listener to ARRIVAL mode (must SIGABRT under
+# the bonded double hop; see docs/CONTRACT.md §4).
+RUN if [ "$TIMING_MODE" = "1" ]; then \
+      sed -i 's/timing-mode=0/timing-mode=1/' source/lib/lib.cpp; fi
+# Debug build ON PURPOSE for the rig: librist asserts armed, so a timing
+# violation aborts loudly instead of degrading silently.
+RUN sed -i 's/>=1\.28/>=1.24/g' CMakeLists.txt \
+    && cmake -S . -B build -D CMAKE_BUILD_TYPE=Debug \
+    && cmake --build build -j"$(nproc)"
+
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad libgstreamer1.0-0 \
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/build/open-broadcast-receiver /usr/local/bin/
+EXPOSE 8080/tcp 5000/udp
+ENTRYPOINT ["open-broadcast-receiver"]

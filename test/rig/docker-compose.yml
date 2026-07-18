@@ -1,0 +1,80 @@
+# Bonding CI rig topology (FIXPLAN M1.6/M1.8):
+#
+#   sender ──lan──▶ bond (rist2rist, 2× netem WANs) ──wan_a/wan_b──▶ receiver
+#                                                                     │
+#                     srs1 + srs2 (RTMP) + srt listener ◀── outputs ──┘
+#
+# Both bond outputs target the SAME receiver port over two networks → two
+# RIST peers on one session port (the bonding model under test).
+# Driven by rig.sh — not intended for standalone `up`.
+name: obr-rig
+
+networks:
+  lan: {}
+  wan_a:
+    ipam: { config: [ { subnet: 172.31.101.0/24 } ] }
+  wan_b:
+    ipam: { config: [ { subnet: 172.31.102.0/24 } ] }
+  egress: {}
+
+services:
+  receiver:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.receiver
+      args:
+        TIMING_MODE: ${RIG_TIMING_MODE:-0}
+    command: >
+      --bind 0.0.0.0 --token rigtoken --rist-port 5000
+      --egress-allow-private --record-dir /rec --idle-timeout 120
+    networks:
+      wan_a: { ipv4_address: 172.31.101.10 }
+      wan_b: { ipv4_address: 172.31.102.10 }
+      egress: {}
+    volumes: [ "rec:/rec" ]
+
+  bond:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.bond
+    cap_add: [ NET_ADMIN ]
+    environment:
+      RECV_A: 172.31.101.10
+      RECV_B: 172.31.102.10
+      LISTEN_PORT: "6000"
+      RECV_PORT: "5000"
+    networks: [ lan, wan_a, wan_b ]
+    depends_on: [ receiver ]
+
+  sender:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.sender
+    environment:
+      DEST_HOST: bond
+      DEST_PORT: "6000"
+      BITRATE_KBPS: "3000"
+    networks: [ lan ]
+    depends_on: [ bond ]
+
+  srs1:
+    image: ossrs/srs:5
+    networks: [ egress ]
+  srs2:
+    image: ossrs/srs:5
+    networks: [ egress ]
+
+  srt-listener:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.sender
+    entrypoint:
+      [ "gst-launch-1.0", "-q",
+        "srtsrc", "uri=srt://0.0.0.0:9000?mode=listener",
+        "!", "filesink", "location=/out/srt-received.ts" ]
+    networks: [ egress ]
+    volumes: [ "srtout:/out" ]
+
+volumes:
+  rec: {}
+  srtout: {}
