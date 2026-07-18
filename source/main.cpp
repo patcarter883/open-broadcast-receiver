@@ -111,6 +111,21 @@ auto main(int argc, char** argv) -> int
 {
   gst_init(&argc, &argv);
 
+#ifndef NDEBUG
+  // Debug builds compile the vendored librist WITHOUT -DNDEBUG, which re-arms
+  // the receiver_enqueue assert (packet_time < next->packet_time). Under the
+  // encoder -> rist2rist -> receiver double hop, retransmission timing can
+  // violate that invariant and SIGABRT this process (see CONTRACT.md §4 and
+  // open-broadcast-encoder/docs/RIST_TIMING_FINDINGS.md). timing-mode=0
+  // (SOURCE) avoids the path, but only Release builds degrade gracefully on a
+  // future edge case instead of aborting a live event.
+  std::cerr
+      << "\n*** WARNING: Debug build (NDEBUG not defined). ***\n"
+      << "*** librist asserts are armed: a bad packet time ABORTS the "
+         "process. ***\n"
+      << "*** Use a Release build for any real stream. ***\n\n";
+#endif
+
   int control_port = k_default_control_port;
   int rist_port = k_default_rist_port;
   std::string bind_host = "0.0.0.0";

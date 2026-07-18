@@ -116,9 +116,23 @@ Top level:
 | `rtt_max` | int (ms) | 500 | `rtt_min`–60000 | `rtt-max` + `recovery_rtt_max` |
 | `reorder_buffer` | int (ms) | 30 | 0–10000 | `reorder-buffer` |
 
-The receiver always appends `timing-mode=1` (ARRIVAL) to the listen URL and sets `mProfile = RIST_PROFILE_ADVANCED`
+The receiver always appends **`timing-mode=0` (SOURCE)** to the listen URL and sets `mProfile = RIST_PROFILE_ADVANCED`
 via `RISTNetReceiverSettings`. It does **not** append a `profile=` URL parameter — this build of librist rejects an
 unknown `profile` URL param and fails the whole listener.
+
+> **Timing mode is SOURCE (`timing-mode=0`) end-to-end — encoder, rist2rist, receiver.** Corrected 2026-07-18:
+> this document previously mandated `timing-mode=1` (ARRIVAL), which was wrong and never matched the shipped
+> code. ARRIVAL interpolates the arrival time of *retransmitted* packets and asserts
+> `packet_time < next->packet_time` (`rist-common.c`); the extra retries of the
+> encoder → rist2rist → receiver double hop violate that invariant and SIGABRT the receiver. SOURCE orders and
+> paces by the monotonic source timestamp librist stamps on each packet, preserved across the relay, and never
+> enters that path. Full history and reproduction: `open-broadcast-encoder/docs/RIST_TIMING_FINDINGS.md`.
+> Release builds keep the vendored librist compiled with `-DNDEBUG` as defence in depth (a Debug librist
+> re-arms the assert; the receiver logs a warning banner at startup when built without `NDEBUG`).
+
+**Bonding topology:** bonded links present as **multiple RIST peers on the single session port** (one peer per
+WAN path, e.g. one `miface` output per WAN from rist2rist, all to the same `host:port`). Port fans
+(`port + 2*i`) are **not supported**.
 
 `source`:
 | Field | Type | Default | Notes |
