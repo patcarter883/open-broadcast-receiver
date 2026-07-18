@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# Bonding-rig router image: the rist2rist bonding hop (FIXPLAN M1.6) built
+# from the vendored librist fork's tools/, plus tc/iproute2 for netem WAN
+# shaping and conntrack for the CGNAT-churn case. Mirrors the OpenWrt
+# luci-app-rist2rist deployment (one RIST in, one peer out per WAN path,
+# all to the SAME receiver port).
+FROM ubuntu:24.04 AS build
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential meson ninja-build pkg-config git libcjson-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY external/rist-cpp/rist rist
+RUN meson setup build rist \
+      -Ddefault_library=static -Dtest=false -Dbuilt_tools=true \
+      -Dbuiltin_mbedtls=true \
+    && ninja -C build tools/rist2rist
+
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    iproute2 iputils-ping conntrack \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/build/tools/rist2rist /usr/local/bin/
+COPY test/rig/bond.sh /usr/local/bin/bond.sh
+RUN chmod +x /usr/local/bin/bond.sh
+ENTRYPOINT ["bond.sh"]

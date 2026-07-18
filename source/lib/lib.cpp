@@ -1,11 +1,23 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Pat Carter
+
 #include "lib/lib.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <format>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
+
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 
 // ---------------------------------------------------------------------------
 // Internal helpers and validation constants (translation-unit scope)
@@ -25,13 +37,8 @@ constexpr int k_buffer_max_max = 60000;
 constexpr int k_rtt_min_max = 10000;
 constexpr int k_rtt_max_max = 60000;
 constexpr int k_reorder_max = 10000;
-constexpr int k_video_bitrate_min = 1000;
-constexpr int k_video_bitrate_max = 60000;
-constexpr int k_dim_min = 16;
-constexpr int k_dim_max_width = 7680;
-constexpr int k_dim_max_height = 4320;
-constexpr int k_gop_min = 1;
-constexpr int k_gop_max = 600;
+constexpr int k_default_rtmp_port = 1935;
+constexpr int k_default_rtmps_port = 443;
 
 auto fail(std::string code,
           std::string field,
@@ -43,21 +50,6 @@ auto fail(std::string code,
     .field = std::move(field),
     .message = std::move(msg)
   };
-}
-
-// A bare token: ASCII alphanumerics, '_' and '-' only (pixel-format names like
-// NV12 / I420 / YUY2). Used to keep CLI-supplied values that are interpolated
-// UNQUOTED-ish into caps strings free of any pipeline-meta characters.
-auto is_token(std::string_view str) noexcept -> bool
-{
-  if (str.empty()) {
-    return false;
-  }
-  return std::ranges::all_of(str, [](char chr) noexcept -> bool {
-    const auto byte = static_cast<unsigned char>(chr);
-    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')
-        || (byte >= '0' && byte <= '9') || chr == '_' || chr == '-';
-  });
 }
 
 auto validate_ingest(const ingest_config& ing) -> validation_result
@@ -91,51 +83,260 @@ auto validate_ingest(const ingest_config& ing) -> validation_result
   return {};
 }
 
-// The on-GPU re-encode settings come from the encoder (bitrate/upscale/dims) and
-// the operator (udp_host/udp_port/preset). The host and preset go bare into the
-// udpsink/nvh264enc pipeline string, so both must be free of whitespace /
-// quote-escape / control characters. The output is H264 only (stream2 has no
-// nvh265enc / nvav1enc), so out_codec is pinned to h264.
-auto validate_reencode(const reencode_config& re) -> validation_result
+auto scheme_of(const std::string& url) -> std::string
 {
-  if (re.udp_host.empty() || !is_pipeline_safe(re.udp_host)) {
-    return fail("bad_host",
-                "reencode.udp_host",
-                "must be a non-empty pipeline-safe host/IP");
+  const std::size_t pos = url.find("://");
+  if (pos == std::string::npos) {
+    return {};
   }
-  if (re.udp_port < 1 || re.udp_port > 65535) {
-    return fail("out_of_range", "reencode.udp_port", "must be 1..65535");
+  std::string scheme = url.substr(0, pos);
+  std::ranges::transform(scheme,
+                         scheme.begin(),
+                         [](unsigned char chr) -> char
+                         { return static_cast<char>(std::tolower(chr)); });
+  return scheme;
+}
+
+auto expected_scheme(output_proto proto) -> const char*
+{
+  switch (proto) {
+    case output_proto::rtmp:
+      return "rtmp";
+    case output_proto::rtmps:
+      return "rtmps";
+    case output_proto::srt:
+      return "srt";
+    case output_proto::rist:
+      return "rist";
   }
-  if (re.bitrate_kbps < k_video_bitrate_min
-      || re.bitrate_kbps > k_video_bitrate_max)
-  {
-    return fail(
-        "out_of_range", "reencode.bitrate_kbps", "must be 1000..60000");
+  return "";
+}
+
+auto default_port(output_proto proto) -> int
+{
+  switch (proto) {
+    case output_proto::rtmp:
+      return k_default_rtmp_port;
+    case output_proto::rtmps:
+      return k_default_rtmps_port;
+    case output_proto::srt:
+    case output_proto::rist:
+      return 0;  // must be explicit
   }
-  if (re.gop_size < k_gop_min || re.gop_size > k_gop_max) {
-    return fail("out_of_range", "reencode.gop_size", "must be 1..600");
+  return 0;
+}
+
+// Parse scheme://host[:port][/path][?query] into host/port/path. Unlike
+// parse_authority, the port may be absent (scheme default applied by caller).
+auto split_url(const std::string& url,
+               std::string& host,
+               int& port,
+               std::string& path) -> bool
+{
+  const std::size_t scheme = url.find("://");
+  if (scheme == std::string::npos) {
+    return false;
   }
-  if (!is_token(re.preset)) {
-    return fail("bad_enum",
-                "reencode.preset",
-                "preset must be a bare token (e.g. p5)");
+  std::string rest = url.substr(scheme + 3);
+  const std::size_t cut = rest.find_first_of("/?");
+  if (cut != std::string::npos) {
+    path = (rest[cut] == '/') ? rest.substr(cut) : std::string {};
+    const std::size_t query = path.find('?');
+    if (query != std::string::npos) {
+      path = path.substr(0, query);
+    }
+    rest = rest.substr(0, cut);
+  } else {
+    path.clear();
   }
-  if (re.upscale) {
-    if (re.width % 2 != 0 || re.height % 2 != 0 || re.width < k_dim_min
-        || re.width > k_dim_max_width || re.height < k_dim_min
-        || re.height > k_dim_max_height)
-    {
-      return fail("out_of_range",
-                  "reencode.width",
-                  "upscale dims must be even, width 16..7680 height 16..4320");
+
+  port = 0;
+  std::size_t colon = std::string::npos;
+  const std::size_t bracket = rest.rfind(']');
+  if (bracket != std::string::npos) {  // [IPv6](:port)?
+    host = rest.substr(0, bracket + 1);
+    colon = rest.find(':', bracket);
+  } else {
+    colon = rest.rfind(':');
+    host = (colon != std::string::npos) ? rest.substr(0, colon) : rest;
+  }
+  if (colon != std::string::npos) {
+    if (colon + 1 >= rest.size()) {
+      return false;  // trailing colon, no port
+    }
+    try {
+      port = std::stoi(rest.substr(colon + 1));
+    } catch (...) {
+      return false;
+    }
+    if (port < k_port_min || port > k_port_max) {
+      return false;
     }
   }
-  if (re.out_codec != codec::h264) {
-    return fail("bad_enum",
-                "reencode.out_codec",
-                "rtmp output requires h264");
+  return !host.empty();
+}
+
+// Strip the brackets of a bracketed IPv6 literal for inet_pton/getaddrinfo.
+auto unbracket(const std::string& host) -> std::string
+{
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+    return host.substr(1, host.size() - 2);
   }
-  return {};
+  return host;
+}
+
+// ---------------------------------------------------------------------------
+// IP classification (M1.2)
+// ---------------------------------------------------------------------------
+
+struct parsed_ip
+{
+  bool valid = false;
+  bool is_v6 = false;
+  std::array<uint8_t, 16> bytes {};  // v4 in bytes[0..3]
+};
+
+auto parse_ip(const std::string& literal) -> parsed_ip
+{
+  parsed_ip out;
+  in_addr addr4 {};
+  if (inet_pton(AF_INET, literal.c_str(), &addr4) == 1) {
+    out.valid = true;
+    out.is_v6 = false;
+    std::memcpy(out.bytes.data(), &addr4, sizeof(addr4));
+    return out;
+  }
+  in6_addr addr6 {};
+  if (inet_pton(AF_INET6, unbracket(literal).c_str(), &addr6) == 1) {
+    // IPv4-mapped (::ffff:a.b.c.d) classifies as the embedded IPv4 address —
+    // otherwise a mapped literal smuggles a forbidden v4 target past the rules.
+    if (IN6_IS_ADDR_V4MAPPED(&addr6)) {
+      out.valid = true;
+      out.is_v6 = false;
+      std::memcpy(out.bytes.data(), &addr6.s6_addr[12], 4);
+      return out;
+    }
+    out.valid = true;
+    out.is_v6 = true;
+    std::memcpy(out.bytes.data(), &addr6, sizeof(addr6));
+    return out;
+  }
+  return out;
+}
+
+auto v4_in(const parsed_ip& ip_addr, uint32_t net, int prefix) -> bool
+{
+  uint32_t host_order = 0;
+  std::memcpy(&host_order, ip_addr.bytes.data(), 4);
+  host_order = ntohl(host_order);
+  const uint32_t mask =
+      prefix == 0 ? 0 : (0xFFFFFFFFUL << (32 - static_cast<unsigned>(prefix)));
+  return (host_order & mask) == (net & mask);
+}
+
+auto v6_prefix(const parsed_ip& ip_addr, uint8_t byte0, uint8_t mask0) -> bool
+{
+  return (ip_addr.bytes[0] & mask0) == byte0;
+}
+
+// nullptr = acceptable; else a short class reason.
+auto classify(const parsed_ip& ip_addr, bool allow_private) -> const char*
+{
+  if (!ip_addr.is_v6) {
+    if (v4_in(ip_addr, 0x7F000000, 8)) {  // 127.0.0.0/8
+      return "loopback";
+    }
+    if (v4_in(ip_addr, 0xA9FE0000, 16)) {  // 169.254.0.0/16 (incl. metadata)
+      return "link_local";
+    }
+    if (v4_in(ip_addr, 0xE0000000, 4)) {  // 224.0.0.0/4
+      return "multicast";
+    }
+    if (v4_in(ip_addr, 0x00000000, 8)) {  // 0.0.0.0/8
+      return "unspecified";
+    }
+    if (v4_in(ip_addr, 0xFFFFFFFF, 32)) {  // broadcast
+      return "broadcast";
+    }
+    const bool priv = v4_in(ip_addr, 0x0A000000, 8)  // 10/8
+        || v4_in(ip_addr, 0xAC100000, 12)            // 172.16/12
+        || v4_in(ip_addr, 0xC0A80000, 16)            // 192.168/16
+        || v4_in(ip_addr, 0x64400000, 10);           // 100.64/10 CGNAT
+    if (priv && !allow_private) {
+      return "private";
+    }
+    return nullptr;
+  }
+
+  static const std::array<uint8_t, 16> k_zero {};
+  if (std::memcmp(ip_addr.bytes.data(), k_zero.data(), 16) == 0) {
+    return "unspecified";  // ::
+  }
+  std::array<uint8_t, 16> loop {};
+  loop[15] = 1;
+  if (std::memcmp(ip_addr.bytes.data(), loop.data(), 16) == 0) {
+    return "loopback";  // ::1
+  }
+  if (v6_prefix(ip_addr, 0xFE, 0xFF)
+      && (ip_addr.bytes[1] & 0xC0) == 0x80)  // fe80::/10
+  {
+    return "link_local";
+  }
+  if (v6_prefix(ip_addr, 0xFF, 0xFF)) {  // ff00::/8
+    return "multicast";
+  }
+  if ((ip_addr.bytes[0] & 0xFE) == 0xFC && !allow_private) {  // fc00::/7 ULA
+    return "private";
+  }
+  return nullptr;
+}
+
+struct cidr
+{
+  parsed_ip base;
+  int prefix = 0;
+};
+
+auto parse_cidr(const std::string& text, cidr& out) -> bool
+{
+  const std::size_t slash = text.find('/');
+  const std::string ip_part =
+      (slash == std::string::npos) ? text : text.substr(0, slash);
+  out.base = parse_ip(ip_part);
+  if (!out.base.valid) {
+    return false;
+  }
+  const int full = out.base.is_v6 ? 128 : 32;
+  if (slash == std::string::npos) {
+    out.prefix = full;
+    return true;
+  }
+  try {
+    out.prefix = std::stoi(text.substr(slash + 1));
+  } catch (...) {
+    return false;
+  }
+  return out.prefix >= 0 && out.prefix <= full;
+}
+
+auto cidr_contains(const cidr& net, const parsed_ip& ip_addr) -> bool
+{
+  if (net.base.is_v6 != ip_addr.is_v6) {
+    return false;
+  }
+  const int total_bytes = net.base.is_v6 ? 16 : 4;
+  int bits = net.prefix;
+  for (int idx = 0; idx < total_bytes && bits > 0; ++idx) {
+    const int take = std::min(bits, 8);
+    const auto mask = static_cast<uint8_t>(0xFF << (8 - take));
+    if ((net.base.bytes[static_cast<std::size_t>(idx)] & mask)
+        != (ip_addr.bytes[static_cast<std::size_t>(idx)] & mask))
+    {
+      return false;
+    }
+    bits -= take;
+  }
+  return true;
 }
 }  // namespace
 
@@ -156,21 +357,19 @@ auto to_string(codec cod) noexcept -> const char*
   return "h264";
 }
 
-auto to_string(audio_codec cod) noexcept -> const char*
+auto to_string(output_proto proto) noexcept -> const char*
 {
-  switch (cod) {
-    case audio_codec::aac:
-      return "aac";
-    case audio_codec::opus:
-      return "opus";
-    case audio_codec::ac3:
-      return "ac3";
-    case audio_codec::eac3:
-      return "eac3";
-    case audio_codec::mp2:
-      return "mp2";
+  switch (proto) {
+    case output_proto::rtmp:
+      return "rtmp";
+    case output_proto::rtmps:
+      return "rtmps";
+    case output_proto::srt:
+      return "srt";
+    case output_proto::rist:
+      return "rist";
   }
-  return "aac";
+  return "rtmp";
 }
 
 auto parse_codec(std::string_view str, codec& out) noexcept -> bool
@@ -181,6 +380,23 @@ auto parse_codec(std::string_view str, codec& out) noexcept -> bool
     out = codec::h265;
   } else if (str == "av1") {
     out = codec::av1;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+auto parse_output_proto(std::string_view str, output_proto& out) noexcept
+    -> bool
+{
+  if (str == "rtmp") {
+    out = output_proto::rtmp;
+  } else if (str == "rtmps") {
+    out = output_proto::rtmps;
+  } else if (str == "srt") {
+    out = output_proto::srt;
+  } else if (str == "rist") {
+    out = output_proto::rist;
   } else {
     return false;
   }
@@ -294,24 +510,168 @@ auto is_pipeline_safe(std::string_view str) noexcept -> bool
 }
 
 // ---------------------------------------------------------------------------
-// Validation entry point (public API)
+// Egress policy (public API)
 // ---------------------------------------------------------------------------
 
-auto validate_config(const receiver_config& cfg) -> validation_result
+auto default_resolver() -> resolve_fn
 {
-  if (cfg.schema_version != 1) {
+  return [](const std::string& host, std::vector<std::string>& ips) -> bool
+  {
+    addrinfo hints {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* results = nullptr;
+    if (getaddrinfo(unbracket(host).c_str(), nullptr, &hints, &results) != 0) {
+      return false;
+    }
+    for (const addrinfo* cur = results; cur != nullptr; cur = cur->ai_next) {
+      std::array<char, INET6_ADDRSTRLEN> text {};
+      if (cur->ai_family == AF_INET) {
+        const auto* sin =
+            reinterpret_cast<const sockaddr_in*>(cur->ai_addr);
+        if (inet_ntop(AF_INET, &sin->sin_addr, text.data(), text.size())
+            != nullptr)
+        {
+          ips.emplace_back(text.data());
+        }
+      } else if (cur->ai_family == AF_INET6) {
+        const auto* sin6 =
+            reinterpret_cast<const sockaddr_in6*>(cur->ai_addr);
+        if (inet_ntop(AF_INET6, &sin6->sin6_addr, text.data(), text.size())
+            != nullptr)
+        {
+          ips.emplace_back(text.data());
+        }
+      }
+    }
+    freeaddrinfo(results);
+    return !ips.empty();
+  };
+}
+
+auto forbidden_reason(const std::string& ip_literal,
+                      const egress_policy& policy) -> const char*
+{
+  const parsed_ip ip_addr = parse_ip(ip_literal);
+  if (!ip_addr.valid) {
+    return "unparsable";
+  }
+  if (const char* reason = classify(ip_addr, policy.allow_private);
+      reason != nullptr)
+  {
+    return reason;
+  }
+  for (const std::string& text : policy.deny_cidrs) {
+    cidr net;
+    if (parse_cidr(text, net) && cidr_contains(net, ip_addr)) {
+      return "denylist";
+    }
+  }
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Validation entry points (public API)
+// ---------------------------------------------------------------------------
+
+auto validate_config(receiver_config& cfg) -> validation_result
+{
+  if (cfg.schema_version != k_schema_version) {
     return fail("invalid_schema",
                 "schema_version",
-                "unsupported schema_version (expected 1)");
+                "unsupported schema_version (expected 2)");
   }
 
   if (const auto res = validate_ingest(cfg.ingest); !res.ok) {
     return res;
   }
 
-  if (const auto res = validate_reencode(cfg.reencode); !res.ok) {
-    return res;
+  if (cfg.outputs.size() > k_max_outputs) {
+    return fail("out_of_range",
+                "outputs",
+                std::format("at most {} outputs", k_max_outputs));
   }
 
+  std::unordered_set<std::string> seen_ids;
+  bool any_rtmp = false;
+  for (std::size_t idx = 0; idx < cfg.outputs.size(); ++idx) {
+    output_config& out = cfg.outputs[idx];
+    const std::string field = std::format("outputs[{}]", idx);
+
+    if (out.id.empty()) {
+      return fail("bad_enum", field + ".id", "output id must be non-empty");
+    }
+    if (!seen_ids.insert(out.id).second) {
+      return fail("bad_enum", "outputs[].id", "duplicate output id: " + out.id);
+    }
+
+    if (scheme_of(out.url) != expected_scheme(out.type)) {
+      return fail("bad_url",
+                  field + ".url",
+                  std::format("URL scheme must match type \"{}\"",
+                              to_string(out.type)));
+    }
+    if (!is_pipeline_safe(out.url) || !is_pipeline_safe(out.key_or_streamid)) {
+      return fail("bad_url",
+                  field + ".url",
+                  "URL/key contains quote-escape or control characters");
+    }
+    if (!split_url(out.url, out.host, out.port, out.path)) {
+      return fail("bad_url", field + ".url", "unparsable URL authority");
+    }
+    if (out.port == 0) {
+      out.port = default_port(out.type);
+      if (out.port == 0) {
+        return fail("bad_url",
+                    field + ".url",
+                    "srt/rist URLs require an explicit port");
+      }
+    }
+
+    any_rtmp = any_rtmp
+        || out.type == output_proto::rtmp || out.type == output_proto::rtmps;
+  }
+
+  // Fail early on the declared hint (TRANSPORT_PROFILE §1.2): copy-only fan-out
+  // can put only H.264 into FLV. The runtime-detection analogue (a non-H264 ES
+  // appearing mid-stream) degrades just the rtmp outputs, not the session.
+  if (any_rtmp && cfg.in_codec != codec::h264) {
+    return fail("rtmp_codec_unsupported",
+                "source.codec",
+                "rtmp/rtmps outputs require h264 (copy-only fan-out)");
+  }
+
+  return {};
+}
+
+auto validate_and_pin_outputs(receiver_config& cfg,
+                              const egress_policy& policy,
+                              const resolve_fn& resolve) -> validation_result
+{
+  for (output_config& out : cfg.outputs) {
+    // A literal-IP host classifies directly; otherwise resolve and vet EVERY
+    // returned address (a rebinding name must not pass because one A record is
+    // public), then pin the first acceptable one. The pipeline connects to
+    // pinned_ip and never re-resolves (M1.2).
+    std::vector<std::string> ips;
+    if (parse_ip(unbracket(out.host)).valid) {
+      ips.push_back(unbracket(out.host));
+    } else {
+      if (!resolve || !resolve(out.host, ips) || ips.empty()) {
+        return fail("bad_url",
+                    "outputs[].url",
+                    "destination host did not resolve (output " + out.id + ")");
+      }
+    }
+    for (const std::string& ip_literal : ips) {
+      if (forbidden_reason(ip_literal, policy) != nullptr) {
+        // Name the output id only — never the resolved IP (topology leak).
+        return fail("forbidden_destination",
+                    "outputs[].url",
+                    "destination not permitted for output " + out.id);
+      }
+    }
+    out.pinned_ip = ips.front();
+  }
   return {};
 }

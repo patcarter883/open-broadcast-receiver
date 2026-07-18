@@ -328,7 +328,9 @@ bool RISTNetReceiver::initReceiver(std::vector<std::string> &rURLList,
     for (auto &rURL: rURLList) {
         int keysize = 0;
         if (!mRistReceiverSettings.mPSK.empty()) {
-            keysize = 128;
+            // Local patch (open-broadcast): honor the configured key size so
+            // the hosted profile can mandate AES-256 (--psk-aes 256).
+            keysize = (mRistReceiverSettings.mPSKKeySize == 256) ? 256 : 128;
         }
         mRistPeerConfig.version = RIST_PEER_CONFIG_VERSION;
         mRistPeerConfig.virt_dst_port = RIST_DEFAULT_VIRT_DST_PORT;

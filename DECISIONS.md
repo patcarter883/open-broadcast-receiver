@@ -296,3 +296,83 @@ patterns and teardown discipline.
    RIST-host independent in the UI but recommends deriving.
 3. Whether TLS is mandatory for the deployment topology. v1 ships plain HTTP + token; TLS is a compile flag for public
    hops.
+
+---
+
+# Transport profile decisions (2026-07-18)
+
+## 13. Fan-out mechanism: N independent pipelines over an in-process SPMC ring
+
+**Choice.** One self-contained GStreamer pipeline per output, each fed from its own cursor into a single
+in-process single-producer/multi-consumer byte ring written by the RIST data callback. (Adopted from
+TRANSPORT_PROFILE.md §3, product repo — full analysis there.)
+
+**Rationale.** The requirement is output independence: a slow, rejecting, or flapping destination must not
+disturb the others. Per-output pipelines make errors local *by construction* — a failed output is destroyed and
+rebuilt, never surgically unlinked; the ring decouples every consumer from ingest (producer never blocks;
+per-consumer drop-oldest at TS-packet boundaries with `dropped_bytes` accounting).
+
+**Rejected.**
+- *Single pipeline with `tee` + per-branch queues*: any branch error is pipeline-fatal by default; containment
+  means pad-block/unlink/flush surgery on a live pipeline on every reconnect — the most bug-prone area of
+  GStreamer programming. A full non-leaky queue stalls the tee (couples every output); `leaky=downstream` drops
+  at unpredictable granularity with no per-consumer accounting.
+- *Process per output*: the session container is already the isolation boundary that matters; a per-output
+  process adds an in-container supervisor, IPC framing, and N× runtime footprint to isolate a customer from
+  themselves. **Revisit trigger:** if production shows crash-class failures attributable to a specific sink
+  element, promote that output type only to a child process behind the same consumer interface.
+
+## 14. Reconnect policy: retry forever; the only terminal error is rtmp_codec_unsupported
+
+**Choice.** Backoff 1 s → ×2 → 30 s cap, retrying indefinitely while the session runs; the ladder resets after a
+run stable for 30 s. Terminal per-output state only for `rtmp_codec_unsupported` (a non-H.264 ES cannot enter
+FLV; cannot self-heal).
+
+**Rationale.** A live event must ride out a platform's 5-minute ingest outage without operator action. Many RTMP
+ingests close the TCP connection on a bad stream key — indistinguishable from a transient reset at the sink's
+error surface — so auth-failure classification is unreliable; misclassification either hammers a platform
+forever or kills a healthy output during a platform blip. Advisory thresholds ("check your stream key") belong
+in the panel/agent, driven by `reconnects` + `last_error`.
+
+**Rejected.** The earlier "5 consecutive auth failures ⇒ terminal" rule (built on signals the sink cannot
+actually distinguish). Backlog: catalogue real `rtmp2sink` error surfaces per platform during integration
+testing before considering terminal classification.
+
+**Observed.** Live test 2026-07-18: with no media flowing, SRS closes the idle RTMP connection repeatedly; the
+retry ladder rode through it and the output recovered the moment media arrived — exactly the behaviour the
+policy was chosen for. Kill/restart of SRS mid-stream: rtmp output cycled reconnecting→running while the SRT
+output and recording ran undisturbed.
+
+## 15. Egress validation: pin the vetted IP; rtmps connects by hostname
+
+**Choice.** `/start` resolves every output destination, rejects loopback/link-local (incl. metadata)/RFC1918/
+ULA/CGNAT/multicast and `--egress-deny` CIDRs (any forbidden record rejects the whole name), then **pins** the
+vetted IP: rtmp/srt/rist pipelines connect to the pinned IP and never re-resolve — a post-validation DNS rebind
+has nothing to attack. `rtmps` is the exception: it connects by **hostname**, because TLS certificate validation
+against the real hostname is itself the rebinding defence for TLS destinations (an attacker's private endpoint
+cannot present a valid public-CA cert for the platform host), and SNI/verification break on a bare IP.
+`forbidden_destination` errors name the output id, never the resolved IP (no topology leak). Self-host opt-out
+`--egress-allow-private` admits RFC1918/ULA only.
+
+**Rejected.** Validating without pinning (loses to rebinding); connecting rtmps to the pinned IP with manual SNI
+override (fights the TLS stack, breaks cert validation semantics); treating the tcUrl hostname as load-bearing
+for plain rtmp (verified against SRS: publishing with an IP tcUrl works; platform ingests to be confirmed in the
+integration rig — if one rejects IP tcUrl, revisit with a resolver shim rather than dropping the pin).
+
+## 16. Session teardown order: producer first
+
+**Choice.** Construction: ring → recorder → outputs → RIST listener last (data flows only once every consumer
+exists). Teardown: RIST first (`destroyReceiver` joins librist workers, so the producer can never touch a dead
+ring), then ring close (wakes blocked consumers), then outputs/recorder, then the ring.
+
+**Rationale.** TRANSPORT_PROFILE §3.6's sketch ("consumers, then ring, then RIST") leaves a live producer
+writing into a ring being destroyed; reversing to producer-first is the memory-safe order and costs nothing at
+/stop time (the session is ending anyway).
+
+## 17. Listener bind fallback
+
+**Choice.** The default listener is dual-stack `rist://@[::]`; if that bind fails (IPv6-less container/VPS), the
+receiver retries once on `rist://@0.0.0.0` and logs the fallback.
+
+**Rationale.** v6-less hosts are common in container fleets; failing the whole session over an address-family
+gap is operator-hostile. **Rejected:** a CLI flag for address family (one more knob for something detectable).

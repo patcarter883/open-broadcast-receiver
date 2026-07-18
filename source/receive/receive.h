@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Pat Carter
+
 #ifndef OPEN_BROADCAST_RECEIVER_SOURCE_RECEIVE_RECEIVE_H
 #define OPEN_BROADCAST_RECEIVER_SOURCE_RECEIVE_RECEIVE_H
 
@@ -6,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "RISTNet.h"
@@ -14,20 +18,22 @@
 
 // rist_receive wraps a RISTNetReceiver that LISTENS for the encoder's
 // RISTNetSender (caller). Received MPEG-TS payloads are handed to a push
-// callback (the restream appsrc); ~1 Hz it computes link quality + worst-case
-// RTT and sends the 5-byte wan_telemetry struct back to the encoder over the
-// RIST OOB channel (closing the encoder's remote_oob adaptive-bitrate loop).
-// See docs/CONTRACT.md §8 and DECISIONS.md §4/§6.
+// callback — under the transport profile that callback writes the SPMC ring
+// and MUST return immediately (the producer never blocks; TRANSPORT_PROFILE
+// §3.4). ~1 Hz it computes link quality + worst-case RTT and sends the 5-byte
+// wan_telemetry struct back over the RIST OOB channel (closing the encoder's
+// remote_oob adaptive-bitrate loop), and snapshots the full receiver_flow
+// stats for the agent-facing GET /stats.
+//
+// Bonding: multiple RIST peers arrive on this ONE listener port (one peer per
+// WAN path via rist2rist). Every peer feeds the same flow; peer connects and
+// disconnects mid-session are normal (cellular CGNAT churn) and never restart
+// anything. OOB telemetry goes to the most recent data peer (the relay
+// forwards it upstream).
 class rist_receive
 {
 public:
   using push_fn = std::function<int(const uint8_t*, std::size_t)>;
-  // Fired (on a librist worker thread) when the encoder RE-connects after a
-  // prior connection — i.e. NOT the very first connect. The handler MUST NOT
-  // block the calling thread (it runs on the librist worker); it should only
-  // signal a supervisor to re-arm codec detection / restart the restream
-  // pipeline. See main.cpp.
-  using reconnect_fn = std::function<void()>;
 
   explicit rist_receive(std::function<void(const std::string&)> log);
   ~rist_receive();
@@ -37,20 +43,19 @@ public:
   auto operator=(rist_receive&&) -> rist_receive& = delete;
 
   // Build the listener, wire callbacks (ADVANCED profile) and start receiving.
-  // `state` is borrowed for telemetry mirroring. Returns false + err on failure.
+  // `state` is borrowed for telemetry mirroring + media-liveness counters.
+  // opts.psk (with opts.psk_aes) enables librist PSK on the listener — the
+  // secret travels via RISTNetReceiverSettings, never inside the URL.
   auto start(const receiver_config& cfg,
+             const runtime_options& opts,
              receiver_state* state,
              push_fn push,
              std::string& err) -> bool;
 
   auto stop() -> void;
 
-  // Register the reconnect hook. Set before start(); fired from the librist
-  // worker thread on a re-connect (not the first connect). Must not block.
-  auto set_on_reconnect(reconnect_fn on_reconnect) -> void
-  {
-    m_on_reconnect = std::move(on_reconnect);
-  }
+  // Copy of the latest ~1 Hz receiver_flow snapshot (for GET /stats).
+  [[nodiscard]] auto flow_stats() const -> rist_flow_stat;
 
 private:
   auto log(const std::string& msg) const -> void;
@@ -58,17 +63,15 @@ private:
   std::function<void(const std::string&)> m_log_func;
   std::unique_ptr<RISTNetReceiver> m_receiver;
   push_fn m_push;
-  reconnect_fn m_on_reconnect;
   receiver_state* m_state = nullptr;  // borrowed
 
-  // The connected encoder peer, captured from networkDataCallback and cleared
-  // in clientDisconnectedCallback. Accessed from librist callback threads.
+  // The most recent data peer, for OOB telemetry. Accessed from librist
+  // callback threads.
   std::atomic<rist_peer*> m_peer {nullptr};
   std::atomic_bool m_started {false};
-  // True once the encoder has connected at least once. Used to distinguish a
-  // first connect from a RE-connect so on_reconnect only fires on the latter.
-  // Survives across listener restarts (only reset by an explicit listener teardown).
-  std::atomic_bool m_was_connected {false};
+
+  mutable std::mutex m_flow_mutex;
+  rist_flow_stat m_flow;
 };
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_RECEIVE_RECEIVE_H

@@ -1,0 +1,27 @@
+# Guard against committed compiled binaries (FIXPLAN M0.1).
+#
+# History was rewritten on 2026-07-18 to purge two ELF executables that had
+# been committed to the repo root. Release artifacts ship via GitHub Releases
+# with a SHA-256 in the release notes — never via the tree. This job keeps it
+# that way: it fails if any tracked file is an ELF, PE, or Mach-O binary.
+name: Binary guard
+
+on: [push, pull_request]
+
+jobs:
+  no-committed-binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if any tracked file is a compiled binary (ELF/PE/Mach-O)
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files -z | xargs -0 -r file --mime-type -- \
+            | grep -E ': *application/(x-executable|x-pie-executable|x-sharedlib|x-object|x-mach-binary|x-dosexec|vnd\.microsoft\.portable-executable)$' \
+            || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Compiled binaries must not be committed. Ship them via GitHub Releases (with SHA-256) instead."
+            echo "$bad"
+            exit 1
+          fi
+          echo "No compiled binaries tracked."
