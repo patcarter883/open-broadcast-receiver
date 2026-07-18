@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Pat Carter
+
 #ifndef OPEN_BROADCAST_RECEIVER_SOURCE_RECEIVE_RECEIVE_H
 #define OPEN_BROADCAST_RECEIVER_SOURCE_RECEIVE_RECEIVE_H
 

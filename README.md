@@ -97,3 +97,14 @@ curl -s -X POST http://127.0.0.1:8080/stop -H "Authorization: Bearer $RECEIVER_T
   `GET /status` or logs.
 
 See `DECISIONS.md` §9 for the full security rationale.
+
+## Licensing
+
+Licensed under the **GNU Affero General Public License v3.0 or later**
+(AGPL-3.0-or-later). See [`LICENSE`](LICENSE).
+
+Third-party components retain their own licenses — see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+Contributions are accepted under the same license with a DCO sign-off — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
