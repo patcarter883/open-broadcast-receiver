@@ -1,0 +1,30 @@
+# Komodo resource sync for the production receiver image (BACKPLANE §13.9).
+# Target instance: https://komodo.huntervalleyit.net.au/
+# Applied via a Resource Sync pointing at komodo.toml in
+# github.com/patcarter883/open-broadcast-receiver. Builder "Builder1",
+# GHCR account patcarter883.
+#
+# This builds ONLY the image; there is no receiver stack — the node agent
+# spawns one container per session at allocate time (it is not a long-running
+# stack). The agent's RECEIVER_IMAGE / the allocate image_tag point here.
+
+[[build]]
+name = "obr-receiver-build"
+description = "open-broadcast receiver (copy-only fan-out) production image"
+tags = ["open-broadcast", "receiver"]
+[build.config]
+builder_id = "Builder1"
+git_provider = "github.com"
+git_account = "patcarter883"
+repo = "patcarter883/open-broadcast-receiver"
+branch = "main"
+build_path = "."
+dockerfile_path = "Dockerfile"
+image_name = "open-broadcast-receiver"
+# On a GStreamer security advisory: push to rebuild + roll new sessions via
+# the allocate image_tag (H4 patch cadence). Webhook-built, deployed per-session.
+webhook_enabled = true
+[[build.config.image_registry]]
+domain = "ghcr.io"
+account = "patcarter883"
+organization = "patcarter883"
