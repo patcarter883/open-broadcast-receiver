@@ -200,6 +200,72 @@ struct receiver_state
   std::atomic<int64_t> last_payload_ms {0};  // steady_clock ms; 0 = never
 };
 
+struct app_context
+{
+  receiver_state state;
+  std::unique_ptr<rist_receive> receive;
+  std::unique_ptr<control_server> control;
+  std::string auth_token;  // empty => dev/no-auth mode
+};
+
+// ---------------------------------------------------------------------------
+// Stats snapshots (GET /status outputs[] + GET /stats — TRANSPORT_PROFILE
+// §1.3/§1.4). Built from atomics by main's snapshot callback; the /stats
+// handler MUST NOT take pipeline locks or block the distribution path.
+// ---------------------------------------------------------------------------
+
+// Per-peer view (vendored librist rist_stats_receiver_peer — verified present
+// at implementation, closing TRANSPORT_PROFILE §5.1): each link in a bond
+// arrives as a separate peer, so this is the per-WAN-path panel view.
+struct rist_peer_stat
+{
+  uint32_t id = 0;            // librist internal peer id
+  uint32_t rtt_ms = 0;
+  double avg_rtt_ms = 0.0;
+  uint64_t received = 0;      // data packets from this peer
+  uint64_t received_bytes = 0;
+  uint64_t bandwidth_bps = 0;
+};
+
+struct rist_flow_stat
+{
+  double quality = 0.0;
+  uint32_t rtt_ms = 0;
+  uint64_t received = 0;
+  uint64_t missing = 0;
+  uint64_t recovered = 0;
+  uint64_t recovered_one_retry = 0;
+  uint64_t lost = 0;
+  uint64_t reordered = 0;
+  uint64_t bandwidth_bps = 0;
+  uint64_t retry_bandwidth_bps = 0;
+  std::vector<rist_peer_stat> peers;
+};
+
+struct output_stat
+{
+  std::string id;
+  std::string type;
+  std::string state;
+  int64_t connected_s = 0;
+  uint64_t reconnects = 0;
+  uint64_t bytes_sent = 0;
+  uint64_t dropped_bytes = 0;
+  bool audio_dropped = false;
+  std::string last_error;  // empty = none; never contains URLs/keys
+};
+
+struct session_stats
+{
+  uint64_t ring_size_bytes = 0;
+  bool recording_active = false;
+  uint64_t recording_bytes = 0;
+  uint64_t recording_dropped = 0;
+  uint64_t rist_bytes_total = 0;  // ingest byte counter (agent derives rate)
+  rist_flow_stat rist;
+  std::vector<output_stat> outputs;
+};
+
 // ---------------------------------------------------------------------------
 // Enum <-> string helpers (docs/CONTRACT.md §3)
 // ---------------------------------------------------------------------------

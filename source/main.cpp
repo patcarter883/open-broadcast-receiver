@@ -8,28 +8,32 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <format>
-#include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include <pthread.h>
 
 #include <gst/gst.h>
 
 #include "control/control.h"
+#include "fanout/output.h"
+#include "fanout/recorder.h"
+#include "fanout/ring.h"
 #include "lib/lib.h"
 #include "receive/receive.h"
-#include "restream/restream.h"
 
 namespace
 {
 constexpr int k_default_control_port = 8080;
 constexpr int k_default_rist_port = 5000;
 constexpr int k_port_max = 65535;
+constexpr auto k_watchdog_tick = std::chrono::seconds(1);
 
 auto stderr_log(const std::string& msg) -> void
 {
@@ -40,39 +44,39 @@ auto stderr_log(const std::string& msg) -> void
 auto print_usage(const char* argv0) -> void
 {
   std::cout
-      << "open-broadcast-receiver — headless RIST receiver / restreamer\n\n"
+      << "open-broadcast-receiver — headless RIST receiver, copy-only fan-out\n\n"
       << "Usage: " << argv0 << " [options]\n\n"
       << "  --control-port <port>   HTTP control port (default 8080)\n"
       << "  --rist-port <port>      RIST listen port (default 5000)\n"
-      << "  --bind <host>           HTTP bind address (default 0.0.0.0)\n"
+      << "  --bind <host>           HTTP bind address (default 127.0.0.1;\n"
+      << "                          non-loopback binds REQUIRE a token or the\n"
+      << "                          explicit --allow-unauthenticated flag)\n"
       << "  --token <secret>        Bearer token for the control API\n"
-      << "                          (empty => DEV no-auth mode; not for production)\n"
+      << "  --allow-unauthenticated Run without a token on a non-loopback bind\n"
+      << "                          (NOT for production; loud warning)\n"
+      << "  --psk <hex>             librist PSK for the RIST listener\n"
+      << "  --psk-aes <128|256>     PSK AES key size (default 256)\n"
+      << "  --record-dir <path>     record incoming TS verbatim to\n"
+      << "                          <dir>/<session_id>.ts\n"
+      << "  --idle-timeout <s>      no RIST payload for this long while running\n"
+      << "                          => stop with last_bus_error=idle_timeout\n"
+      << "                          (default 0 = off)\n"
+      << "  --egress-deny <cidrs>   comma-separated CIDR deny-list for output\n"
+      << "                          destinations (hosted: node subnet+metadata)\n"
+      << "  --egress-allow-private  permit RFC1918/ULA output destinations\n"
+      << "                          (LAN restreaming; metadata/loopback stay\n"
+      << "                          blocked)\n"
       << "  --buffer-min <ms>       RIST recovery buffer floor (default 1000)\n"
       << "  --buffer-max <ms>       RIST recovery buffer ceiling (default 5000)\n"
       << "  --rtt-min <ms>          RIST recovery RTT min (default 40)\n"
       << "  --rtt-max <ms>          RIST recovery RTT max (default 500)\n"
       << "  --reorder-buffer <ms>   RIST reorder hold-off (default 30; keep well\n"
       << "                          below buffer-min or retransmission is starved)\n"
-      << "  --udp-host <host>       MPEG-TS/UDP sink host for the H264 publish\n"
-      << "                          (default 127.0.0.1; datarhei udp ingest)\n"
-      << "  --udp-port <port>       MPEG-TS/UDP sink port (default 12000)\n"
-      << "  --bitrate <kbps>        on-GPU H264 encode bitrate (default 4300;\n"
-      << "                          1000..60000)\n"
-      << "  --upscale               insert cudascale to encode at --width x\n"
-      << "                          --height (default off)\n"
-      << "  --width <px>            upscale target width (default 2560; used only\n"
-      << "                          with --upscale)\n"
-      << "  --height <px>           upscale target height (default 1440; used\n"
-      << "                          only with --upscale)\n"
-      << "  --no-hw-decode          force software decode (default: prefer\n"
-      << "                          NVDEC/VA/QSV when present)\n"
       << "  --help                  Show this help\n\n"
-      << "The receiver decodes the incoming RIST stream, re-encodes H264 on the\n"
-      << "GPU (NVENC) and pushes a single MPEG-TS/UDP stream to a restreaming package\n"
-      << "(e.g. datarhei/restreamer), which fans it out by codec copy. AAC audio\n"
-      << "is passed through. The restream pipeline AUTO-STARTS on the first RIST\n"
-      << "connection using the encode settings above (no POST /start required);\n"
-      << "POST /start remains an optional override. See docs/CONTRACT.md.\n";
+      << "The receiver terminates one RIST/TS ingest and fans it out, copy-only\n"
+      << "(H.264+AAC), to up to 8 RTMP/RTMPS/SRT/RIST outputs over an in-process\n"
+      << "ring — one independent pipeline per output. POST /start (schema 2)\n"
+      << "configures outputs; see docs/CONTRACT.md.\n";
 }
 
 auto parse_port(const char* str, int& out) -> bool
@@ -89,22 +93,45 @@ auto parse_port(const char* str, int& out) -> bool
   }
 }
 
-// Parse a bounded integer (for --bitrate/--width/--height, whose ranges exceed
-// the port ceiling). Range validation against the contract limits is done by
-// validate_config() before launch; here we just bound to a sane positive int.
-auto parse_int(const char* str, int& out, int min_val, int max_val) -> bool
+auto is_loopback_bind(const std::string& host) -> bool
 {
-  try {
-    const int val = std::stoi(str);
-    if (val < min_val || val > max_val) {
-      return false;
-    }
-    out = val;
-    return true;
-  } catch (...) {
-    return false;
-  }
+  return host == "localhost" || host == "::1" || host == "[::1]"
+      || host.starts_with("127.");
 }
+
+auto split_csv(const std::string& text) -> std::vector<std::string>
+{
+  std::vector<std::string> out;
+  std::stringstream stream(text);
+  std::string item;
+  while (std::getline(stream, item, ',')) {
+    if (!item.empty()) {
+      out.push_back(item);
+    }
+  }
+  return out;
+}
+
+auto steady_ms() -> int64_t
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// The live fan-out session: ring + consumers. Owned by main, guarded by the
+// lifecycle mutex. Construction: ring → recorder → outputs → RIST last (data
+// only flows once every consumer exists). Teardown REVERSE of data flow:
+// RIST first (joins librist workers ⇒ producer can no longer touch the ring),
+// then ring close (wakes consumers), then outputs/recorder, then the ring
+// itself. (TRANSPORT_PROFILE §3.6's teardown note, tightened for memory
+// safety — recorded in DECISIONS.md.)
+struct session
+{
+  std::unique_ptr<ts_ring> ring;
+  std::vector<std::unique_ptr<output>> outputs;
+  std::unique_ptr<recorder> rec;
+};
 }  // namespace
 
 auto main(int argc, char** argv) -> int
@@ -128,8 +155,13 @@ auto main(int argc, char** argv) -> int
 
   int control_port = k_default_control_port;
   int rist_port = k_default_rist_port;
-  std::string bind_host = "0.0.0.0";
+  // M1.1: loopback by default. Self-hosters must take an explicit, visible
+  // step (token, or the scary flag) to expose the control plane.
+  std::string bind_host = "127.0.0.1";
   std::string token;
+  bool allow_unauthenticated = false;
+  runtime_options opts;
+  egress_policy egress;
   // RIST recovery tuning (ms). Operator-authoritative over the /start body's
   // ingest block, like --rist-port. Defaults come from receiver_defaults.
   int buffer_min = receiver_defaults::buffer_min_ms;
@@ -137,21 +169,6 @@ auto main(int argc, char** argv) -> int
   int rtt_min = receiver_defaults::rtt_min_ms;
   int rtt_max = receiver_defaults::rtt_max_ms;
   int reorder_buffer = receiver_defaults::reorder_buffer_ms;
-  // On-GPU re-encode infrastructure (host-set; see reencode_config). The MPEG-TS/
-  // UDP sink targets the local restreaming package (datarhei). The encode
-  // settings (bitrate/upscale/dims) come from the encoder via /start; only this
-  // target + the decode preference are operator-authoritative here.
-  std::string udp_host = reencode_config {}.udp_host;
-  int udp_port = reencode_config {}.udp_port;
-  bool prefer_hw_decode = true;
-  // On-GPU encode settings for AUTO-START. The receiver no longer waits for the
-  // encoder's /start to supply these — it auto-starts on the first RIST
-  // connection using its own config. Seeded from reencode_config defaults;
-  // overridable via the flags below. A later /start can still override per-body.
-  int bitrate = reencode_config {}.bitrate_kbps;
-  bool upscale = reencode_config {}.upscale;
-  int width = reencode_config {}.width;
-  int height = reencode_config {}.height;
 
   for (int idx = 1; idx < argc; ++idx) {
     const std::string_view arg = argv[idx];
@@ -162,6 +179,15 @@ auto main(int argc, char** argv) -> int
         return false;
       }
       ++idx;
+      return true;
+    };
+    auto next_str = [&](std::string& dst) -> bool
+    {
+      if (idx + 1 >= argc) {
+        std::cerr << "Missing value for " << arg << "\n";
+        return false;
+      }
+      dst = argv[++idx];
       return true;
     };
     if (arg == "--help" || arg == "-h") {
@@ -176,17 +202,61 @@ auto main(int argc, char** argv) -> int
         return 2;
       }
     } else if (arg == "--bind") {
-      if (idx + 1 >= argc) {
-        std::cerr << "Missing value for --bind\n";
+      if (!next_str(bind_host)) {
         return 2;
       }
-      bind_host = argv[++idx];
     } else if (arg == "--token") {
-      if (idx + 1 >= argc) {
-        std::cerr << "Missing value for --token\n";
+      if (!next_str(token)) {
         return 2;
       }
-      token = argv[++idx];
+    } else if (arg == "--allow-unauthenticated") {
+      allow_unauthenticated = true;
+    } else if (arg == "--psk") {
+      if (!next_str(opts.psk)) {
+        return 2;
+      }
+    } else if (arg == "--psk-aes") {
+      int val = 0;
+      if (idx + 1 >= argc) {
+        std::cerr << "Missing value for --psk-aes\n";
+        return 2;
+      }
+      try {
+        val = std::stoi(argv[++idx]);
+      } catch (...) {
+        val = 0;
+      }
+      if (val != 128 && val != 256) {
+        std::cerr << "--psk-aes must be 128 or 256\n";
+        return 2;
+      }
+      opts.psk_aes = val;
+    } else if (arg == "--record-dir") {
+      if (!next_str(opts.record_dir)) {
+        return 2;
+      }
+    } else if (arg == "--idle-timeout") {
+      if (idx + 1 >= argc) {
+        std::cerr << "Missing value for --idle-timeout\n";
+        return 2;
+      }
+      try {
+        opts.idle_timeout_s = std::stoi(argv[++idx]);
+      } catch (...) {
+        opts.idle_timeout_s = -1;
+      }
+      if (opts.idle_timeout_s < 0) {
+        std::cerr << "--idle-timeout must be >= 0 seconds\n";
+        return 2;
+      }
+    } else if (arg == "--egress-deny") {
+      std::string csv;
+      if (!next_str(csv)) {
+        return 2;
+      }
+      egress.deny_cidrs = split_csv(csv);
+    } else if (arg == "--egress-allow-private") {
+      egress.allow_private = true;
     } else if (arg == "--buffer-min") {
       if (!next(buffer_min)) {
         return 2;
@@ -207,45 +277,31 @@ auto main(int argc, char** argv) -> int
       if (!next(reorder_buffer)) {
         return 2;
       }
-    } else if (arg == "--udp-host") {
-      if (idx + 1 >= argc) {
-        std::cerr << "Missing value for --udp-host\n";
-        return 2;
-      }
-      udp_host = argv[++idx];
-    } else if (arg == "--udp-port") {
-      if (idx + 1 >= argc || !parse_int(argv[idx + 1], udp_port, 1, 65535)) {
-        std::cerr << "Invalid or missing value for --udp-port\n";
-        return 2;
-      }
-      ++idx;
-    } else if (arg == "--bitrate") {
-      if (idx + 1 >= argc || !parse_int(argv[idx + 1], bitrate, 1, 1000000)) {
-        std::cerr << "Invalid or missing value for --bitrate\n";
-        return 2;
-      }
-      ++idx;
-    } else if (arg == "--upscale") {
-      upscale = true;
-    } else if (arg == "--width") {
-      if (idx + 1 >= argc || !parse_int(argv[idx + 1], width, 1, 100000)) {
-        std::cerr << "Invalid or missing value for --width\n";
-        return 2;
-      }
-      ++idx;
-    } else if (arg == "--height") {
-      if (idx + 1 >= argc || !parse_int(argv[idx + 1], height, 1, 100000)) {
-        std::cerr << "Invalid or missing value for --height\n";
-        return 2;
-      }
-      ++idx;
-    } else if (arg == "--no-hw-decode") {
-      prefer_hw_decode = false;
     } else {
       std::cerr << "Unknown argument: " << arg << "\n";
       print_usage(argv[0]);
       return 2;
     }
+  }
+
+  // M1.1: an empty token on a non-loopback bind is an internet-exposed
+  // unauthenticated control plane — refuse to start unless the operator
+  // explicitly demanded it.
+  if (token.empty() && !is_loopback_bind(bind_host)) {
+    if (!allow_unauthenticated) {
+      std::cerr
+          << "FATAL: refusing to bind the control API to " << bind_host
+          << " without a token.\n"
+          << "Anyone who can reach this port could redirect your stream.\n"
+          << "Either pass --token <secret>, keep --bind 127.0.0.1 behind a\n"
+          << "reverse proxy, or (NOT for production) pass\n"
+          << "--allow-unauthenticated to accept the risk explicitly.\n";
+      return 3;
+    }
+  }
+  if (token.empty()) {
+    std::cerr << "\x1b[1;31m*** NO-AUTH MODE: control API accepts "
+                 "unauthenticated requests. NOT for production. ***\x1b[0m\n";
   }
 
   // Block SIGINT/SIGTERM in all threads; main alone waits via sigwait. Threads
@@ -260,49 +316,50 @@ auto main(int argc, char** argv) -> int
   app_context ctx;
   ctx.auth_token = token;
   ctx.receive = std::make_unique<rist_receive>(&stderr_log);
-  ctx.restreamer = std::make_unique<restream>(&stderr_log);
 
-  std::mutex lifecycle;  // serialises start/stop; never held by bus/RIST threads
+  std::mutex lifecycle;  // serialises start/stop; never held by RIST threads
+  session sess;
 
   control_server control(ctx);
 
-  // The single start primitive, shared by THREE callers: (1) the POST /start
-  // handler (optional override), (2) the AUTO-START at process startup, and (3)
-  // the reconnect supervisor. It applies the operator-authoritative CLI
-  // overrides onto the supplied cfg, runs the idempotency/409 checks, then
-  // launches the restream pipeline + RIST receiver. The `lifecycle` mutex makes
-  // every caller mutually exclusive. Captures the CLI locals by reference (they
-  // outlive every invocation; main owns them).
-  std::function<bool(const receiver_config&,
-                     std::string&,
-                     std::string&,
-                     int&)>
-      do_start = [&ctx, &lifecycle, rist_port, buffer_min, buffer_max, rtt_min,
-                  rtt_max, reorder_buffer, udp_host, udp_port, prefer_hw_decode](
-                     const receiver_config& body_cfg,
-                     std::string& err_code,
-                     std::string& err_msg,
-                     int& http_status) -> bool
+  // Tear down the live session. Caller holds `lifecycle`. Order per the
+  // session struct comment: producer first, then wake+stop consumers.
+  auto teardown = [&ctx, &sess]() -> void
+  {
+    ctx.receive->stop();  // joins librist workers: producer is now quiescent
+    if (sess.ring) {
+      sess.ring->close();  // wake all blocked consumers
+    }
+    for (std::unique_ptr<output>& out : sess.outputs) {
+      out->stop();
+    }
+    sess.outputs.clear();
+    if (sess.rec) {
+      sess.rec->stop();
+      sess.rec.reset();
+    }
+    sess.ring.reset();
+  };
+
+  const auto do_start = [&ctx, &lifecycle, &sess, &teardown, &egress, &opts,
+                         rist_port, buffer_min, buffer_max, rtt_min, rtt_max,
+                         reorder_buffer](receiver_config& cfg,
+                                         std::string& err_code,
+                                         std::string& err_field,
+                                         std::string& err_msg,
+                                         int& http_status) -> bool
   {
     std::lock_guard<std::mutex> life(lifecycle);
 
     // The operator-chosen --rist-port and recovery flags are authoritative
     // for the listen socket and retransmission window. Apply up front so
     // idempotency compares the *effective* config.
-    receiver_config cfg = body_cfg;
-    cfg.ingest.rist_listen = std::format("rist://@[::]:{}", rist_port);
+    cfg.ingest.rist_listen = "rist://@[::]:" + std::to_string(rist_port);
     cfg.ingest.buffer_min = buffer_min;
     cfg.ingest.buffer_max = buffer_max;
     cfg.ingest.rtt_min = rtt_min;
     cfg.ingest.rtt_max = rtt_max;
     cfg.ingest.reorder_buffer = reorder_buffer;
-    // The UDP sink target and decode preference are operator-authoritative
-    // (CLI), like --rist-port. Applied before the idempotency compare so it
-    // sees the effective config. The encode settings (bitrate/upscale/dims)
-    // come from the auto cfg (CLI defaults) or a /start body.
-    cfg.reencode.udp_host = udp_host;
-    cfg.reencode.udp_port = udp_port;
-    cfg.reencode.prefer_hw_decode = prefer_hw_decode;
 
     if (ctx.state.is_running.load(std::memory_order_acquire)) {
       std::string current_session;
@@ -312,49 +369,72 @@ auto main(int argc, char** argv) -> int
         current_session = ctx.state.session_id;
         current_cfg = ctx.state.cfg;
       }
-      // A repeat of the EXACT same /start (same session_id + identical config) is
-      // a genuine idempotent retry -> no-op. Anything else -- a NEW session_id
-      // (the encoder generates one each time the user presses Start) or a changed
-      // config -- RE-RUNS codec detection by restarting just the restream
-      // pipeline, applying the encoder's settings. This lets the end user trigger
-      // re-detection from the encoder UI without restarting the remote receiver.
-      // Only the restream pipeline cycles; the RIST listener stays bound and
-      // keeps feeding the shared appsrc (same primitive as the reconnect
-      // supervisor), so push_buffer is routed to the rebuilt pipeline.
+      // Identical /start (same session_id + config) is an idempotent retry →
+      // 200 no-op. Anything else conflicts with the running session → 409.
       if (current_session == cfg.session_id && current_cfg == cfg) {
         http_status = 200;
         return true;
       }
-      ctx.restreamer->stop();
-      if (!ctx.restreamer->start(cfg, &ctx.state, err_code, err_msg)) {
-        ctx.state.is_running.store(false, std::memory_order_release);
-        http_status = (err_code == "encoder_unavailable") ? 400 : 500;
-        return false;
-      }
-      {
-        std::lock_guard<std::mutex> guard(ctx.state.mutex);
-        ctx.state.cfg = cfg;
-        ctx.state.session_id = cfg.session_id;
-        ctx.state.started_at = std::chrono::steady_clock::now();
-        ctx.state.last_bus_error.clear();
-      }
-      http_status = 200;
-      return true;
-    }
-
-    if (!ctx.restreamer->start(cfg, &ctx.state, err_code, err_msg)) {
-      http_status = (err_code == "encoder_unavailable") ? 400 : 500;
+      http_status = 409;
+      err_code = "already_running";
+      err_msg = "a different session is running";
       return false;
     }
 
+    // Egress validation + IP pinning (M1.2) — after structural validation
+    // (control.cpp), before anything launches.
+    if (auto res = validate_and_pin_outputs(cfg, egress, default_resolver());
+        !res.ok)
+    {
+      http_status = 400;
+      err_code = res.error_code;
+      err_field = res.field;
+      err_msg = res.message;
+      return false;
+    }
+
+    // Element preflight (§1.2): 400 element_unavailable naming the element.
+    for (const output_config& out : cfg.outputs) {
+      const std::string missing = output::first_missing_element(out.type);
+      if (!missing.empty()) {
+        http_status = 400;
+        err_code = "element_unavailable";
+        err_field = "outputs[].type";
+        err_msg = "missing GStreamer element: " + missing;
+        return false;
+      }
+    }
+
+    // ---- construction: ring → recorder → outputs → RIST ----
+    sess.ring = std::make_unique<ts_ring>(
+        ts_ring::size_for_bandwidth(cfg.ingest.bandwidth));
+
+    if (!opts.record_dir.empty()) {
+      sess.rec = std::make_unique<recorder>(
+          opts.record_dir, cfg.session_id, *sess.ring, &stderr_log);
+      // Recording failure is never session-fatal (§3.7): keep the object for
+      // /status visibility (active=false).
+      sess.rec->start();
+    }
+
+    for (const output_config& out_cfg : cfg.outputs) {
+      auto out = std::make_unique<output>(out_cfg, *sess.ring, &stderr_log);
+      out->start();
+      sess.outputs.push_back(std::move(out));
+    }
+
+    ts_ring* ring_ptr = sess.ring.get();
+    auto push = [ring_ptr](const uint8_t* buf, std::size_t len) -> int
+    {
+      ring_ptr->write(buf, len);
+      return 0;  // never drop the peer; never block (§3.4)
+    };
     std::string rerr;
-    auto push = [&ctx](const uint8_t* buf, std::size_t len) -> int
-    { return ctx.restreamer->push_buffer(buf, len); };
-    if (!ctx.receive->start(cfg, &ctx.state, push, rerr)) {
-      ctx.restreamer->stop();
+    if (!ctx.receive->start(cfg, opts, &ctx.state, push, rerr)) {
+      teardown();
+      http_status = 500;
       err_code = "pipeline_launch_failed";
       err_msg = "RIST receiver failed to start: " + rerr;
-      http_status = 500;
       return false;
     }
 
@@ -365,49 +445,83 @@ auto main(int argc, char** argv) -> int
       ctx.state.started_at = std::chrono::steady_clock::now();
       ctx.state.last_bus_error.clear();
     }
+    ctx.state.rist_bytes.store(0, std::memory_order_relaxed);
+    ctx.state.last_payload_ms.store(0, std::memory_order_relaxed);
     ctx.state.is_running.store(true, std::memory_order_release);
     http_status = 200;
     return true;
   };
 
-  control.set_handlers(
-      // --- start (optional override; same primitive as auto-start) ---
-      do_start,
-      // --- stop ---
-      [&ctx, &lifecycle](bool has_session,
-                         const std::string& session_id,
-                         std::string& err_code,
-                         int& http_status) -> bool
+  const auto do_stop = [&ctx, &lifecycle, &sess, &teardown](
+                           bool has_session,
+                           const std::string& session_id,
+                           std::string& err_code,
+                           int& http_status) -> bool
+  {
+    std::lock_guard<std::mutex> life(lifecycle);
+
+    if (!ctx.state.is_running.load(std::memory_order_acquire)) {
+      http_status = 200;  // already stopped: no-op (§5 leniency)
+      return true;
+    }
+    if (has_session) {
+      std::string current;
       {
-        std::lock_guard<std::mutex> life(lifecycle);
+        std::lock_guard<std::mutex> guard(ctx.state.mutex);
+        current = ctx.state.session_id;
+      }
+      if (current != session_id) {
+        http_status = 409;
+        err_code = "session_mismatch";
+        return false;
+      }
+    }
 
-        if (!ctx.state.is_running.load(std::memory_order_acquire)) {
-          http_status = 200;  // already stopped: no-op
-          return true;
-        }
-        if (has_session) {
-          std::string current;
-          {
-            std::lock_guard<std::mutex> guard(ctx.state.mutex);
-            current = ctx.state.session_id;
-          }
-          if (current != session_id) {
-            http_status = 409;
-            err_code = "session_mismatch";
-            return false;
-          }
-        }
+    ctx.state.is_running.store(false, std::memory_order_release);
+    teardown();
+    {
+      std::lock_guard<std::mutex> guard(ctx.state.mutex);
+      ctx.state.session_id.clear();
+    }
+    http_status = 200;
+    return true;
+  };
 
-        ctx.state.is_running.store(false, std::memory_order_release);
-        ctx.restreamer->stop();  // flush appsrc first so RIST thread can exit
-        ctx.receive->stop();
-        {
-          std::lock_guard<std::mutex> guard(ctx.state.mutex);
-          ctx.state.session_id.clear();
-        }
-        http_status = 200;
-        return true;
-      });
+  // Snapshot for /status + /stats — atomics and short mutexes only; never
+  // touches pipelines (§1.4 cadence rule). Holding `lifecycle` here also
+  // guarantees the outputs vector is not mid-teardown.
+  const auto get_stats = [&ctx, &lifecycle, &sess]() -> session_stats
+  {
+    std::lock_guard<std::mutex> life(lifecycle);
+    session_stats snap;
+    if (sess.ring) {
+      snap.ring_size_bytes = sess.ring->capacity();
+    }
+    if (sess.rec) {
+      snap.recording_active = sess.rec->active();
+      snap.recording_bytes = sess.rec->bytes_written();
+      snap.recording_dropped = sess.rec->dropped_bytes();
+    }
+    snap.rist_bytes_total =
+        ctx.state.rist_bytes.load(std::memory_order_relaxed);
+    snap.rist = ctx.receive->flow_stats();
+    for (const std::unique_ptr<output>& out : sess.outputs) {
+      output_stat ostat;
+      ostat.id = out->id();
+      ostat.type = to_string(out->proto());
+      ostat.state = out->state_name();
+      ostat.connected_s = out->connected_s();
+      ostat.reconnects = out->reconnects();
+      ostat.bytes_sent = out->bytes_sent();
+      ostat.dropped_bytes = out->dropped_bytes();
+      ostat.audio_dropped = out->audio_dropped();
+      ostat.last_error = out->last_error();
+      snap.outputs.push_back(std::move(ostat));
+    }
+    return snap;
+  };
+
+  control.set_handlers(do_start, do_stop, get_stats);
 
   if (!control.listen(bind_host, control_port)) {
     std::cerr << "FATAL: failed to bind control server to " << bind_host << ":"
@@ -417,139 +531,60 @@ auto main(int argc, char** argv) -> int
 
   std::cout << "open-broadcast-receiver listening: control http://" << bind_host
             << ":" << control_port << "  rist @[::]:" << rist_port
-            << (token.empty() ? "  [DEV no-auth]" : "  [token auth]") << "\n";
-  std::cout << "On-GPU H264 encode -> MPEG-TS/UDP " << udp_host << ":" << udp_port
-            << " (" << (prefer_hw_decode ? "hw" : "sw")
-            << " decode)  audio -> AAC passthrough\n";
+            << (token.empty() ? "  [NO-AUTH]" : "  [token auth]")
+            << (opts.psk.empty() ? "" : "  [psk]") << "\n"
+            << "Copy-only fan-out (schema 2): POST /start with outputs[]. "
+            << "Ctrl-C to quit." << std::endl;
 
-  // --- AUTO-START config (the receiver's own defaults + CLI) ------------------
-  // The receiver no longer waits for the encoder's POST /start. It binds RIST,
-  // runs codec detection and launches the on-GPU encode -> RTMP pipeline using
-  // THIS config. The session_id is a sentinel ("auto") so an explicit /start
-  // with a different session 409s until POST /stop (then /start) takes over.
-  receiver_config auto_cfg {};
-  auto_cfg.session_id = "auto";
-  auto_cfg.in_codec = codec::h264;  // detection fallback if tsdemux is slow
-  auto_cfg.reencode.bitrate_kbps = bitrate;
-  auto_cfg.reencode.upscale = upscale;
-  auto_cfg.reencode.width = width;
-  auto_cfg.reencode.height = height;
-  // udp_host/udp_port / prefer_hw_decode are applied inside do_start from the CLI.
-
-  // Fail fast on bad CLI before we touch GStreamer. do_start applies the CLI
-  // ingest/udp overrides itself, so mirror them here for an accurate check.
-  {
-    receiver_config check = auto_cfg;
-    check.ingest.buffer_min = buffer_min;
-    check.ingest.buffer_max = buffer_max;
-    check.ingest.rtt_min = rtt_min;
-    check.ingest.rtt_max = rtt_max;
-    check.ingest.reorder_buffer = reorder_buffer;
-    check.reencode.udp_host = udp_host;
-    check.reencode.udp_port = udp_port;
-    check.reencode.prefer_hw_decode = prefer_hw_decode;
-    if (const auto res = validate_config(check); !res.ok) {
-      std::cerr << "FATAL: invalid configuration (" << res.error_code << " @ "
-                << res.field << "): " << res.message << "\n";
-      return 1;
-    }
-  }
-
-  // --- reconnect supervisor ---------------------------------------------------
-  // The librist worker thread fires on_reconnect on a RE-connect (a new stream
-  // that may carry a different codec). It must NOT restart the pipeline inline:
-  // restream::stop() joins the bus thread and would block/deadlock the RIST
-  // worker. Instead it sets restart_requested and the supervisor thread below
-  // services it: take `lifecycle`, restart ONLY the restream pipeline (the RIST
-  // listener stays bound) which re-arms codec detection.
-  std::atomic_bool restart_requested {false};
+  // --- idle-timeout watchdog (§1.5) -----------------------------------------
   std::atomic_bool shutting_down {false};
-  std::condition_variable supervisor_cv;
-  std::mutex supervisor_mutex;
-
-  ctx.receive->set_on_reconnect(
-      [&restart_requested, &supervisor_cv, &supervisor_mutex]()
+  std::thread watchdog(
+      [&]() -> void
       {
-        {
-          std::lock_guard<std::mutex> guard(supervisor_mutex);
-          restart_requested.store(true, std::memory_order_release);
-        }
-        supervisor_cv.notify_one();
-      });
-
-  std::thread supervisor(
-      [&]()
-      {
-        for (;;) {
-          std::unique_lock<std::mutex> wait_lock(supervisor_mutex);
-          supervisor_cv.wait(wait_lock,
-                             [&]
-                             {
-                               return restart_requested.load(
-                                          std::memory_order_acquire)
-                                   || shutting_down.load(
-                                          std::memory_order_acquire);
-                             });
-          if (shutting_down.load(std::memory_order_acquire)) {
-            return;
-          }
-          restart_requested.store(false, std::memory_order_release);
-          wait_lock.unlock();
-
-          // Re-arm detection by restarting only the restream pipeline. The RIST
-          // listener (ctx.receive) stays bound across the reconnect.
-          std::lock_guard<std::mutex> life(lifecycle);
-          if (!ctx.state.is_running.load(std::memory_order_acquire)) {
-            continue;  // stopped via /stop in the meantime; nothing to restart
-          }
-          receiver_config running_cfg;
+        while (!shutting_down.load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(k_watchdog_tick);
+          if (opts.idle_timeout_s <= 0
+              || !ctx.state.is_running.load(std::memory_order_acquire))
           {
-            std::lock_guard<std::mutex> guard(ctx.state.mutex);
-            running_cfg = ctx.state.cfg;
+            continue;
           }
-          ctx.restreamer->stop();
-          std::string ec, em;
-          if (!ctx.restreamer->start(running_cfg, &ctx.state, ec, em)) {
-            std::cerr << "reconnect restart failed: " << ec << " " << em << "\n";
+          const int64_t last =
+              ctx.state.last_payload_ms.load(std::memory_order_relaxed);
+          if (last == 0) {
+            continue;  // no payload yet: the pre-start TTL is the agent's job
+          }
+          if (steady_ms() - last
+              > static_cast<int64_t>(opts.idle_timeout_s) * 1000)
+          {
+            std::lock_guard<std::mutex> life(lifecycle);
+            if (!ctx.state.is_running.load(std::memory_order_acquire)) {
+              continue;
+            }
+            stderr_log("idle-timeout: no RIST payload for "
+                       + std::to_string(opts.idle_timeout_s)
+                       + " s; stopping session\n");
+            ctx.state.is_running.store(false, std::memory_order_release);
+            teardown();
             std::lock_guard<std::mutex> guard(ctx.state.mutex);
-            ctx.state.last_bus_error = ec + ": " + em;
-          } else {
-            std::cout << "Reconnect: restream pipeline re-armed for detection.\n";
+            ctx.state.last_bus_error = "idle_timeout";
           }
         }
       });
-
-  // Auto-start now (binds RIST + kicks detection; the real encode -> RTMP
-  // pipeline launches on detection-complete without any POST /start).
-  {
-    std::string ec, em;
-    int st = 0;
-    if (!do_start(auto_cfg, ec, em, st)) {
-      std::cerr << "FATAL: auto-start failed (" << ec << "): " << em << "\n";
-      shutting_down.store(true, std::memory_order_release);
-      supervisor_cv.notify_one();
-      supervisor.join();
-      control.stop_listening();
-      return 1;
-    }
-  }
-
-  std::cout << "Auto-started; POST /start to reconfigure. Ctrl-C to quit."
-            << std::endl;
 
   int sig = 0;
   sigwait(&sigset, &sig);
   std::cout << "\nSignal " << sig << " received; shutting down...\n";
 
   shutting_down.store(true, std::memory_order_release);
-  supervisor_cv.notify_one();
-  supervisor.join();
+  watchdog.join();
 
   control.stop_listening();
-  ctx.restreamer->stop();  // flush appsrc first so RIST thread can exit
-  ctx.receive->stop();
+  {
+    std::lock_guard<std::mutex> life(lifecycle);
+    ctx.state.is_running.store(false, std::memory_order_release);
+    teardown();
+  }
   ctx.receive.reset();
-  ctx.restreamer.reset();
 
   return 0;
 }

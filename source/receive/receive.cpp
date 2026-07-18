@@ -3,6 +3,8 @@
 
 #include "receive/receive.h"
 
+#include <chrono>
+#include <string_view>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,6 +28,13 @@ auto librist_log_cb(void* /*arg*/,
   }
   return 0;
 }
+
+auto steady_ms() -> int64_t
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 }  // namespace
 
 rist_receive::rist_receive(std::function<void(const std::string&)> log)
@@ -45,7 +54,14 @@ auto rist_receive::log(const std::string& msg) const -> void
   }
 }
 
+auto rist_receive::flow_stats() const -> rist_flow_stat
+{
+  std::lock_guard<std::mutex> guard(m_flow_mutex);
+  return m_flow;
+}
+
 auto rist_receive::start(const receiver_config& cfg,
+                          const runtime_options& opts,
                           receiver_state* state,
                           push_fn push,
                           std::string& err) -> bool
@@ -54,6 +70,10 @@ auto rist_receive::start(const receiver_config& cfg,
   m_push = std::move(push);
   m_peer.store(nullptr, std::memory_order_release);
 
+  // (Re)create the receiver and wire callbacks. Recreated on the v4 retry
+  // below — a failed initReceiver leaves the instance torn down.
+  const auto wire_receiver = [this]() -> void
+  {
   m_receiver = std::make_unique<RISTNetReceiver>();
 
   // --- callbacks (wired BEFORE initReceiver) ---
@@ -62,24 +82,11 @@ auto rist_receive::start(const receiver_config& cfg,
       [this](const std::string& addr, uint16_t port)
       -> std::shared_ptr<RISTNetReceiver::NetworkConnection>
   {
-    // First connect vs RE-connect: if the encoder has connected before, the
-    // incoming stream may carry a different codec, so re-run detection +
-    // restart the restream pipeline. exchange() makes the first-connect
-    // detection race-free against concurrent librist workers.
-    const bool reconnect = m_was_connected.exchange(true, std::memory_order_acq_rel);
-    if (reconnect) {
-      log("Encoder reconnecting from " + addr + ":" + std::to_string(port)
-          + "; re-arming detection\n");
-      if (m_on_reconnect) {
-        // Signal only — the handler defers the actual stop()/start() to a
-        // supervisor thread; calling restream::stop() here would join the bus
-        // thread from a librist worker and risk deadlock.
-        m_on_reconnect();
-      }
-    } else {
-      log("Encoder connecting from " + addr + ":" + std::to_string(port)
-          + "\n");
-    }
+    // Bonded sessions legitimately present several peers on this one port
+    // (one per WAN path), and cellular CGNAT rebinds source addresses
+    // mid-stream — every connect is welcome and nothing is restarted.
+    log("RIST peer connected from " + addr + ":" + std::to_string(port)
+        + "\n");
     return std::make_shared<RISTNetReceiver::NetworkConnection>();
   };
 
@@ -90,10 +97,14 @@ auto rist_receive::start(const receiver_config& cfg,
              rist_peer* peer_ptr,
              uint16_t /*connID*/) -> int
   {
-    // Capture the encoder peer for OOB telemetry. Single-encoder model.
+    // Track the most recent data peer for OOB telemetry + media liveness for
+    // the idle watchdog. The push target is the SPMC ring: it memcpys and
+    // returns — this thread is never blocked by consumers (§3.4).
     m_peer.store(peer_ptr, std::memory_order_release);
     if (m_state != nullptr) {
       m_state->have_peer.store(true, std::memory_order_relaxed);
+      m_state->rist_bytes.fetch_add(len, std::memory_order_relaxed);
+      m_state->last_payload_ms.store(steady_ms(), std::memory_order_relaxed);
     }
     if (m_push) {
       return m_push(buf, len);
@@ -130,6 +141,36 @@ auto rist_receive::start(const receiver_config& cfg,
       m_state->worst_rtt.store(worst_rtt, std::memory_order_relaxed);
     }
 
+    // Full snapshot for GET /stats (§1.4): everything this vendored librist's
+    // receiver_flow exposes, including the per-peer counters (presence
+    // verified at implementation — closes TRANSPORT_PROFILE §5.1).
+    {
+      std::lock_guard<std::mutex> guard(m_flow_mutex);
+      m_flow.quality = quality;
+      m_flow.rtt_ms = flow.rtt;
+      m_flow.received = flow.received;
+      m_flow.missing = flow.missing;
+      m_flow.recovered = flow.recovered;
+      m_flow.recovered_one_retry = flow.recovered_one_retry;
+      m_flow.lost = flow.lost;
+      m_flow.reordered = flow.reordered;
+      m_flow.bandwidth_bps = flow.bandwidth;
+      m_flow.retry_bandwidth_bps = flow.retry_bandwidth;
+      m_flow.peers.clear();
+      if (flow.peers != nullptr) {
+        for (uint32_t idx = 0; idx < flow.peer_count; ++idx) {
+          const auto& peer = flow.peers[idx];
+          m_flow.peers.push_back(rist_peer_stat {
+              .id = peer.peer_id,
+              .rtt_ms = static_cast<uint32_t>(peer.rtt),
+              .avg_rtt_ms = peer.avg_rtt,
+              .received = peer.received_data,
+              .received_bytes = peer.received_bytes,
+              .bandwidth_bps = peer.bandwidth});
+        }
+      }
+    }
+
     // Send the 5-byte wan_telemetry back to the encoder (best-effort). The
     // vendored sendOOBData is patched to NOT tear down the receiver on a
     // transient failure (DECISIONS.md §6).
@@ -147,16 +188,13 @@ auto rist_receive::start(const receiver_config& cfg,
       [this](const std::shared_ptr<RISTNetReceiver::NetworkConnection>& /*conn*/,
              const rist_peer& /*peer*/) -> void
   {
-    // Single encoder: clear the tracked peer so no telemetry is sent to a dead
-    // pointer, and zero the telemetry mirror.
+    // A bonded session may have other live peers; only clear the OOB target
+    // (the next data packet from any surviving peer re-captures it).
     m_peer.store(nullptr, std::memory_order_release);
-    if (m_state != nullptr) {
-      m_state->have_peer.store(false, std::memory_order_relaxed);
-      m_state->link_quality.store(0, std::memory_order_relaxed);
-      m_state->worst_rtt.store(0, std::memory_order_relaxed);
-    }
-    log("Encoder disconnected.\n");
+    log("RIST peer disconnected.\n");
   };
+
+  };  // wire_receiver
 
   // --- settings ---
   RISTNetReceiver::RISTNetReceiverSettings settings;
@@ -171,11 +209,35 @@ auto rist_receive::start(const receiver_config& cfg,
   settings.mPeerConfig.recovery_rtt_max = cfg.ingest.rtt_max;
   settings.mPeerConfig.recovery_reorder_buffer = cfg.ingest.reorder_buffer;
   settings.mPeerConfig.recovery_maxbitrate = cfg.ingest.bandwidth;
+  if (!opts.psk.empty()) {
+    // Secrets never enter URLs: the PSK rides the settings struct into
+    // rist_peer_config.secret. Hosted sessions always set it (BACKPLANE §1.1).
+    settings.mPSK = opts.psk;
+    settings.mPSKKeySize = opts.psk_aes;
+  }
 
-  std::vector<std::string> urls {build_listener_url(cfg.ingest)};
-  log("RIST listening on: " + urls.front() + "\n");
+  const std::string url = build_listener_url(cfg.ingest);
+  log("RIST listening on: " + url.substr(0, url.find('?')) + "\n");
 
+  wire_receiver();
+  std::vector<std::string> urls {url};
   if (!m_receiver->initReceiver(urls, settings)) {
+    // The default @[::] dual-stack bind fails outright on IPv6-less hosts
+    // (containers without ::, v4-only VPSes). Fall back to the v4 any
+    // address once before giving up.
+    constexpr std::string_view k_v6_any = "rist://@[::]:";
+    if (url.starts_with(k_v6_any)) {
+      const std::string v4_url =
+          "rist://@0.0.0.0:" + url.substr(k_v6_any.size());
+      log("IPv6 listen failed; retrying on "
+          + v4_url.substr(0, v4_url.find('?')) + "\n");
+      wire_receiver();  // fresh instance; a failed init tears down internals
+      std::vector<std::string> v4_urls {v4_url};
+      if (m_receiver->initReceiver(v4_urls, settings)) {
+        m_started.store(true, std::memory_order_release);
+        return true;
+      }
+    }
     err = "initReceiver failed (check listen URL / port availability)";
     m_receiver.reset();
     return false;
@@ -203,8 +265,9 @@ auto rist_receive::stop() -> void
   }
   m_peer.store(nullptr, std::memory_order_release);
   m_started.store(false, std::memory_order_release);
-  m_was_connected.store(false, std::memory_order_release);
   if (m_state != nullptr) {
     m_state->have_peer.store(false, std::memory_order_relaxed);
+    m_state->link_quality.store(0, std::memory_order_relaxed);
+    m_state->worst_rtt.store(0, std::memory_order_relaxed);
   }
 }

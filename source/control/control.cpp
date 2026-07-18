@@ -84,21 +84,6 @@ auto get_int(const json& obj,
   return val.get<int>();
 }
 
-auto get_bool(const json& obj,
-              const char* key,
-              bool def,
-              const std::string& field_pfx) -> bool
-{
-  if (!obj.contains(key)) {
-    return def;
-  }
-  const json& val = obj.at(key);
-  if (!val.is_boolean()) {
-    perr("invalid_schema", field_pfx + "." + key, "must be a boolean");
-  }
-  return val.get<bool>();
-}
-
 auto codec_field(const std::string& str,
                  const std::string& field) -> codec
 {
@@ -109,6 +94,8 @@ auto codec_field(const std::string& str,
   return cod;
 }
 
+// POST /start body — schema_version 2 (TRANSPORT_PROFILE §1.1). outputs[] is
+// required but MAY be empty (a link-test / record-only session).
 auto parse_start_body(const json& jbody) -> receiver_config
 {
   if (!jbody.is_object()) {
@@ -123,10 +110,10 @@ auto parse_start_body(const json& jbody) -> receiver_config
     perr("invalid_schema", "schema_version", "required integer field");
   }
   cfg.schema_version = jbody.at("schema_version").get<int>();
-  if (cfg.schema_version != 1) {
+  if (cfg.schema_version != k_schema_version) {
     perr("invalid_schema",
          "schema_version",
-         "unsupported schema_version (expected 1)");
+         "unsupported schema_version (expected 2)");
   }
 
   cfg.session_id = require_string(jbody, "session_id", "session_id");
@@ -159,53 +146,30 @@ auto parse_start_body(const json& jbody) -> receiver_config
       require_string(jbody.at("source"), "codec", "source.codec"),
       "source.codec");
 
-  // The receiver re-encodes ON THE GPU and pushes a single H264 MPEG-TS/UDP
-  // stream to datarhei (udp_host/udp_port is operator infra, applied in main.cpp).
-  // The encode settings come from the encoder's outputs[0].video block; only the
-  // video sub-object is honoured (audio is AAC passthrough). See docs/CONTRACT.md.
-  if (!jbody.contains("outputs") || !jbody.at("outputs").is_array()
-      || jbody.at("outputs").empty())
-  {
-    perr("invalid_schema", "outputs", "required non-empty array");
+  if (!jbody.contains("outputs") || !jbody.at("outputs").is_array()) {
+    perr("invalid_schema", "outputs", "required array (may be empty)");
   }
-  const json& out0 = jbody.at("outputs").at(0);
-  if (!out0.is_object()) {
-    perr("invalid_schema", "outputs[0]", "must be an object");
+  std::size_t idx = 0;
+  for (const json& out_json : jbody.at("outputs")) {
+    const std::string field = "outputs[" + std::to_string(idx) + "]";
+    if (!out_json.is_object()) {
+      perr("invalid_schema", field, "must be an object");
+    }
+    output_config out;
+    out.id = require_string(out_json, "id", field + ".id");
+    const std::string type_str =
+        require_string(out_json, "type", field + ".type");
+    if (!parse_output_proto(type_str, out.type)) {
+      perr("bad_enum",
+           field + ".type",
+           "invalid type (expected rtmp|rtmps|srt|rist)");
+    }
+    out.url = require_string(out_json, "url", field + ".url");
+    out.key_or_streamid =
+        get_string(out_json, "key_or_streamid", "", field);
+    cfg.outputs.push_back(std::move(out));
+    ++idx;
   }
-  if (!out0.contains("video") || !out0.at("video").is_object()) {
-    perr("invalid_schema", "outputs[0].video", "required object");
-  }
-  const json& vid = out0.at("video");
-
-  // mode: "reencode" (NVENC) or "copy" (H264 passthrough). Anything else is a
-  // schema error.
-  const std::string mode =
-      require_string(vid, "mode", "outputs[0].video.mode");
-  if (mode == "reencode") {
-    cfg.reencode.reencode = true;
-  } else if (mode == "copy") {
-    cfg.reencode.reencode = false;
-  } else {
-    perr("bad_enum",
-         "outputs[0].video.mode",
-         "must be \"reencode\" or \"copy\"");
-  }
-
-  cfg.reencode.out_codec = codec_field(
-      require_string(vid, "codec", "outputs[0].video.codec"),
-      "outputs[0].video.codec");
-  cfg.reencode.bitrate_kbps = get_int(
-      vid, "bitrate_kbps", cfg.reencode.bitrate_kbps, "outputs[0].video");
-  cfg.reencode.upscale =
-      get_bool(vid, "upscale", cfg.reencode.upscale, "outputs[0].video");
-  cfg.reencode.width =
-      get_int(vid, "width", cfg.reencode.width, "outputs[0].video");
-  cfg.reencode.height =
-      get_int(vid, "height", cfg.reencode.height, "outputs[0].video");
-
-  // outputs[0].video.encoder is parsed-and-ignored (the receiver always uses
-  // nvh264enc); outputs[0].audio is ignored (AAC passthrough), as are the
-  // output id/type/url/key_or_streamid/params (datarhei owns the fan-out).
 
   return cfg;
 }
@@ -216,7 +180,7 @@ auto error_body(const std::string& code,
 {
   json err_json;
   err_json["ok"] = false;
-  err_json["schema_version"] = 1;
+  err_json["schema_version"] = k_schema_version;
   err_json["error_code"] = code;
   if (!field.empty()) {
     err_json["field"] = field;
@@ -242,16 +206,19 @@ control_server::~control_server()
   stop_listening();
 }
 
-auto control_server::set_handlers(start_fn on_start, stop_fn on_stop) -> void
+auto control_server::set_handlers(start_fn on_start,
+                                  stop_fn on_stop,
+                                  stats_fn get_stats) -> void
 {
   m_on_start = std::move(on_start);
   m_on_stop = std::move(on_stop);
+  m_get_stats = std::move(get_stats);
 }
 
 auto control_server::authorized(const httplib::Request& req) const -> bool
 {
   if (m_ctx.auth_token.empty()) {
-    return true;  // explicit dev/no-auth mode
+    return true;  // explicit dev/no-auth mode (M1.1 gates this at startup)
   }
   const std::string hdr = req.get_header_value("Authorization");
   constexpr std::string_view prefix = "Bearer ";
@@ -265,31 +232,38 @@ auto control_server::build_status_json() const -> std::string
 {
   json out;
   out["ok"] = true;
-  out["schema_version"] = 1;
+  out["schema_version"] = k_schema_version;
 
   if (!m_ctx.state.is_running.load(std::memory_order_acquire)) {
-    out["state"] = "stopped";
-    out["session_id"] = nullptr;
-    out["reencode"] = nullptr;
+    // A session that ended abnormally (e.g. idle_timeout, §1.5) reports
+    // state=error with the cause until the next /start.
+    std::string last_err;
+    std::string sid;
+    {
+      std::lock_guard<std::mutex> guard(m_ctx.state.mutex);
+      last_err = m_ctx.state.last_bus_error;
+      sid = m_ctx.state.session_id;
+    }
+    out["state"] = last_err.empty() ? "stopped" : "error";
+    out["session_id"] = sid.empty() ? json(nullptr) : json(sid);
+    out["outputs"] = json::array();
+    out["last_bus_error"] = last_err.empty() ? json(nullptr) : json(last_err);
     return out.dump();
   }
 
   std::string sid;
   std::string last_err;
-  reencode_config re;
-  std::string det_v;
-  std::string det_a;
   std::chrono::steady_clock::time_point started;
   {
     std::lock_guard<std::mutex> guard(m_ctx.state.mutex);
     sid = m_ctx.state.session_id;
     last_err = m_ctx.state.last_bus_error;
-    re = m_ctx.state.cfg.reencode;
-    det_v = m_ctx.state.detected_video;
-    det_a = m_ctx.state.detected_audio;
     started = m_ctx.state.started_at;
   }
 
+  // Session state stays "running" while the session is intact — per-output
+  // failure is never session-fatal (§1.3). "error" is reserved for
+  // session-level failures (idle_timeout, RIST listener death).
   out["state"] = last_err.empty() ? "running" : "error";
   out["session_id"] = sid;
   out["uptime_s"] = std::chrono::duration_cast<std::chrono::seconds>(
@@ -301,20 +275,98 @@ auto control_server::build_status_json() const -> std::string
   tel["worst_case_rtt_ms"] = m_ctx.state.worst_rtt.load(std::memory_order_relaxed);
   out["telemetry"] = tel;
 
-  // The single on-GPU encode + RTMP push. Detected codecs are null until phase-1
-  // detection settles. The RTMP location is token-redacted (not a secret URL).
-  json re_json;
-  re_json["mode"] = re.reencode ? "reencode" : "copy";
-  re_json["bitrate_kbps"] = re.bitrate_kbps;
-  re_json["upscale"] = re.upscale;
-  re_json["width"] = re.width;
-  re_json["height"] = re.height;
-  re_json["udp_target"] = re.udp_host + ":" + std::to_string(re.udp_port);
-  re_json["video_codec"] = det_v.empty() ? json(nullptr) : json(det_v);
-  re_json["audio_codec"] = det_a.empty() ? json(nullptr) : json(det_a);
-  re_json["state"] = last_err.empty() ? "running" : "error";
-  out["reencode"] = std::move(re_json);
+  const session_stats snap = m_get_stats ? m_get_stats() : session_stats {};
+  json outs = json::array();
+  for (const output_stat& ostat : snap.outputs) {
+    json obj;
+    obj["id"] = ostat.id;
+    obj["type"] = ostat.type;
+    obj["state"] = ostat.state;
+    if (ostat.state == "running") {
+      obj["connected_s"] = ostat.connected_s;
+    }
+    obj["reconnects"] = ostat.reconnects;
+    obj["audio_dropped"] = ostat.audio_dropped;
+    if (!ostat.last_error.empty()) {
+      obj["last_error"] = ostat.last_error;
+    }
+    outs.push_back(std::move(obj));
+  }
+  out["outputs"] = std::move(outs);
+
+  json rec;
+  rec["active"] = snap.recording_active;
+  rec["bytes"] = snap.recording_bytes;
+  out["recording"] = std::move(rec);
+
   out["last_bus_error"] = last_err.empty() ? json(nullptr) : json(last_err);
+  return out.dump();
+}
+
+auto control_server::build_stats_json() const -> std::string
+{
+  json out;
+  out["ok"] = true;
+  out["schema_version"] = k_schema_version;
+  {
+    std::lock_guard<std::mutex> guard(m_ctx.state.mutex);
+    out["session_id"] = m_ctx.state.session_id;
+  }
+  out["ts"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::system_clock::now().time_since_epoch())
+                  .count();
+
+  const session_stats snap = m_get_stats ? m_get_stats() : session_stats {};
+  out["ring_size_bytes"] = snap.ring_size_bytes;
+
+  json rist;
+  rist["quality"] = snap.rist.quality;
+  rist["rtt_ms"] = snap.rist.rtt_ms;
+  rist["received"] = snap.rist.received;
+  rist["missing"] = snap.rist.missing;
+  rist["recovered"] = snap.rist.recovered;
+  rist["recovered_one_retry"] = snap.rist.recovered_one_retry;
+  rist["lost"] = snap.rist.lost;
+  rist["reordered"] = snap.rist.reordered;
+  rist["bandwidth_bps"] = snap.rist.bandwidth_bps;
+  rist["retry_bandwidth_bps"] = snap.rist.retry_bandwidth_bps;
+  json peers = json::array();
+  for (const rist_peer_stat& peer : snap.rist.peers) {
+    json pobj;
+    pobj["id"] = peer.id;
+    pobj["rtt_ms"] = peer.rtt_ms;
+    pobj["avg_rtt_ms"] = peer.avg_rtt_ms;
+    pobj["received"] = peer.received;
+    pobj["received_bytes"] = peer.received_bytes;
+    pobj["bandwidth_bps"] = peer.bandwidth_bps;
+    peers.push_back(std::move(pobj));
+  }
+  rist["peers"] = std::move(peers);
+  out["rist"] = std::move(rist);
+
+  json ts_in;
+  ts_in["bytes_total"] = snap.rist_bytes_total;  // agent derives bitrate
+  out["ts_in"] = std::move(ts_in);
+
+  json outs = json::array();
+  for (const output_stat& ostat : snap.outputs) {
+    json obj;
+    obj["id"] = ostat.id;
+    obj["state"] = ostat.state;
+    obj["bytes_sent"] = ostat.bytes_sent;
+    obj["dropped_bytes"] = ostat.dropped_bytes;
+    obj["reconnects"] = ostat.reconnects;
+    outs.push_back(std::move(obj));
+  }
+  out["outputs"] = std::move(outs);
+
+  if (snap.recording_active || snap.recording_bytes > 0) {
+    json rec;
+    rec["active"] = snap.recording_active;
+    rec["bytes"] = snap.recording_bytes;
+    rec["dropped_bytes"] = snap.recording_dropped;
+    out["recording"] = std::move(rec);
+  }
   return out.dump();
 }
 
@@ -365,41 +417,46 @@ auto control_server::setup_routes() -> void
 
                const validation_result val_result = validate_config(cfg);
                if (!val_result.ok) {
+                 // rtmp_codec_unsupported is a 400 at /start (fail early on
+                 // the declared hint, §1.2); all structural errors are 400s.
                  res.status = 400;
                  res.set_content(
-                     error_body(val_result.error_code, val_result.field, val_result.message).dump(),
+                     error_body(val_result.error_code,
+                                val_result.field,
+                                val_result.message)
+                         .dump(),
                      "application/json");
                  return;
                }
 
                int status = 200;
                std::string err_code;
+               std::string err_field;
                std::string err_msg;
-               const bool started =
-                   m_on_start && m_on_start(cfg, err_code, err_msg, status);
+               const bool started = m_on_start
+                   && m_on_start(cfg, err_code, err_field, err_msg, status);
                if (started) {
                  json body;
                  body["ok"] = true;
-                 body["schema_version"] = 1;
+                 body["schema_version"] = k_schema_version;
                  body["session_id"] = cfg.session_id;
                  body["state"] = "running";
-                 json re_json;
-                 re_json["mode"] = cfg.reencode.reencode ? "reencode" : "copy";
-                 re_json["bitrate_kbps"] = cfg.reencode.bitrate_kbps;
-                 re_json["upscale"] = cfg.reencode.upscale;
-                 re_json["width"] = cfg.reencode.width;
-                 re_json["height"] = cfg.reencode.height;
-                 re_json["udp_target"] = cfg.reencode.udp_host + ":"
-                     + std::to_string(cfg.reencode.udp_port);
-                 re_json["state"] = "connecting";
-                 body["reencode"] = std::move(re_json);
+                 // Echo outputs as id/type only — never URLs, never keys.
+                 json outs = json::array();
+                 for (const output_config& out : cfg.outputs) {
+                   json obj;
+                   obj["id"] = out.id;
+                   obj["type"] = to_string(out.type);
+                   outs.push_back(std::move(obj));
+                 }
+                 body["outputs"] = std::move(outs);
                  res.status = 200;
                  res.set_content(body.dump(), "application/json");
                } else {
                  res.status = status;
                  json err_body = error_body(
                      err_code.empty() ? "pipeline_launch_failed" : err_code,
-                     "",
+                     err_field,
                      err_msg);
                  if (status == 409) {
                    std::lock_guard<std::mutex> guard(m_ctx.state.mutex);
@@ -424,7 +481,7 @@ auto control_server::setup_routes() -> void
                      session_id = jbody.at("session_id").get<std::string>();
                    }
                  } catch (const json::exception&) {
-                   // tolerate a malformed/empty stop body
+                   // tolerate a malformed/empty stop body (§5 leniency)
                  }
                }
                int status = 200;
@@ -434,7 +491,7 @@ auto control_server::setup_routes() -> void
                if (stopped) {
                  json body;
                  body["ok"] = true;
-                 body["schema_version"] = 1;
+                 body["schema_version"] = k_schema_version;
                  body["state"] = "stopped";
                  res.status = 200;
                  res.set_content(body.dump(), "application/json");
@@ -457,6 +514,13 @@ auto control_server::setup_routes() -> void
             {
               res.status = 200;
               res.set_content(build_status_json(), "application/json");
+            });
+
+  m_srv.Get("/stats",
+            [this](const httplib::Request& /*req*/, httplib::Response& res) -> void
+            {
+              res.status = 200;
+              res.set_content(build_stats_json(), "application/json");
             });
 
   m_srv.Get("/healthz",
