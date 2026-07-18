@@ -121,6 +121,8 @@ struct RISTNetReceiverSettings {
     rist_log_level mLogLevel = RIST_LOG_ERROR;
     std::unique_ptr<rist_logging_settings> mLogSetting;
     std::string mPSK;
+    // Local patch (open-broadcast): AES key size for mPSK (128 or 256).
+    int mPSKKeySize = 128;
     std::string mCNAME;
     int mSessionTimeout = 5000;
     int mKeepAliveInterval = 10000;

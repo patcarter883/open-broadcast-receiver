@@ -7,18 +7,22 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Forward declarations of the runtime components owned by app_context. Their
 // full definitions live in their own modules; app_context is only ever
 // destroyed in a translation unit (main.cpp) where the complete types are
 // visible.
 class rist_receive;
-class restream;
 class control_server;
+class ts_ring;
+class output;
+class recorder;
 
 // ---------------------------------------------------------------------------
 // Enums — the integer order MUST stay byte-for-byte identical to the encoder's
@@ -33,23 +37,22 @@ enum class codec : std::uint8_t
   av1
 };
 
-// Audio codecs the receiver can ingest. NOT part of the control-plane contract:
-// it is *detected* from the incoming MPEG-TS, never declared by the encoder.
-// The receiver passes AAC through to RTMP (aacparse); other codecs have no audio
-// path (the source is expected to be AAC). See restream.
-enum class audio_codec : std::uint8_t
+// Output protocols for the copy-only fan-out (CONTRACT §3, schema_version 2).
+// The integer order is wire contract — do not renumber.
+enum class output_proto : std::uint8_t
 {
-  aac,
-  opus,
-  ac3,
-  eac3,
-  mp2
+  rtmp,
+  rtmps,
+  srt,
+  rist
 };
 
 // ---------------------------------------------------------------------------
 // RIST OOB telemetry back-channel (receiver -> encoder). Byte-for-byte
 // identical to open-broadcast-encoder/source/lib/lib.h:53-59. The encoder
-// rejects any OOB payload whose size != sizeof(wan_telemetry).
+// rejects any OOB payload whose size != sizeof(wan_telemetry). FROZEN: this
+// struct is an ABR control signal, never a monitoring channel — see
+// BACKPLANE.md §0/§13.4 (product repo).
 // ---------------------------------------------------------------------------
 
 struct __attribute__((packed)) wan_telemetry
@@ -78,19 +81,12 @@ struct receiver_defaults
   static constexpr int reorder_buffer_ms = 30;
 };
 
-// Recommended defaults for the on-GPU re-encode (CONTRACT §4). The encoder's
-// outputs[0].video block overrides these per /start; absent fields keep these.
-struct reencode_defaults
-{
-  static constexpr int bitrate_kbps = 4300;
-  static constexpr int width = 2560;
-  static constexpr int height = 1440;
-  static constexpr int gop_size = 120;
-};
+// ---------------------------------------------------------------------------
+// Configuration (schema_version 2 — TRANSPORT_PROFILE §1.1)
+// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
+inline constexpr int k_schema_version = 2;
+inline constexpr std::size_t k_max_outputs = 8;
 
 struct ingest_config
 {
@@ -104,76 +100,104 @@ struct ingest_config
   auto operator==(const ingest_config&) const -> bool = default;
 };
 
-// How the receiver re-encodes the decoded video ON THE GPU and pushes a single
-// H264 MPEG-TS/UDP publish to the local restreaming package (datarhei/restreamer),
-// which fans it out (codec copy) to YouTube/etc. Frames never leave CUDA memory
-// between NVDEC and nvh264enc. Most fields come from the encoder's
-// outputs[0].video over /start; udp_host/udp_port + prefer_hw_decode are operator
-// infrastructure (CLI). On stream2 only nvh264enc exists, so out_codec is pinned
-// to h264. AAC audio is passed through (never decoded/re-encoded). UDP has no
-// connection state, so a datarhei restart cannot error the pipeline. See
-// docs/CONTRACT.md and docs/GSTREAMER.md.
-struct reencode_config
+// One fan-out destination. `url` and `key_or_streamid` are secrets-adjacent:
+// the key is never echoed or logged, and the URL is validated + redacted per
+// CONTRACT §2/§9. The pinned_* fields are runtime state produced by egress
+// validation (M1.2): the vetted resolved IP that the pipeline MUST connect to
+// (DNS-rebinding resistance — never re-resolve at connect/reconnect). They are
+// deliberately excluded from equality so /start idempotency compares the wire
+// config, not DNS weather.
+struct output_config
 {
-  bool reencode = true;               // false => H264 copy passthrough (no NVENC)
-  codec out_codec = codec::h264;      // H264-only output (pinned on stream2)
-  int bitrate_kbps = reencode_defaults::bitrate_kbps;
-  bool upscale = false;               // insert cudascale only when true
-  int width = reencode_defaults::width;
-  int height = reencode_defaults::height;
-  int gop_size = reencode_defaults::gop_size;
-  // nvh264enc preset (bare token). Must NOT be a low-latency tuned preset
-  // (low-latency-hq etc): NVENC low-latency tuning forces bframes to 0 and
-  // the pipeline pins bframes=4 / profile=high.
-  std::string preset = "p5";
-  std::string udp_host = "127.0.0.1";     // MPEG-TS/UDP sink target (datarhei ingest)
-  int udp_port = 12000;                   // MPEG-TS/UDP sink target port
-  bool prefer_hw_decode = true;       // prefer NVDEC/VA/QSV over software decode
-  auto operator==(const reencode_config&) const -> bool = default;
+  std::string id;
+  output_proto type = output_proto::rtmp;
+  std::string url;
+  std::string key_or_streamid;
+
+  std::string host;       // parsed authority host (kept for TLS SNI / tcUrl)
+  int port = 0;           // parsed or scheme-default port
+  std::string path;       // URL path (RTMP app), no query
+  std::string pinned_ip;  // vetted resolved IP literal (connect target)
+
+  auto operator==(const output_config& other) const -> bool
+  {
+    return id == other.id && type == other.type && url == other.url
+        && key_or_streamid == other.key_or_streamid;
+  }
 };
 
 struct receiver_config
 {
-  int schema_version = 1;
+  int schema_version = k_schema_version;
   std::string session_id;
   ingest_config ingest;
   codec in_codec = codec::h264;  // the codec arriving over RIST (source.codec hint)
-  reencode_config reencode;      // on-GPU encode + RTMP push (mixed CLI / /start)
+  std::vector<output_config> outputs;
   auto operator==(const receiver_config&) const -> bool = default;
 };
 
+// Operator-side runtime options that never appear on the wire (CLI flags).
+struct runtime_options
+{
+  std::string psk;          // --psk <hex>; empty = no encryption (self-host)
+  int psk_aes = 256;        // --psk-aes 128|256
+  std::string record_dir;   // --record-dir; empty = no recording
+  int idle_timeout_s = 0;   // --idle-timeout; 0 = off
+};
+
 // ---------------------------------------------------------------------------
-// Runtime state (shared across the control, receive and restream threads)
+// Egress policy (M1.2 / REVIEW C2) — SSRF & rebinding resistance
+// ---------------------------------------------------------------------------
+
+struct egress_policy
+{
+  // --egress-allow-private: self-host opt-out permitting RFC1918/ULA/CGNAT
+  // destinations (LAN restreaming). Loopback, link-local (incl. the cloud
+  // metadata range) and multicast stay forbidden even with the opt-out.
+  bool allow_private = false;
+  // --egress-deny <cidr,...>: unconditional deny-list, applied after the
+  // class checks (the hosted agent passes the node subnet + metadata ranges).
+  std::vector<std::string> deny_cidrs;
+};
+
+// Resolver injection point so validation is unit-testable with a rebinding
+// stub. Fills `ips` with numeric literals (IPv4 dotted / IPv6 hex). The
+// default implementation is getaddrinfo.
+using resolve_fn =
+    std::function<bool(const std::string& host, std::vector<std::string>& ips)>;
+
+auto default_resolver() -> resolve_fn;
+
+// Classify an IP literal against the policy. Returns nullptr when the address
+// is an acceptable egress target, else a short reason ("loopback",
+// "link_local", "private", "multicast", "denylist", "unparsable", ...).
+auto forbidden_reason(const std::string& ip_literal,
+                      const egress_policy& policy) -> const char*;
+
+// ---------------------------------------------------------------------------
+// Runtime state (shared across the control, receive and fanout threads)
 // ---------------------------------------------------------------------------
 
 struct receiver_state
 {
   std::atomic_bool is_running {false};
 
-  // Guards cfg, session_id, started_at, last_bus_error and the detected codecs.
+  // Guards cfg, session_id, started_at, last_bus_error.
   std::mutex mutex;
   receiver_config cfg;
   std::string session_id;
   std::chrono::steady_clock::time_point started_at;
   std::string last_bus_error;
-  // Codecs detected off the live MPEG-TS once phase-1 detection settles; empty
-  // until then. Surfaced (read-only) by GET /status.
-  std::string detected_video;
-  std::string detected_audio;
 
   // Telemetry mirror (also sent over RIST OOB). Lock-free for /status reads.
   std::atomic<int> link_quality {0};
   std::atomic<uint32_t> worst_rtt {0};
   std::atomic_bool have_peer {false};
-};
 
-struct app_context
-{
-  receiver_state state;
-  std::unique_ptr<rist_receive> receive;
-  std::unique_ptr<restream> restreamer;
-  std::unique_ptr<control_server> control;
-  std::string auth_token;  // empty => dev/no-auth mode
+  // Media liveness for the --idle-timeout watchdog: absolute payload byte
+  // count and the steady-clock time of the last RIST payload.
+  std::atomic<uint64_t> rist_bytes {0};
+  std::atomic<int64_t> last_payload_ms {0};  // steady_clock ms; 0 = never
 };
 
 // ---------------------------------------------------------------------------
@@ -181,23 +205,27 @@ struct app_context
 // ---------------------------------------------------------------------------
 
 auto to_string(codec cod) noexcept -> const char*;
-auto to_string(audio_codec cod) noexcept -> const char*;
+auto to_string(output_proto proto) noexcept -> const char*;
 
 auto parse_codec(std::string_view str, codec& out) noexcept -> bool;
+auto parse_output_proto(std::string_view str, output_proto& out) noexcept
+    -> bool;
 
 // Build the RIST listener URL the receiver hands to initReceiver. Mirrors the
-// encoder's recovery params and appends timing-mode=1 (ARRIVAL). The base (scheme +
-// "@host:port") is taken from ingest.rist_listen up to any '?'. Fixes the
-// original ndi-rist-server missing-'&' bug. NOTE: it does NOT append a
-// profile= URL param — librist's URL parser rejects it; the ADVANCED profile
-// is set via RISTNetReceiverSettings.mProfile instead (see receive.cpp).
+// encoder's recovery params and appends timing-mode=0 (SOURCE — every RIST hop
+// runs SOURCE; ARRIVAL SIGABRTs under the double hop, see CONTRACT §4). The
+// base (scheme + "@host:port") is taken from ingest.rist_listen up to any '?'.
+// NOTE: it does NOT append a profile= URL param — librist's URL parser rejects
+// it; the ADVANCED profile is set via RISTNetReceiverSettings.mProfile
+// (see receive.cpp). The PSK never enters this URL (secrets never enter URLs);
+// it travels via RISTNetReceiverSettings.mPSK.
 auto build_listener_url(const ingest_config& ingest) -> std::string;
 
 // Parse the numeric port from a "rist://@[::]:PORT" / "rist://@host:PORT"
 // listen URL. Returns -1 if it cannot be determined.
 auto listen_port_from_url(const std::string& rist_listen) noexcept -> int;
 
-// Parse "scheme://host:port[/...][?...]" into host + port (handles bracketed
+// Parse "scheme://host:port[/path][?...]" into host + port (handles bracketed
 // IPv6). Returns false if host/port cannot be determined.
 auto parse_authority(const std::string& url,
                      std::string& host,
@@ -206,18 +234,31 @@ auto parse_authority(const std::string& url,
 // ---------------------------------------------------------------------------
 // Validation (pure: no GStreamer, no JSON). Field-shape/type checks live in the
 // JSON parser (control.cpp); these are the cross-field/value rules of
-// CONTRACT §4 that do not need the GStreamer registry.
+// CONTRACT §4 / TRANSPORT_PROFILE §1.1–1.2 that do not need the GStreamer
+// registry.
 // ---------------------------------------------------------------------------
 
 struct validation_result
 {
   bool ok = true;
-  std::string error_code;  // e.g. "out_of_range", "bad_url"
-  std::string field;       // e.g. "ingest.bandwidth"
+  std::string error_code;  // e.g. "out_of_range", "bad_url", "forbidden_destination"
+  std::string field;       // e.g. "ingest.bandwidth", "outputs[1].url"
   std::string message;
 };
 
-auto validate_config(const receiver_config& cfg) -> validation_result;
+// Structural validation: ingest bounds, outputs count/id uniqueness,
+// scheme/type match, URL parse + pipeline safety, rtmp_codec_unsupported.
+// Fills outputs[].host/port/path as a side effect (parse once).
+auto validate_config(receiver_config& cfg) -> validation_result;
+
+// Egress validation (M1.2): resolve every output host through `resolve`,
+// reject forbidden destinations per `policy`, and PIN the vetted IP into
+// outputs[].pinned_ip. Error code "forbidden_destination" names the output ID
+// only (never the resolved IP — don't leak topology). Call after
+// validate_config; separated so unit tests can inject a rebinding resolver.
+auto validate_and_pin_outputs(receiver_config& cfg,
+                              const egress_policy& policy,
+                              const resolve_fn& resolve) -> validation_result;
 
 // True if `str` is safe to interpolate into a single-quoted gst_parse_launch
 // property value (no quote-escape / control characters).
