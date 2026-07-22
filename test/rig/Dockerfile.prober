@@ -1,0 +1,9 @@
+# syntax=docker/dockerfile:1
+# Playout prober (FIXPLAN M4.1). Carries ffprobe/ffmpeg to validate that the
+# receiver's restreamed RTMP output is a real, decodable H.264+AAC stream —
+# i.e. that media actually flowed through the hosted fan-out and plays.
+# Invoked only via `docker compose run` (never `up`), so it has no CMD.
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*

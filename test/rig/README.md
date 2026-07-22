@@ -1,3 +1,35 @@
+# Real-media rigs
+
+Two containerised end-to-end harnesses:
+
+- **`smoke.sh`** — single-path **real-media smoke** (FIXPLAN M4.1), runs
+  **per-PR**. The fast proof of the core product function.
+- **`rig.sh`** — the full **bonding** soak (M1.6/M1.8), runs **nightly**.
+
+## Single-path smoke (`smoke.sh`)
+
+```
+sender (gst test src → rist_feed) ─RIST─▶ receiver (hosted profile)
+   ─rtmp1─▶ SRS ◀─ffprobe/ffmpeg─ prober
+```
+
+One path, one RTMP output, no netem — ~30 s after the images build. Asserts:
+- the receiver ingested RIST (`rist.received > 0`) and the RTMP output is
+  `running` and `bytes_sent > 0`;
+- the SRS stream is **playable** — `ffprobe` sees an **h264** video + **aac**
+  audio stream (proves the copy-only fan-out + flvmux remux produced valid RTMP);
+- it actually **decodes** — `ffmpeg` reads 3 s to a null sink without error.
+
+```sh
+test/rig/smoke.sh
+```
+
+CI: `.github/workflows/smoke-rig.yml` (pull_request + push + manual). This is
+the gate that proves real video reaches a real RTMP endpoint; the bonding rig
+below adds multi-path resilience on top.
+
+---
+
 # Bonding CI rig (FIXPLAN M1.6 + M1.8)
 
 Containerised end-to-end harness for the bonded topology — the test that would
