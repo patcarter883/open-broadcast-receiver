@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -29,6 +31,25 @@ auto now_ms() -> int64_t
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+// F4 defence-in-depth: strip the stream key / SRT streamid from any text
+// before it is logged or exposed via /stats last_error. The key is set as a
+// pipeline PROPERTY (never in a URI), so sink error text should not contain it
+// — but redact regardless so a future GStreamer element/version can't regress
+// the "the key is never logged" invariant (lib.h/CONTRACT §2/§9). Guarded on a
+// sane secret length so a short/empty key can't blank unrelated text.
+auto redact_secret(std::string text, const std::string& secret) -> std::string
+{
+  if (secret.size() < 4) {
+    return text;
+  }
+  constexpr std::string_view k_mask = "[REDACTED]";
+  for (std::string::size_type pos = text.find(secret); pos != std::string::npos;
+       pos = text.find(secret, pos + k_mask.size())) {
+    text.replace(pos, secret.size(), k_mask);
+  }
+  return text;
 }
 
 // Elements each template needs (TRANSPORT_PROFILE §1.2 element_unavailable).
@@ -473,9 +494,13 @@ auto output::run_once() -> bool
           GError* gerr = nullptr;
           gchar* dbg = nullptr;
           gst_message_parse_error(msg, &gerr, &dbg);
-          const std::string text =
+          // The debug string (dbg) can carry URIs/element internals — it is
+          // parsed but deliberately never logged; only gerr->message is, and
+          // it is redacted below as a belt-and-suspenders guard (F4).
+          const std::string text = redact_secret(
               (gerr != nullptr && gerr->message != nullptr) ? gerr->message
-                                                            : "unknown";
+                                                            : "unknown",
+              m_cfg.key_or_streamid);
           terminal = is_codec_terminal(
               gerr, GST_ELEMENT(GST_MESSAGE_SRC(msg)));
           set_last_error(terminal ? "rtmp_codec_unsupported" : text);
