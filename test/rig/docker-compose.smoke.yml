@@ -1,0 +1,49 @@
+# Single-path real-media smoke topology (FIXPLAN M4.1):
+#
+#   sender ──RIST──▶ receiver (hosted profile) ──RTMP──▶ srs ◀──ffprobe── prober
+#
+# One path, one output, no netem — the fast per-PR proof that a real H.264+AAC
+# stream flows encoder-side → RIST → receiver fan-out → RTMP and is playable.
+# Driven by smoke.sh — not intended for standalone `up`.
+name: obr-smoke
+
+networks:
+  media: {}
+
+services:
+  receiver:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.receiver
+      args:
+        TIMING_MODE: "0"
+    command: >
+      --bind 0.0.0.0 --token smoketoken --rist-port 5000
+      --egress-allow-private --record-dir /rec --idle-timeout 120
+    networks: [ media ]
+    volumes: [ "rec:/rec" ]
+
+  srs:
+    image: ossrs/srs:5
+    networks: [ media ]
+
+  sender:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.sender
+    environment:
+      DEST_HOST: receiver
+      DEST_PORT: "5000"
+      BITRATE_KBPS: "3000"
+    networks: [ media ]
+    depends_on: [ receiver ]
+
+  # ffprobe/ffmpeg validator; started on demand via `compose run`.
+  prober:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.prober
+    networks: [ media ]
+
+volumes:
+  rec: {}

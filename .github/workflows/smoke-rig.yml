@@ -1,0 +1,24 @@
+# Single-path real-media smoke (FIXPLAN M4.1) — runs PER-PR (unlike the
+# minutes-long nightly bonding rig). Proves a real H.264+AAC stream flows
+# encoder-side → RIST → receiver fan-out → RTMP → SRS and is playable.
+name: Real-media smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke
+        run: |
+          chmod +x test/rig/smoke.sh test/rig/*.sh
+          test/rig/smoke.sh
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f test/rig/docker-compose.smoke.yml logs --tail 200 || true
