@@ -57,7 +57,10 @@ probe=$($COMPOSE run --rm -T prober \
 echo "$probe" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-codecs={s['codec_type']:s['codec_name'] for s in d.get('streams',[])}
+# FLV/RTMP can expose a data/undetermined track with a codec_type but no
+# codec_name — read codec_name defensively so it doesn't KeyError before the
+# video/audio assertions run.
+codecs={s['codec_type']:s.get('codec_name') for s in d.get('streams',[])}
 assert codecs.get('video')=='h264', 'video not h264: '+str(codecs)
 assert codecs.get('audio')=='aac', 'audio not aac: '+str(codecs)
 print('SRS stream playable:',codecs)
