@@ -22,8 +22,11 @@ RUN if [ "$TIMING_MODE" = "1" ]; then \
       sed -i 's/timing-mode=0/timing-mode=1/' source/lib/lib.cpp; fi
 # Debug build ON PURPOSE for the rig: librist asserts armed, so a timing
 # violation aborts loudly instead of degrading silently.
+# BUILD_TESTING=OFF: the rig needs only the receiver binary, not the unit
+# tests — so the build context needs no test/CMakeLists.txt (.dockerignore
+# keeps most of test/ out; only test/rig + test/tools are shipped, for sender).
 RUN sed -i 's/>=1\.28/>=1.24/g' CMakeLists.txt \
-    && cmake -S . -B build -D CMAKE_BUILD_TYPE=Debug \
+    && cmake -S . -B build -D CMAKE_BUILD_TYPE=Debug -D BUILD_TESTING=OFF \
     && cmake --build build -j"$(nproc)"
 
 FROM ubuntu:24.04
