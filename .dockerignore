@@ -1,5 +1,11 @@
 build/
 build-external/
 test/
+# …but the CI rigs (bonding + real-media smoke) build the sender/receiver
+# images from this same context and COPY these paths — keep them in.
+!test/rig
+!test/rig/**
+!test/tools
+!test/tools/**
 .git/
 *.AppImage
