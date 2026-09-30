@@ -31,7 +31,19 @@ shape "$RECV_B" "$NETEM_B"
 # Two outputs, SAME port on both paths — bonded links present as multiple
 # RIST peers on the single session port; port fans are not supported
 # (CONTRACT.md §4).
+#
+# -p 2 (ADVANCED input profile) is REQUIRED, not a preference: rist2rist
+# defaults its receive profile to SIMPLE, and the fork registers an OOB
+# callback on the receiver context for the auth ack + wan_telemetry. Simple
+# profile refuses OOB ("Out-of-band data is not support for simple profile",
+# src/rist.c rist_oob_callback_set), so rist2rist exits 1 at startup and the
+# rig silently starves the receiver of media. ADVANCED also matches the
+# production chain, which is ADVANCED end-to-end (encoder
+# RISTNetSenderSettings, receiver RISTNetReceiverSettings.mProfile).
+# -P 2 is already the tool's default for the output side; stated explicitly
+# so a future librist bump cannot quietly change the hop's behaviour.
 exec rist2rist \
+  -p 2 -P 2 \
   -i "rist://@0.0.0.0:${LISTEN_PORT}?timing-mode=0" \
   -o "rist://${RECV_A}:${RECV_PORT}?timing-mode=0" \
   -o "rist://${RECV_B}:${RECV_PORT}?timing-mode=0"
