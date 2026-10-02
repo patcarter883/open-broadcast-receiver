@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -47,6 +48,26 @@ enum class output_proto : std::uint8_t
   rist
 };
 
+// Opt-in transcode tier (schema_version 3): an output with
+// target == none is copy-only (the default tier). A non-none target decodes
+// the arriving elementary stream and re-encodes it for that output only; it
+// does not relax the server-wide copy-only default. Integer order is wire
+// contract — none must stay 0.
+enum class transcode_target : std::uint8_t
+{
+  none,
+  h264,
+  h265
+};
+
+struct transcode_config
+{
+  transcode_target target = transcode_target::none;
+  int bitrate_kbps = 0;  // 0 = encoder default
+  int gop = 0;           // 0 = encoder default
+  auto operator==(const transcode_config&) const -> bool = default;
+};
+
 // ---------------------------------------------------------------------------
 // RIST OOB telemetry back-channel (receiver -> encoder). Byte-for-byte
 // identical to open-broadcast-encoder/source/lib/lib.h:53-59. The encoder
@@ -82,10 +103,11 @@ struct receiver_defaults
 };
 
 // ---------------------------------------------------------------------------
-// Configuration (schema_version 2 — TRANSPORT_PROFILE §1.1)
+// Configuration (schema_version 3 — TRANSPORT_PROFILE §1.1; v3 adds the
+// optional outputs[].transcode object)
 // ---------------------------------------------------------------------------
 
-inline constexpr int k_schema_version = 2;
+inline constexpr int k_schema_version = 3;
 inline constexpr std::size_t k_max_outputs = 8;
 
 struct ingest_config
@@ -119,10 +141,16 @@ struct output_config
   std::string path;       // URL path (RTMP app), no query
   std::string pinned_ip;  // vetted resolved IP literal (connect target)
 
+  // Opt-in per-output transcode (schema_version 3). Part of the wire config,
+  // so it participates in equality; the runtime parsed/pinned fields above
+  // stay deliberately excluded.
+  transcode_config transcode;
+
   auto operator==(const output_config& other) const -> bool
   {
     return id == other.id && type == other.type && url == other.url
-        && key_or_streamid == other.key_or_streamid;
+        && key_or_streamid == other.key_or_streamid
+        && transcode == other.transcode;
   }
 };
 
@@ -247,6 +275,7 @@ struct output_stat
   std::string id;
   std::string type;
   std::string state;
+  transcode_target transcode = transcode_target::none;  // none = copy-only
   int64_t connected_s = 0;
   uint64_t reconnects = 0;
   uint64_t bytes_sent = 0;
@@ -272,10 +301,16 @@ struct session_stats
 
 auto to_string(codec cod) noexcept -> const char*;
 auto to_string(output_proto proto) noexcept -> const char*;
+auto to_string(transcode_target target) noexcept -> const char*;
 
 auto parse_codec(std::string_view str, codec& out) noexcept -> bool;
 auto parse_output_proto(std::string_view str, output_proto& out) noexcept
     -> bool;
+// Parse a transcode target codec ("h264"|"h265"). "none" is NOT accepted:
+// copy-only is expressed by omitting the transcode object, so a present
+// transcode.codec must name a real target codec.
+auto parse_transcode_target(std::string_view str,
+                            transcode_target& out) noexcept -> bool;
 
 // Build the RIST listener URL the receiver hands to initReceiver. Mirrors the
 // encoder's recovery params and appends timing-mode=0 (SOURCE — every RIST hop
@@ -329,5 +364,44 @@ auto validate_and_pin_outputs(receiver_config& cfg,
 // True if `str` is safe to interpolate into a single-quoted gst_parse_launch
 // property value (no quote-escape / control characters).
 auto is_pipeline_safe(std::string_view str) noexcept -> bool;
+
+// ---------------------------------------------------------------------------
+// Element availability (TRANSPORT_PROFILE §1.2 element_unavailable)
+// ---------------------------------------------------------------------------
+
+// One element requirement. ANY listed factory name satisfies it — a transcode
+// chain lists a VAAPI and a software alternative, so presence must be
+// "any of". `transcode` marks the requirement as belonging to the opt-in
+// transcode chain (so /start reports transcode_unavailable, not
+// element_unavailable, when it is the one missing).
+struct element_requirement
+{
+  std::vector<std::string> names;
+  bool transcode = false;
+  auto operator==(const element_requirement&) const -> bool = default;
+};
+
+// Elements one output template needs: the base chain for `proto`, plus the
+// decode -> convert -> encode chain when `transcode.target != none` (the
+// decoder is chosen from the source `in_codec`).
+auto required_elements(output_proto proto,
+                       const transcode_config& transcode,
+                       codec in_codec) -> std::vector<element_requirement>;
+
+// Registry probe, injected for testability: the real implementation is
+// gst_element_factory_find; unit tests pass a stub.
+using element_present_fn = std::function<bool(const char*)>;
+
+struct missing_requirement
+{
+  std::string element;  // first name of the unsatisfied requirement
+  bool transcode = false;
+  auto operator==(const missing_requirement&) const -> bool = default;
+};
+
+// First requirement not satisfied by `present`, or nullopt when all are met.
+auto first_missing_requirement(const std::vector<element_requirement>& reqs,
+                               const element_present_fn& present)
+    -> std::optional<missing_requirement>;
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_LIB_LIB_H

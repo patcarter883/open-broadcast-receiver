@@ -372,6 +372,19 @@ auto to_string(output_proto proto) noexcept -> const char*
   return "rtmp";
 }
 
+auto to_string(transcode_target target) noexcept -> const char*
+{
+  switch (target) {
+    case transcode_target::none:
+      return "none";
+    case transcode_target::h264:
+      return "h264";
+    case transcode_target::h265:
+      return "h265";
+  }
+  return "none";
+}
+
 auto parse_codec(std::string_view str, codec& out) noexcept -> bool
 {
   if (str == "h264") {
@@ -397,6 +410,19 @@ auto parse_output_proto(std::string_view str, output_proto& out) noexcept
     out = output_proto::srt;
   } else if (str == "rist") {
     out = output_proto::rist;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+auto parse_transcode_target(std::string_view str,
+                            transcode_target& out) noexcept -> bool
+{
+  if (str == "h264") {
+    out = transcode_target::h264;
+  } else if (str == "h265") {
+    out = transcode_target::h265;
   } else {
     return false;
   }
@@ -510,6 +536,97 @@ auto is_pipeline_safe(std::string_view str) noexcept -> bool
 }
 
 // ---------------------------------------------------------------------------
+// Element availability (public API)
+// ---------------------------------------------------------------------------
+
+auto required_elements(output_proto proto,
+                       const transcode_config& transcode,
+                       codec in_codec) -> std::vector<element_requirement>
+{
+  std::vector<element_requirement> reqs;
+  switch (proto) {
+    case output_proto::rtmp:
+    case output_proto::rtmps:
+      reqs = {{{"appsrc"}, false},
+              {{"tsparse"}, false},
+              {{"tsdemux"}, false},
+              {{"queue"}, false},
+              {{"h264parse"}, false},
+              {{"aacparse"}, false},
+              {{"flvmux"}, false},
+              {{"rtmp2sink"}, false}};
+      break;
+    case output_proto::srt:
+      reqs = {{{"appsrc"}, false}, {{"tsparse"}, false}, {{"srtsink"}, false}};
+      break;
+    case output_proto::rist:
+      reqs = {{{"appsrc"}, false}, {{"tsparse"}, false}, {{"ristsink"}, false}};
+      break;
+  }
+
+  if (transcode.target == transcode_target::none) {
+    return reqs;  // copy-only: the base chain is all that is needed
+  }
+
+  // Decoder for the arriving elementary stream, chosen from the source codec.
+  // Hardware (VAAPI/RADV) first, software fallback second; presence is
+  // satisfied by ANY one.
+  std::vector<std::string> decoder;
+  switch (in_codec) {
+    case codec::av1:
+      decoder = {"vaav1dec", "av1dec", "dav1ddec"};
+      break;
+    case codec::h265:
+      decoder = {"avdec_h265", "vah265dec"};
+      break;
+    case codec::h264:
+      decoder = {"vah264dec", "avdec_h264"};
+      break;
+  }
+
+  // Encoder + elementary-stream parser for the requested target codec.
+  std::vector<std::string> encoder;
+  std::string target_parse;
+  switch (transcode.target) {
+    case transcode_target::h264:
+      encoder = {"vah264enc", "x264enc"};
+      target_parse = "h264parse";
+      break;
+    case transcode_target::h265:
+      encoder = {"vah265enc", "x265enc"};
+      target_parse = "h265parse";
+      break;
+    case transcode_target::none:
+      return reqs;  // guarded above
+  }
+
+  reqs.push_back({{"tsdemux"}, true});
+  reqs.push_back({{"queue"}, true});
+  reqs.push_back({{"videoconvert"}, true});
+  reqs.push_back({{"videoscale"}, true});
+  reqs.push_back({{"capsfilter"}, true});
+  reqs.push_back({std::move(decoder), true});
+  reqs.push_back({std::move(encoder), true});
+  reqs.push_back({{std::move(target_parse)}, true});
+  return reqs;
+}
+
+auto first_missing_requirement(const std::vector<element_requirement>& reqs,
+                               const element_present_fn& present)
+    -> std::optional<missing_requirement>
+{
+  for (const element_requirement& req : reqs) {
+    const bool satisfied = std::ranges::any_of(
+        req.names, [&present](const std::string& name) -> bool
+        { return present(name.c_str()); });
+    if (!satisfied) {
+      return missing_requirement {req.names.front(), req.transcode};
+    }
+  }
+  return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
 // Egress policy (public API)
 // ---------------------------------------------------------------------------
 
@@ -579,7 +696,7 @@ auto validate_config(receiver_config& cfg) -> validation_result
   if (cfg.schema_version != k_schema_version) {
     return fail("invalid_schema",
                 "schema_version",
-                "unsupported schema_version (expected 2)");
+                "unsupported schema_version (expected 3)");
   }
 
   if (const auto res = validate_ingest(cfg.ingest); !res.ok) {
@@ -593,7 +710,7 @@ auto validate_config(receiver_config& cfg) -> validation_result
   }
 
   std::unordered_set<std::string> seen_ids;
-  bool any_rtmp = false;
+  bool any_copy_rtmp = false;
   for (std::size_t idx = 0; idx < cfg.outputs.size(); ++idx) {
     output_config& out = cfg.outputs[idx];
     const std::string field = std::format("outputs[{}]", idx);
@@ -628,17 +745,24 @@ auto validate_config(receiver_config& cfg) -> validation_result
       }
     }
 
-    any_rtmp = any_rtmp
-        || out.type == output_proto::rtmp || out.type == output_proto::rtmps;
+    // Only a COPY-only rtmp/rtmps output constrains the source codec: FLV
+    // needs AVC. An rtmp output that opts into transcode accepts any source
+    // (the pipeline decodes + re-encodes to its target).
+    const bool is_rtmp = out.type == output_proto::rtmp
+        || out.type == output_proto::rtmps;
+    if (is_rtmp && out.transcode.target == transcode_target::none) {
+      any_copy_rtmp = true;
+    }
   }
 
   // Fail early on the declared hint (TRANSPORT_PROFILE §1.2): copy-only fan-out
   // can put only H.264 into FLV. The runtime-detection analogue (a non-H264 ES
   // appearing mid-stream) degrades just the rtmp outputs, not the session.
-  if (any_rtmp && cfg.in_codec != codec::h264) {
+  // srt/rist outputs and transcode-enabled rtmp outputs are unaffected.
+  if (any_copy_rtmp && cfg.in_codec != codec::h264) {
     return fail("rtmp_codec_unsupported",
                 "source.codec",
-                "rtmp/rtmps outputs require h264 (copy-only fan-out)");
+                "rtmp/rtmps outputs require h264 unless they transcode");
   }
 
   return {};
