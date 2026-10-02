@@ -7,6 +7,7 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "httplib.h"
@@ -14,11 +15,21 @@
 #include "lib/lib.h"
 
 // control_server is the REST control plane (docs/CONTRACT.md, schema_version
-// 2). It owns an httplib::Server on a background thread, authenticates every
+// 3). It owns an httplib::Server on a background thread, authenticates every
 // request with a Bearer token, parses/validates POST /start bodies into a
 // receiver_config, and delegates lifecycle to handlers supplied by main.
 // GET /status and the agent-facing GET /stats are built from the snapshot
 // callback (atomics only — never pipeline locks).
+
+// Parse + schema-check a POST /start body (schema_version 3). On success
+// fills `cfg` and returns true. On failure returns false and fills the
+// CONTRACT error code/field/message (the HTTP handler maps these onto a 400
+// body). Exposed so the parser is unit-testable without a live server.
+auto parse_start_body(std::string_view body,
+                      receiver_config& cfg,
+                      std::string& error_code,
+                      std::string& error_field,
+                      std::string& error_message) -> bool;
 class control_server
 {
 public:

@@ -94,9 +94,21 @@ auto codec_field(const std::string& str,
   return cod;
 }
 
-// POST /start body — schema_version 2 (TRANSPORT_PROFILE §1.1). outputs[] is
+// Optional outputs[].transcode.codec — same shape as codec_field, but the
+// transcode target has no "av1"/"none" value (copy-only = omit the object).
+auto transcode_field(const std::string& str,
+                     const std::string& field) -> transcode_target
+{
+  transcode_target target {};
+  if (!parse_transcode_target(str, target)) {
+    perr("bad_enum", field, "invalid transcode codec (expected h264|h265)");
+  }
+  return target;
+}
+
+// POST /start body — schema_version 3 (TRANSPORT_PROFILE §1.1). outputs[] is
 // required but MAY be empty (a link-test / record-only session).
-auto parse_start_body(const json& jbody) -> receiver_config
+auto parse_start_body_json(const json& jbody) -> receiver_config
 {
   if (!jbody.is_object()) {
     perr("invalid_schema", "", "request body must be a JSON object");
@@ -113,7 +125,7 @@ auto parse_start_body(const json& jbody) -> receiver_config
   if (cfg.schema_version != k_schema_version) {
     perr("invalid_schema",
          "schema_version",
-         "unsupported schema_version (expected 2)");
+         "unsupported schema_version (expected 3)");
   }
 
   cfg.session_id = require_string(jbody, "session_id", "session_id");
@@ -167,6 +179,19 @@ auto parse_start_body(const json& jbody) -> receiver_config
     out.url = require_string(out_json, "url", field + ".url");
     out.key_or_streamid =
         get_string(out_json, "key_or_streamid", "", field);
+    // Opt-in per-output transcode (schema_version 3). Absent => copy-only.
+    if (out_json.contains("transcode")) {
+      const json& tr_json = out_json.at("transcode");
+      if (!tr_json.is_object()) {
+        perr("invalid_schema", field + ".transcode", "must be an object");
+      }
+      out.transcode.target = transcode_field(
+          require_string(tr_json, "codec", field + ".transcode.codec"),
+          field + ".transcode.codec");
+      out.transcode.bitrate_kbps =
+          get_int(tr_json, "bitrate_kbps", 0, field + ".transcode");
+      out.transcode.gop = get_int(tr_json, "gop", 0, field + ".transcode");
+    }
     cfg.outputs.push_back(std::move(out));
     ++idx;
   }
@@ -191,6 +216,32 @@ auto error_body(const std::string& code,
 
 constexpr std::size_t k_max_body_bytes = 256 * 1024;
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// /start body parsing (public: unit-testable without a live server)
+// ---------------------------------------------------------------------------
+
+auto parse_start_body(std::string_view body,
+                      receiver_config& cfg,
+                      std::string& error_code,
+                      std::string& error_field,
+                      std::string& error_message) -> bool
+{
+  try {
+    cfg = parse_start_body_json(json::parse(body));
+  } catch (const parse_error& err) {
+    error_code = err.code;
+    error_field = err.field;
+    error_message = err.message;
+    return false;
+  } catch (const json::exception& json_err) {
+    error_code = "invalid_schema";
+    error_field.clear();
+    error_message = std::string("malformed JSON: ") + json_err.what();
+    return false;
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // control_server implementations
@@ -287,6 +338,11 @@ auto control_server::build_status_json() const -> std::string
     }
     obj["reconnects"] = ostat.reconnects;
     obj["audio_dropped"] = ostat.audio_dropped;
+    // Copy-only outputs omit the field entirely; a transcode output advertises
+    // its target codec (never the source codec or any secret).
+    if (ostat.transcode != transcode_target::none) {
+      obj["transcode"] = {{"codec", to_string(ostat.transcode)}};
+    }
     if (!ostat.last_error.empty()) {
       obj["last_error"] = ostat.last_error;
     }
@@ -356,6 +412,9 @@ auto control_server::build_stats_json() const -> std::string
     obj["bytes_sent"] = ostat.bytes_sent;
     obj["dropped_bytes"] = ostat.dropped_bytes;
     obj["reconnects"] = ostat.reconnects;
+    if (ostat.transcode != transcode_target::none) {
+      obj["transcode"] = {{"codec", to_string(ostat.transcode)}};
+    }
     outs.push_back(std::move(obj));
   }
   out["outputs"] = std::move(outs);
@@ -395,22 +454,15 @@ auto control_server::setup_routes() -> void
              [this](const httplib::Request& req, httplib::Response& res) -> void
              {
                receiver_config cfg;
-               try {
-                 cfg = parse_start_body(json::parse(req.body));
-               } catch (const parse_error& parse_err) {
+               std::string parse_code;
+               std::string parse_field;
+               std::string parse_msg;
+               if (!parse_start_body(
+                       req.body, cfg, parse_code, parse_field, parse_msg))
+               {
                  res.status = 400;
                  res.set_content(
-                     error_body(parse_err.code, parse_err.field, parse_err.message)
-                         .dump(),
-                     "application/json");
-                 return;
-               } catch (const json::exception& json_err) {
-                 res.status = 400;
-                 res.set_content(
-                     error_body("invalid_schema",
-                                "",
-                                std::string("malformed JSON: ") + json_err.what())
-                         .dump(),
+                     error_body(parse_code, parse_field, parse_msg).dump(),
                      "application/json");
                  return;
                }
