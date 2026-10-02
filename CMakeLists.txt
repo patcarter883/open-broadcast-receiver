@@ -26,6 +26,11 @@ find_package(Threads REQUIRED)
 if(OBR_TESTS_ONLY)
   add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/lib)
 
+  # The /start body parser is pure logic (httplib + nlohmann only, no
+  # GStreamer), so the control library is unit-testable in this fast lane.
+  find_package(nlohmann_json 3.2 REQUIRED)
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/control)
+
   add_library(ring_lib STATIC
     ${CMAKE_CURRENT_LIST_DIR}/source/fanout/ring.h
     ${CMAKE_CURRENT_LIST_DIR}/source/fanout/ring.cpp)

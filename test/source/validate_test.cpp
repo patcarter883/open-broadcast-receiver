@@ -5,10 +5,13 @@
 // (destination classes, deny-list, DNS-rebinding resistance, IP pinning).
 // Framework-free; exit 0 = pass.
 
+#include <algorithm>
 #include <cstdio>
 #include <utility>
 #include <cstdlib>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "lib/lib.h"
@@ -236,6 +239,107 @@ auto test_egress_pinning() -> void
   }
   std::puts("ok: egress pinning + rebinding");
 }
+
+// ---------------------------------------------------------------------------
+auto test_transcode() -> void
+{
+  // transcode_target enum <-> string round-trip + reject an unknown codec.
+  {
+    transcode_target tgt = transcode_target::none;
+    expect(parse_transcode_target("h264", tgt), "parse transcode h264");
+    expect(tgt == transcode_target::h264, "h264 target value");
+    expect(parse_transcode_target("h265", tgt)
+               && tgt == transcode_target::h265,
+           "parse transcode h265");
+    expect(!parse_transcode_target("vp9", tgt), "vp9 rejected as target");
+    expect(!parse_transcode_target("none", tgt),
+           "none rejected (copy = omit object)");
+    expect(std::string(to_string(transcode_target::h264)) == "h264",
+           "to_string transcode h264");
+    expect(std::string(to_string(transcode_target::none)) == "none",
+           "to_string transcode none");
+  }
+
+  // rtmp codec gate is transcode-aware (MT1.3).
+  {
+    receiver_config cfg = make_cfg();
+    cfg.in_codec = codec::av1;
+    cfg.outputs[0].transcode.target = transcode_target::h264;
+    expect(validate_config(cfg).ok, "av1 + transcode rtmp is legal");
+  }
+  {
+    receiver_config cfg = make_cfg();
+    cfg.in_codec = codec::av1;  // rtmp copy output, no transcode
+    const auto res = validate_config(cfg);
+    expect(!res.ok && res.error_code == "rtmp_codec_unsupported"
+               && res.field == "source.codec",
+           "av1 + copy rtmp -> rtmp_codec_unsupported");
+  }
+  {
+    receiver_config cfg = make_cfg();
+    cfg.in_codec = codec::av1;
+    cfg.outputs[0] =
+        make_output("cli", output_proto::srt, "srt://203.0.113.9:9000", "s");
+    expect(validate_config(cfg).ok, "av1 + srt-only is fine");
+  }
+
+  // Element availability for an av1 -> h264 transcode output (MT1.4).
+  {
+    transcode_config tcfg;
+    tcfg.target = transcode_target::h264;
+    const auto reqs = required_elements(output_proto::rtmp, tcfg, codec::av1);
+    const auto has = [&reqs](const std::string& name) -> bool
+    {
+      return std::ranges::any_of(
+          reqs, [&name](const element_requirement& req) -> bool
+          { return std::ranges::find(req.names, name) != req.names.end(); });
+    };
+    expect(has("tsdemux") && has("videoconvert") && has("videoscale")
+               && has("capsfilter"),
+           "convert chain elements required");
+    expect(has("vaav1dec") && has("av1dec") && has("dav1ddec"),
+           "av1 decoder alternatives listed");
+    expect(has("vah264enc") && has("x264enc"), "h264 encoder alternatives");
+    expect(has("h264parse"), "target parser required");
+
+    // ANY alternative satisfies presence.
+    const element_present_fn everything = [](const char*) -> bool
+    { return true; };
+    expect(!first_missing_requirement(reqs, everything).has_value(),
+           "all elements present -> satisfied");
+
+    // Hardware path present, software alternative absent -> still satisfied.
+    const element_present_fn hw_only = [](const char* name) -> bool
+    { return std::string_view {name} != "x264enc"; };
+    expect(!first_missing_requirement(reqs, hw_only).has_value(),
+           "vah264enc alone satisfies the encoder requirement");
+
+    // Both encoder alternatives absent -> missing, naming the first name and
+    // flagged as a transcode-chain element.
+    const element_present_fn no_encoder = [](const char* name) -> bool
+    {
+      const std::string_view elem {name};
+      return elem != "vah264enc" && elem != "x264enc";
+    };
+    const auto miss = first_missing_requirement(reqs, no_encoder);
+    expect(miss.has_value() && miss->element == "vah264enc"
+               && miss->transcode,
+           "both encoders missing -> transcode_unavailable(vah264enc)");
+
+    // A copy-only output must not require the transcode chain.
+    const auto copy_reqs =
+        required_elements(output_proto::rtmp, transcode_config {}, codec::av1);
+    const element_present_fn no_chain = [](const char* name) -> bool
+    {
+      const std::string_view elem {name};
+      return elem != "videoconvert" && elem != "vah264enc"
+          && elem != "x264enc";
+    };
+    expect(!first_missing_requirement(copy_reqs, no_chain).has_value(),
+           "copy output does not need the transcode chain");
+  }
+  std::puts("ok: transcode");
+}
 }  // namespace
 
 auto main() -> int
@@ -243,6 +347,7 @@ auto main() -> int
   test_structural();
   test_ip_classes();
   test_egress_pinning();
+  test_transcode();
   std::puts("validate_test: ALL OK");
   return 0;
 }
