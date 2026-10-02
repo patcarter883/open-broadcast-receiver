@@ -30,6 +30,13 @@ auto parse_start_body(std::string_view body,
                       std::string& error_code,
                       std::string& error_field,
                       std::string& error_message) -> bool;
+
+// Serialise one output_stat into the /status (stats_view == false) or /stats
+// (stats_view == true) JSON object. A transcode output carries a "transcode"
+// object {codec, encoder, frames_dropped}; a copy-only output omits it
+// entirely. Exposed so the per-output serialisation is unit-testable without
+// a live server.
+auto output_stat_json(const output_stat& stat, bool stats_view) -> std::string;
 class control_server
 {
 public:

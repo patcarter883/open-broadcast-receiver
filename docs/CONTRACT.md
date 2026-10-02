@@ -189,6 +189,10 @@ The PSK travels via the librist settings struct — never inside any URL.
   second) and, when no alternative is present, ⇒ **400 `transcode_unavailable`** naming the element, field
   `outputs[i].transcode.codec`. Both are checked synchronously at `/start`. (`encoder_unavailable` does not exist:
   the transcode chain implies its own encoder from `transcode.codec`.)
+- **h265 transcode → RTMP/RTMPS is opt-in.** `outputs[].transcode.codec = "h265"` on an rtmp/rtmps output is
+  rejected **400 `bad_enum`** (field `outputs[i].transcode.codec`) unless the receiver was started with
+  `--allow-enhanced-rtmp`: H.265 requires the Enhanced FLV muxer (`eflvmux`) and platform eRTMP-HEVC support varies.
+  h264 → RTMP and h265 → SRT/RIST never require the flag.
 - **rtmp/rtmps egress needs AVC.** `rtmp_codec_unsupported` (400) fires **only when `source.codec != "h264"` AND at
   least one rtmp/rtmps output has no `transcode` block** — a copy-only rtmp output cannot carry a non-H.264 ES into
   FLV. An **AV1 or H.265 ingest that targets an rtmp/rtmps output MUST carry a `transcode` block** (it cannot be
@@ -256,7 +260,7 @@ Poll for health/state, decoupled from RIST. Recommended encoder poll interval **
   "telemetry": { "link_quality": 92, "worst_case_rtt_ms": 140 },
   "outputs": [
     { "id": "yt",  "type": "rtmp",  "state": "running", "connected_s": 1230, "reconnects": 0, "audio_dropped": false },
-    { "id": "fb",  "type": "rtmps", "state": "reconnecting", "reconnects": 3, "audio_dropped": false, "last_error": "connection_refused", "transcode": { "codec": "h265" } },
+    { "id": "fb",  "type": "rtmps", "state": "reconnecting", "reconnects": 3, "audio_dropped": false, "last_error": "connection_refused", "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } },
     { "id": "cli", "type": "srt",   "state": "running", "connected_s": 1231, "reconnects": 0, "audio_dropped": false }
   ],
   "recording": { "active": true, "bytes": 912345678 },
@@ -264,7 +268,9 @@ Poll for health/state, decoupled from RIST. Recommended encoder poll interval **
 }
 ```
 - A per-output `transcode` object appears **only for outputs that opted into the transcode tier** (§4) and carries the
-  target `codec`; **copy-only outputs omit it entirely**. It never echoes the source codec or any secret.
+  target `codec`, the chosen `encoder` element name (e.g. `"vah264enc"`; may be `""` before the first pipeline build)
+  and `frames_dropped` (whole-frame drop-oldest on the shared decode frame ring for that output); **copy-only outputs
+  omit it entirely**. It never echoes the source codec or any secret.
 - Session `state` ∈ `"running"`, `"stopped"`, `"error"`. It stays `running` while **any** output runs or the
   session is intact with zero outputs; **per-output failure is never session-fatal**. `error` is reserved for
   session-level failures (`idle_timeout`, listener death), reported with `last_bus_error` until the next `/start`.
@@ -301,14 +307,15 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
   "ts_in": { "bytes_total": 238100000 },
   "outputs": [
     { "id": "yt", "state": "running", "bytes_sent": 912345678, "dropped_bytes": 0, "reconnects": 0 },
-    { "id": "fb", "state": "running", "bytes_sent": 909000000, "dropped_bytes": 0, "reconnects": 0, "transcode": { "codec": "h265" } }
+    { "id": "fb", "state": "running", "bytes_sent": 909000000, "dropped_bytes": 0, "reconnects": 0, "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } }
   ],
   "recording": { "active": true, "bytes": 912345678, "dropped_bytes": 0 }
 }
 ```
-- `outputs[].transcode`: present only for outputs that opted into the transcode tier, carrying the target `codec`;
-  **copy-only outputs omit it entirely**. (The shared-decode frame ring's own per-consumer `dropped_frames`
-  accounting will ride here once the shared decode stage lands.)
+- `outputs[].transcode`: present only for outputs that opted into the transcode tier, carrying the target `codec`,
+  the chosen `encoder` element name and `frames_dropped` (whole-frame drop-oldest on the shared decode frame ring);
+  **copy-only outputs omit it entirely**. The decoder stage decodes the ingest elementary stream once and publishes
+  raw frames to that ring; each transcode output pulls with its own cursor and reports its own drops.
 - `rist.peers[]`: one entry per connected RIST peer — **each link in a bond arrives as a separate peer**, so this
   is the per-WAN-path view. Per-peer counters come from the vendored librist's `rist_stats_receiver_peer`
   (verified present).

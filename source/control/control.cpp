@@ -244,6 +244,45 @@ auto parse_start_body(std::string_view body,
 }
 
 // ---------------------------------------------------------------------------
+// Per-output JSON (public: unit-testable without a live server)
+// ---------------------------------------------------------------------------
+
+auto output_stat_json(const output_stat& stat, bool stats_view) -> std::string
+{
+  json obj;
+  obj["id"] = stat.id;
+  if (!stats_view) {
+    obj["type"] = stat.type;
+  }
+  obj["state"] = stat.state;
+  if (!stats_view) {
+    if (stat.state == "running") {
+      obj["connected_s"] = stat.connected_s;
+    }
+    obj["reconnects"] = stat.reconnects;
+    obj["audio_dropped"] = stat.audio_dropped;
+  } else {
+    obj["bytes_sent"] = stat.bytes_sent;
+    obj["dropped_bytes"] = stat.dropped_bytes;
+    obj["reconnects"] = stat.reconnects;
+  }
+  // Copy-only outputs omit the field entirely; a transcode output advertises
+  // its target codec, chosen encoder element and whole-frame drop count
+  // (never the source codec or any secret).
+  if (stat.transcode != transcode_target::none) {
+    json tr;
+    tr["codec"] = to_string(stat.transcode);
+    tr["encoder"] = stat.transcode_encoder;
+    tr["frames_dropped"] = stat.frames_dropped;
+    obj["transcode"] = std::move(tr);
+  }
+  if (!stats_view && !stat.last_error.empty()) {
+    obj["last_error"] = stat.last_error;
+  }
+  return obj.dump();
+}
+
+// ---------------------------------------------------------------------------
 // control_server implementations
 // ---------------------------------------------------------------------------
 
@@ -329,24 +368,7 @@ auto control_server::build_status_json() const -> std::string
   const session_stats snap = m_get_stats ? m_get_stats() : session_stats {};
   json outs = json::array();
   for (const output_stat& ostat : snap.outputs) {
-    json obj;
-    obj["id"] = ostat.id;
-    obj["type"] = ostat.type;
-    obj["state"] = ostat.state;
-    if (ostat.state == "running") {
-      obj["connected_s"] = ostat.connected_s;
-    }
-    obj["reconnects"] = ostat.reconnects;
-    obj["audio_dropped"] = ostat.audio_dropped;
-    // Copy-only outputs omit the field entirely; a transcode output advertises
-    // its target codec (never the source codec or any secret).
-    if (ostat.transcode != transcode_target::none) {
-      obj["transcode"] = {{"codec", to_string(ostat.transcode)}};
-    }
-    if (!ostat.last_error.empty()) {
-      obj["last_error"] = ostat.last_error;
-    }
-    outs.push_back(std::move(obj));
+    outs.push_back(json::parse(output_stat_json(ostat, false)));
   }
   out["outputs"] = std::move(outs);
 
@@ -406,16 +428,7 @@ auto control_server::build_stats_json() const -> std::string
 
   json outs = json::array();
   for (const output_stat& ostat : snap.outputs) {
-    json obj;
-    obj["id"] = ostat.id;
-    obj["state"] = ostat.state;
-    obj["bytes_sent"] = ostat.bytes_sent;
-    obj["dropped_bytes"] = ostat.dropped_bytes;
-    obj["reconnects"] = ostat.reconnects;
-    if (ostat.transcode != transcode_target::none) {
-      obj["transcode"] = {{"codec", to_string(ostat.transcode)}};
-    }
-    outs.push_back(std::move(obj));
+    outs.push_back(json::parse(output_stat_json(ostat, true)));
   }
   out["outputs"] = std::move(outs);
 
