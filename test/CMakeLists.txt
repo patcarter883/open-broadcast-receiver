@@ -11,6 +11,10 @@ add_executable(ring_test source/ring_test.cpp)
 target_link_libraries(ring_test PRIVATE ring_lib Threads::Threads)
 target_compile_features(ring_test PRIVATE cxx_std_20)
 
+add_executable(frame_ring_test source/frame_ring_test.cpp)
+target_link_libraries(frame_ring_test PRIVATE ring_lib Threads::Threads)
+target_compile_features(frame_ring_test PRIVATE cxx_std_20)
+
 add_executable(validate_test source/validate_test.cpp)
 target_link_libraries(validate_test PRIVATE receiver_lib Threads::Threads)
 target_compile_features(validate_test PRIVATE cxx_std_20)
@@ -20,5 +24,6 @@ target_link_libraries(start_parse_test PRIVATE control_lib Threads::Threads)
 target_compile_features(start_parse_test PRIVATE cxx_std_20)
 
 add_test(NAME ring_test COMMAND ring_test)
+add_test(NAME frame_ring_test COMMAND frame_ring_test)
 add_test(NAME validate_test COMMAND validate_test)
 add_test(NAME start_parse_test COMMAND start_parse_test)

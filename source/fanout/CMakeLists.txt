@@ -13,6 +13,8 @@ target_sources(ring_lib ${warning_guard}
   PUBLIC
     ring.h
     ring.cpp
+    frame_ring.h
+    frame_ring.cpp
 )
 
 target_include_directories(ring_lib PUBLIC

@@ -33,7 +33,9 @@ if(OBR_TESTS_ONLY)
 
   add_library(ring_lib STATIC
     ${CMAKE_CURRENT_LIST_DIR}/source/fanout/ring.h
-    ${CMAKE_CURRENT_LIST_DIR}/source/fanout/ring.cpp)
+    ${CMAKE_CURRENT_LIST_DIR}/source/fanout/ring.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/source/fanout/frame_ring.h
+    ${CMAKE_CURRENT_LIST_DIR}/source/fanout/frame_ring.cpp)
   target_include_directories(ring_lib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/source)
   target_compile_features(ring_lib PUBLIC cxx_std_20)
 
