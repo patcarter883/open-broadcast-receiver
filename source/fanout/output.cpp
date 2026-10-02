@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <gst/app/gstappsrc.h>
+#include <gst/video/video.h>
 
 namespace
 {
@@ -74,9 +75,10 @@ auto registry_has_element(const char* name) -> bool
 }
 }  // namespace
 
-output::output(output_config cfg, ts_ring& ring, log_fn log)
+output::output(output_config cfg, ts_ring& ring, frame_ring* frames, log_fn log)
     : m_cfg {std::move(cfg)}
     , m_ring {ring}
+    , m_frames {frames}
     , m_log {std::move(log)}
 {
 }
@@ -135,6 +137,12 @@ auto output::set_last_error(const std::string& err) -> void
   m_last_error = err;
 }
 
+auto output::encoder_name() const -> std::string
+{
+  std::lock_guard<std::mutex> guard(m_enc_mutex);
+  return m_encoder_name;
+}
+
 auto output::set_state(run_state next) -> void
 {
   m_state.store(next, std::memory_order_release);
@@ -158,44 +166,122 @@ auto output::first_missing_element(output_proto proto,
 // Pipeline construction (TRANSPORT_PROFILE §3.5)
 // ---------------------------------------------------------------------------
 
+auto output_template(output_proto proto,
+                     const transcode_config& transcode,
+                     const char* encoder) -> std::string
+{
+  constexpr std::string_view k_appsrc =
+      "appsrc name=osrc is-live=true do-timestamp=true format=time "
+      "block=true max-bytes=4194304 ";
+  constexpr std::string_view k_audio_appsrc =
+      "appsrc name=asrc is-live=true do-timestamp=true format=time "
+      "block=true max-bytes=4194304 ";
+
+  if (transcode.target == transcode_target::none) {
+    // Copy-only templates — byte-identical to the pre-transcode tier. An rtmp
+    // copy keeps legacy flvmux; only h265 transcode opts into eflvmux.
+    switch (proto) {
+      case output_proto::srt:
+        return std::string {k_appsrc}
+            + "! tsparse alignment=7 "
+              "! srtsink name=osink wait-for-connection=false";
+      case output_proto::rist:
+        return std::string {k_appsrc}
+            + "! tsparse alignment=7 ! ristsink name=osink";
+      case output_proto::rtmp:
+      case output_proto::rtmps:
+        return std::string {k_appsrc}
+            + "! tsparse set-timestamps=true alignment=7 "
+              "! tsdemux name=d "
+              "d. ! queue ! h264parse config-interval=-1 "
+              "! video/x-h264,stream-format=avc,alignment=au ! mux. "
+              "d. ! queue ! aacparse "
+              "! audio/mpeg,mpegversion=4,stream-format=raw ! mux. "
+              "flvmux name=mux streamable=true latency=1000000000 "
+              "! rtmp2sink name=osink async-connect=true";
+    }
+    return {};
+  }
+
+  // Transcode target is h264 or h265 (av1 is not representable and is
+  // rejected during parsing, so it can never reach here).
+  const std::string enc = encoder != nullptr ? encoder : "";
+  const std::string parse = transcode_target_parser(transcode.target);
+  switch (proto) {
+    case output_proto::rtmp:
+    case output_proto::rtmps: {
+      const bool hevc = transcode.target == transcode_target::h265;
+      const char* mux = transcode_muxer(proto, transcode.target);
+      const std::string vcaps = hevc
+          ? "video/x-h265,stream-format=hvc1,alignment=au"
+          : "video/x-h264,stream-format=avc,alignment=au";
+      // Encoded video is driven from the shared frame ring; audio stays on the
+      // ts_ring AAC copy path so RTMP audio passthrough is unchanged. h265
+      // uses the Enhanced FLV muxer (eflvmux) — legacy flvmux cannot carry
+      // H.265.
+      return std::format(
+          "{}! queue ! {} name=venc ! {} config-interval=-1 ! {} ! mux. "
+          "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=d "
+          "d. ! queue ! aacparse "
+          "! audio/mpeg,mpegversion=4,stream-format=raw ! mux. "
+          "{} name=mux streamable=true "
+          "! rtmp2sink name=osink async-connect=true",
+          k_appsrc,
+          enc,
+          parse,
+          vcaps,
+          k_audio_appsrc,
+          mux);
+    }
+    case output_proto::srt:
+      // Re-encoded video to a fresh TS. AAC is carried only on the rtmp path;
+      // the srt/rist transcode chain is video-only.
+      return std::format(
+          "{}! queue ! {} name=venc ! {} config-interval=-1 "
+          "! mpegtsmux alignment=7 "
+          "! srtsink name=osink wait-for-connection=false",
+          k_appsrc,
+          enc,
+          parse);
+    case output_proto::rist:
+      return std::format(
+          "{}! queue ! {} name=venc ! {} config-interval=-1 "
+          "! mpegtsmux alignment=7 ! ristsink name=osink",
+          k_appsrc,
+          enc,
+          parse);
+  }
+  return {};
+}
+
 auto output::build_pipeline(std::string& err) -> bool
 {
   // The parse string carries NO secrets and NO customer URLs — the sink is
   // created unconfigured (name=osink) and its connect properties are set via
   // g_object_set below. That keeps pipeline strings loggable by definition.
-  std::string tmpl;
-  switch (m_cfg.type) {
-    case output_proto::srt:
-      tmpl =
-          "appsrc name=osrc is-live=true do-timestamp=true format=time "
-          "block=true max-bytes=4194304 "
-          "! tsparse alignment=7 "
-          "! srtsink name=osink wait-for-connection=false";
-      break;
-    case output_proto::rist:
-      tmpl =
-          "appsrc name=osrc is-live=true do-timestamp=true format=time "
-          "block=true max-bytes=4194304 "
-          "! tsparse alignment=7 "
-          "! ristsink name=osink";
-      break;
-    case output_proto::rtmp:
-    case output_proto::rtmps:
-      // FLV needs AVC stream-format + raw AAC (§3.5 pitfalls 1–2); the caps
-      // filters make the conversions explicit and fail loudly if impossible.
-      tmpl =
-          "appsrc name=osrc is-live=true do-timestamp=true format=time "
-          "block=true max-bytes=4194304 "
-          "! tsparse set-timestamps=true alignment=7 "
-          "! tsdemux name=d "
-          "d. ! queue ! h264parse config-interval=-1 "
-          "! video/x-h264,stream-format=avc,alignment=au ! mux. "
-          "d. ! queue ! aacparse "
-          "! audio/mpeg,mpegversion=4,stream-format=raw ! mux. "
-          "flvmux name=mux streamable=true latency=1000000000 "
-          "! rtmp2sink name=osink async-connect=true";
-      break;
+  const bool is_transcode =
+      m_cfg.transcode.target != transcode_target::none;
+  std::string chosen_encoder;
+  if (is_transcode) {
+    if (m_frames == nullptr) {
+      err = "transcode output has no frame ring";
+      return false;
+    }
+    const auto enc = choose_present(
+        transcode_encoder_alternatives(m_cfg.transcode.target),
+        &registry_has_element);
+    if (!enc) {
+      // Preflighted at /start; a race is treated as a retryable build failure.
+      err = "no transcode encoder available";
+      return false;
+    }
+    chosen_encoder = *enc;
   }
+
+  const std::string tmpl = output_template(
+      m_cfg.type,
+      m_cfg.transcode,
+      is_transcode ? chosen_encoder.c_str() : nullptr);
 
   GError* gerr = nullptr;
   m_pipeline = gst_parse_launch(tmpl.c_str(), &gerr);
@@ -222,6 +308,38 @@ auto output::build_pipeline(std::string& err) -> bool
   }
 
   gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), k_appsrc_max_bytes);
+
+  if (is_transcode) {
+    m_audio_appsrc = gst_bin_get_by_name(GST_BIN(m_pipeline), "asrc");
+    if (m_audio_appsrc != nullptr) {
+      gst_app_src_set_max_bytes(GST_APP_SRC(m_audio_appsrc),
+                                k_appsrc_max_bytes);
+    }
+    // Encoder tuning: bitrate/GOP only where the element exposes them
+    // (all four encoders do; guard anyway so a future element cannot abort).
+    GstElement* venc = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
+    if (venc != nullptr) {
+      if (m_cfg.transcode.bitrate_kbps != 0
+          && has_property(venc, "bitrate"))
+      {
+        g_object_set(venc,
+                     "bitrate",
+                     static_cast<gint>(m_cfg.transcode.bitrate_kbps),
+                     nullptr);
+      }
+      if (m_cfg.transcode.gop != 0 && has_property(venc, "key-int-max")) {
+        g_object_set(venc,
+                     "key-int-max",
+                     static_cast<guint>(m_cfg.transcode.gop),
+                     nullptr);
+      }
+      gst_object_unref(venc);
+    }
+    {
+      std::lock_guard<std::mutex> guard(m_enc_mutex);
+      m_encoder_name = chosen_encoder;
+    }
+  }
 
   // ---- connect target (M1.2: the vetted, pinned IP — never re-resolve) ----
   switch (m_cfg.type) {
@@ -335,6 +453,10 @@ auto output::destroy_pipeline() -> void
     gst_object_unref(m_appsrc);
     m_appsrc = nullptr;
   }
+  if (m_audio_appsrc != nullptr) {
+    gst_object_unref(m_audio_appsrc);
+    m_audio_appsrc = nullptr;
+  }
   if (m_pipeline != nullptr) {
     gst_object_unref(m_pipeline);
     m_pipeline = nullptr;
@@ -350,6 +472,13 @@ auto output::is_codec_terminal(const GError* err, GstElement* src) const
 {
   if (m_cfg.type != output_proto::rtmp && m_cfg.type != output_proto::rtmps) {
     return false;  // passthrough outputs have no codec constraint
+  }
+  // A transcode output was preflighted at /start; a runtime negotiation or
+  // encoder failure is retried forever like any other output failure rather
+  // than latching a terminal state (the FLV codec rule below governs the
+  // copy-only path, where a non-H.264 ES genuinely cannot self-heal).
+  if (m_cfg.transcode.target != transcode_target::none) {
+    return false;
   }
   // A caps-negotiation / format failure on the FLV path means the elementary
   // stream cannot enter FLV (e.g. H.265 video against flvmux) — that cannot
@@ -385,11 +514,43 @@ auto output::is_codec_terminal(const GError* err, GstElement* src) const
 
 auto output::start() -> bool
 {
-  m_consumer = m_ring.add_consumer();
-  if (m_consumer < 0) {
-    set_last_error("no ring consumer slot");
-    set_state(run_state::error);
-    return false;
+  const bool is_transcode =
+      m_cfg.transcode.target != transcode_target::none;
+  // An RTMP/RTMPS transcode output still needs a ts_ring cursor for its AAC
+  // audio branch; a video-only srt/rist transcode output does not, so it
+  // takes no ts_ring drops.
+  const bool needs_ts = !is_transcode || m_cfg.type == output_proto::rtmp
+      || m_cfg.type == output_proto::rtmps;
+
+  if (needs_ts) {
+    m_consumer = m_ring.add_consumer();
+    if (m_consumer < 0) {
+      set_last_error("no ring consumer slot");
+      set_state(run_state::error);
+      return false;
+    }
+  }
+  if (is_transcode) {
+    if (m_frames == nullptr) {
+      if (m_consumer >= 0) {
+        m_ring.remove_consumer(m_consumer);
+        m_consumer = -1;
+      }
+      set_last_error("transcode output has no frame ring");
+      set_state(run_state::error);
+      return false;
+    }
+    m_frame_consumer = m_frames->add_consumer();
+    if (m_frame_consumer < 0) {
+      if (m_consumer >= 0) {
+        m_ring.remove_consumer(m_consumer);
+        m_consumer = -1;
+      }
+      set_last_error("no frame ring consumer slot");
+      set_state(run_state::error);
+      return false;
+    }
+    m_frame_buf.resize(m_frames->capacity());
   }
   m_stopping.store(false, std::memory_order_release);
   set_state(run_state::starting);
@@ -407,6 +568,10 @@ auto output::stop() -> void
   if (m_consumer >= 0) {
     m_ring.remove_consumer(m_consumer);
     m_consumer = -1;
+  }
+  if (m_frame_consumer >= 0 && m_frames != nullptr) {
+    m_frames->remove_consumer(m_frame_consumer);
+    m_frame_consumer = -1;
   }
   if (m_state.load(std::memory_order_acquire) != run_state::error) {
     set_state(run_state::stopped);
@@ -472,6 +637,7 @@ auto output::run_once() -> bool
 
   std::vector<uint8_t> buf(k_read_chunk);
   bool announced_running = false;
+  bool video_caps_set = false;
 
   while (!m_stopping.load(std::memory_order_acquire)) {
     // 1) bus: errors / EOS / state transitions, non-blocking.
@@ -541,6 +707,12 @@ auto output::run_once() -> bool
     // 2) feed: ring → appsrc. block=true bounds only THIS output's feeder;
     // when the sink stalls, the cursor lags and the ring's drop-oldest takes
     // over — ingest never notices.
+    if (m_cfg.transcode.target != transcode_target::none) {
+      if (!feed_transcode(video_caps_set)) {
+        return true;  // attempt over: flushing appsrc or stopping
+      }
+      continue;
+    }
     const std::size_t got =
         m_ring.read(m_consumer, buf.data(), buf.size(), k_read_timeout);
     if (got == 0) {
@@ -555,4 +727,76 @@ auto output::run_once() -> bool
     m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
   }
   return true;  // stopping
+}
+
+// Transcode feed: encoded VIDEO comes from the shared decode frame ring; AAC
+// AUDIO (rtmp/rtmps only) is copied from the ts_ring, exactly as the copy-only
+// path does, so RTMP audio passthrough is unchanged. Returns true when the
+// caller should stop the attempt (appsrc gone).
+auto output::feed_transcode(bool& video_caps_set) -> bool
+{
+  frame_ring::frame_meta vmeta;
+  const std::size_t vgot =
+      m_frames->read(m_frame_consumer, vmeta, m_frame_buf.data(),
+                     m_frame_buf.size(), k_read_timeout);
+  if (vgot > 0) {
+    if (!video_caps_set) {
+      set_video_caps(vgot, vmeta);
+      video_caps_set = true;
+    }
+    GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, vgot, nullptr);
+    gst_buffer_fill(gbuf, 0, m_frame_buf.data(), vgot);
+    GST_BUFFER_PTS(gbuf) = static_cast<GstClockTime>(vmeta.pts);
+    GST_BUFFER_DTS(gbuf) = static_cast<GstClockTime>(vmeta.dts);
+    if ((vmeta.flags & frame_ring::k_flag_keyframe) == 0U) {
+      GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_DELTA_UNIT);
+    }
+    if (gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf) != GST_FLOW_OK) {
+      set_last_error("appsrc rejected buffer (pipeline flushing)");
+      return false;
+    }
+    m_bytes_sent.fetch_add(vgot, std::memory_order_relaxed);
+  }
+
+  if (m_audio_appsrc != nullptr) {
+    std::vector<uint8_t> abuf(k_read_chunk);
+    for (;;) {
+      const std::size_t agot = m_ring.read(
+          m_consumer, abuf.data(), abuf.size(), std::chrono::milliseconds(0));
+      if (agot == 0) {
+        break;
+      }
+      GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, agot, nullptr);
+      gst_buffer_fill(gbuf, 0, abuf.data(), agot);
+      if (gst_app_src_push_buffer(GST_APP_SRC(m_audio_appsrc), gbuf)
+          != GST_FLOW_OK)
+      {
+        break;
+      }
+      m_bytes_sent.fetch_add(agot, std::memory_order_relaxed);
+    }
+  }
+  return !m_stopping.load(std::memory_order_acquire);
+}
+
+auto output::set_video_caps(std::size_t frame_bytes,
+                            const frame_ring::frame_meta& meta) -> void
+{
+  // Raw NV12 from the decode stage. The frame ring carries format + stride,
+  // not dimensions: width follows the line stride and height is derived from
+  // the NV12 plane layout (bytes = w*h*3/2). The encoder needs fixed
+  // width/height, so they are reconstructed here.
+  const int width = meta.stride > 0 ? meta.stride : 0;
+  const int height =
+      (meta.stride > 0)
+      ? static_cast<int>((static_cast<std::uint64_t>(frame_bytes) * 2U)
+                         / (3U * static_cast<std::uint64_t>(meta.stride)))
+      : 0;
+  GstCaps* caps = gst_caps_new_simple("video/x-raw",
+                                      "format", G_TYPE_STRING, "NV12",
+                                      "width", G_TYPE_INT, width,
+                                      "height", G_TYPE_INT, height,
+                                      nullptr);
+  gst_app_src_set_caps(GST_APP_SRC(m_appsrc), caps);
+  gst_caps_unref(caps);
 }

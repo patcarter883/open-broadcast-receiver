@@ -31,6 +31,8 @@ target_sources(fanout_lib ${warning_guard}
   PUBLIC
     output.h
     output.cpp
+    decoder.h
+    decoder.cpp
     recorder.h
     recorder.cpp
 )
@@ -48,7 +50,8 @@ target_link_libraries(fanout_lib PUBLIC
 
 target_link_libraries(fanout_lib PRIVATE
     PkgConfig::gstreamer
-    PkgConfig::gstreamer-app)
+    PkgConfig::gstreamer-app
+    PkgConfig::gstreamer-video)
 
 target_include_directories(fanout_lib PRIVATE SYSTEM
     ${GSTREAMER_INCLUDE_DIRS})

@@ -171,6 +171,10 @@ struct runtime_options
   int psk_aes = 256;        // --psk-aes 128|256
   std::string record_dir;   // --record-dir; empty = no recording
   int idle_timeout_s = 0;   // --idle-timeout; 0 = off
+  // --allow-enhanced-rtmp: permit an h265 transcode target on rtmp/rtmps.
+  // H.265 needs the Enhanced FLV muxer (eflvmux); platform eRTMP-HEVC support
+  // varies, so the operator opts in explicitly.
+  bool allow_enhanced_rtmp = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -276,6 +280,12 @@ struct output_stat
   std::string type;
   std::string state;
   transcode_target transcode = transcode_target::none;  // none = copy-only
+  // Chosen encoder element (e.g. "vah264enc") for a transcode output; empty
+  // for copy-only (the JSON object is omitted entirely then).
+  std::string transcode_encoder;
+  // Whole-frame ring drops for this output's frame_ring cursor (transcode
+  // outputs only; 0 for copy-only).
+  uint64_t frames_dropped = 0;
   int64_t connected_s = 0;
   uint64_t reconnects = 0;
   uint64_t bytes_sent = 0;
@@ -403,5 +413,47 @@ struct missing_requirement
 auto first_missing_requirement(const std::vector<element_requirement>& reqs,
                                const element_present_fn& present)
     -> std::optional<missing_requirement>;
+
+// ---------------------------------------------------------------------------
+// Transcode element selection (single source of truth)
+//
+// These functions own the element alternatives for the opt-in transcode tier.
+// required_elements() preflights exactly these, and the runtime decoder/output
+// pick from them at build time, so preflight and runtime can never disagree.
+// Hardware (VAAPI/RADV) is listed first, software fallback second.
+// ---------------------------------------------------------------------------
+
+// Decoder for the arriving elementary stream, keyed by the source codec.
+auto transcode_decoder_alternatives(codec in_codec) -> std::vector<std::string>;
+
+// Elementary-stream parser ahead of the decoder, keyed by the source codec.
+auto transcode_source_parser_alternatives(codec in_codec)
+    -> std::vector<std::string>;
+
+// Encoder for the target codec (the output's transcode target).
+auto transcode_encoder_alternatives(transcode_target target)
+    -> std::vector<std::string>;
+
+// Target-codec parser element name ("h264parse" / "h265parse"); nullptr for
+// transcode_target::none.
+auto transcode_target_parser(transcode_target target) -> const char*;
+
+// Muxer for a transcode output: flvmux (h264 rtmp/rtmps), eflvmux (h265
+// rtmp/rtmps — Enhanced FLV; legacy flvmux cannot carry H.265), mpegtsmux
+// (h264/h265 srt/rist). nullptr for a copy-only config.
+auto transcode_muxer(output_proto proto, transcode_target target) -> const char*;
+
+// First alternative for which `present` returns true, or nullopt when none is
+// available (the preflight reports the missing requirement).
+auto choose_present(const std::vector<std::string>& alternatives,
+                    const element_present_fn& present)
+    -> std::optional<std::string>;
+
+// Reject an h265 transcode target on an rtmp/rtmps output unless the operator
+// passed --allow-enhanced-rtmp. Returns 400 bad_enum naming
+// outputs[i].transcode.codec; the runtime null-flag check mirrors this so the
+// flag and the pipeline are never inconsistent.
+auto validate_transcode_targets(const receiver_config& cfg,
+                                bool allow_enhanced_rtmp) -> validation_result;
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_LIB_LIB_H

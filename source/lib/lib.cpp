@@ -539,10 +539,99 @@ auto is_pipeline_safe(std::string_view str) noexcept -> bool
 // Element availability (public API)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Transcode element selection (public API)
+// ---------------------------------------------------------------------------
+
+auto transcode_decoder_alternatives(codec in_codec) -> std::vector<std::string>
+{
+  switch (in_codec) {
+    case codec::av1:
+      return {"vaav1dec", "av1dec", "dav1ddec"};
+    case codec::h265:
+      return {"vah265dec", "avdec_h265"};
+    case codec::h264:
+      return {"vah264dec", "avdec_h264"};
+  }
+  return {};
+}
+
+auto transcode_source_parser_alternatives(codec in_codec)
+    -> std::vector<std::string>
+{
+  switch (in_codec) {
+    case codec::av1:
+      return {"av1parse"};
+    case codec::h265:
+      return {"h265parse"};
+    case codec::h264:
+      return {"h264parse"};
+  }
+  return {};
+}
+
+auto transcode_encoder_alternatives(transcode_target target)
+    -> std::vector<std::string>
+{
+  switch (target) {
+    case transcode_target::h264:
+      return {"vah264enc", "x264enc"};
+    case transcode_target::h265:
+      return {"vah265enc", "x265enc"};
+    case transcode_target::none:
+      return {};
+  }
+  return {};
+}
+
+auto transcode_target_parser(transcode_target target) -> const char*
+{
+  switch (target) {
+    case transcode_target::h264:
+      return "h264parse";
+    case transcode_target::h265:
+      return "h265parse";
+    case transcode_target::none:
+      return nullptr;
+  }
+  return nullptr;
+}
+
+auto transcode_muxer(output_proto proto, transcode_target target) -> const char*
+{
+  if (target == transcode_target::none) {
+    return nullptr;
+  }
+  switch (proto) {
+    case output_proto::rtmp:
+    case output_proto::rtmps:
+      return target == transcode_target::h265 ? "eflvmux" : "flvmux";
+    case output_proto::srt:
+    case output_proto::rist:
+      return "mpegtsmux";
+  }
+  return nullptr;
+}
+
+auto choose_present(const std::vector<std::string>& alternatives,
+                    const element_present_fn& present)
+    -> std::optional<std::string>
+{
+  for (const std::string& name : alternatives) {
+    if (present(name.c_str())) {
+      return name;
+    }
+  }
+  return std::nullopt;
+}
+
 auto required_elements(output_proto proto,
                        const transcode_config& transcode,
                        codec in_codec) -> std::vector<element_requirement>
 {
+  const transcode_target target = transcode.target;
+  const bool transcode_on = target != transcode_target::none;
+
   std::vector<element_requirement> reqs;
   switch (proto) {
     case output_proto::rtmp:
@@ -551,64 +640,70 @@ auto required_elements(output_proto proto,
               {{"tsparse"}, false},
               {{"tsdemux"}, false},
               {{"queue"}, false},
-              {{"h264parse"}, false},
               {{"aacparse"}, false},
-              {{"flvmux"}, false},
               {{"rtmp2sink"}, false}};
+      // Muxer + video parser: legacy FLV/h264 by default; Enhanced FLV
+      // (eflvmux) + h265parse for an h265 transcode target (legacy flvmux
+      // cannot carry H.265).
+      if (target == transcode_target::h265) {
+        reqs.push_back({{"eflvmux"}, true});
+        reqs.push_back({{"h265parse"}, true});
+      } else {
+        reqs.push_back({{"flvmux"}, false});
+        reqs.push_back({{"h264parse"}, transcode_on});
+      }
       break;
     case output_proto::srt:
-      reqs = {{{"appsrc"}, false}, {{"tsparse"}, false}, {{"srtsink"}, false}};
+      reqs =
+          {{{"appsrc"}, false}, {{"tsparse"}, false}, {{"srtsink"}, false}};
+      if (transcode_on) {
+        reqs.push_back({{"mpegtsmux"}, true});
+      }
       break;
     case output_proto::rist:
-      reqs = {{{"appsrc"}, false}, {{"tsparse"}, false}, {{"ristsink"}, false}};
+      reqs =
+          {{{"appsrc"}, false}, {{"tsparse"}, false}, {{"ristsink"}, false}};
+      if (transcode_on) {
+        reqs.push_back({{"mpegtsmux"}, true});
+      }
       break;
   }
 
-  if (transcode.target == transcode_target::none) {
+  if (!transcode_on) {
     return reqs;  // copy-only: the base chain is all that is needed
   }
 
-  // Decoder for the arriving elementary stream, chosen from the source codec.
-  // Hardware (VAAPI/RADV) first, software fallback second; presence is
-  // satisfied by ANY one.
-  std::vector<std::string> decoder;
-  switch (in_codec) {
-    case codec::av1:
-      decoder = {"vaav1dec", "av1dec", "dav1ddec"};
-      break;
-    case codec::h265:
-      decoder = {"avdec_h265", "vah265dec"};
-      break;
-    case codec::h264:
-      decoder = {"vah264dec", "avdec_h264"};
-      break;
-  }
-
-  // Encoder + elementary-stream parser for the requested target codec.
-  std::vector<std::string> encoder;
-  std::string target_parse;
-  switch (transcode.target) {
-    case transcode_target::h264:
-      encoder = {"vah264enc", "x264enc"};
-      target_parse = "h264parse";
-      break;
-    case transcode_target::h265:
-      encoder = {"vah265enc", "x265enc"};
-      target_parse = "h265parse";
-      break;
-    case transcode_target::none:
-      return reqs;  // guarded above
-  }
-
+  // Shared decode chain (one stage, N outputs) plus the target encoder/parser.
+  reqs.push_back({transcode_source_parser_alternatives(in_codec), true});
   reqs.push_back({{"tsdemux"}, true});
   reqs.push_back({{"queue"}, true});
   reqs.push_back({{"videoconvert"}, true});
   reqs.push_back({{"videoscale"}, true});
   reqs.push_back({{"capsfilter"}, true});
-  reqs.push_back({std::move(decoder), true});
-  reqs.push_back({std::move(encoder), true});
-  reqs.push_back({{std::move(target_parse)}, true});
+  reqs.push_back({transcode_decoder_alternatives(in_codec), true});
+  reqs.push_back({transcode_encoder_alternatives(target), true});
+  reqs.push_back({{transcode_target_parser(target)}, true});
   return reqs;
+}
+
+auto validate_transcode_targets(const receiver_config& cfg,
+                                bool allow_enhanced_rtmp) -> validation_result
+{
+  if (allow_enhanced_rtmp) {
+    return {};
+  }
+  for (std::size_t idx = 0; idx < cfg.outputs.size(); ++idx) {
+    const output_config& out = cfg.outputs[idx];
+    const bool is_rtmp = out.type == output_proto::rtmp
+        || out.type == output_proto::rtmps;
+    if (is_rtmp && out.transcode.target == transcode_target::h265) {
+      return fail("bad_enum",
+                  std::format("outputs[{}].transcode.codec", idx),
+                  "h265 -> rtmp/rtmps requires --allow-enhanced-rtmp "
+                  "(Enhanced FLV muxer, eflvmux)");
+    }
+  }
+  return {};
 }
 
 auto first_missing_requirement(const std::vector<element_requirement>& reqs,

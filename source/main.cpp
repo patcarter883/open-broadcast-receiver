@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Pat Carter
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,6 +23,7 @@
 #include <gst/gst.h>
 
 #include "control/control.h"
+#include "fanout/decoder.h"
 #include "fanout/output.h"
 #include "fanout/recorder.h"
 #include "fanout/ring.h"
@@ -66,6 +68,9 @@ auto print_usage(const char* argv0) -> void
       << "  --egress-allow-private  permit RFC1918/ULA output destinations\n"
       << "                          (LAN restreaming; metadata/loopback stay\n"
       << "                          blocked)\n"
+      << "  --allow-enhanced-rtmp   permit an h265 transcode target on rtmp/\n"
+      << "                          rtmps (Enhanced FLV via eflvmux; platform\n"
+      << "                          eRTMP-HEVC support varies)\n"
       << "  --buffer-min <ms>       RIST recovery buffer floor (default 1000)\n"
       << "  --buffer-max <ms>       RIST recovery buffer ceiling (default 5000)\n"
       << "  --rtt-min <ms>          RIST recovery RTT min (default 40)\n"
@@ -75,7 +80,8 @@ auto print_usage(const char* argv0) -> void
       << "  --help                  Show this help\n\n"
       << "The receiver terminates one RIST/TS ingest and fans it out, copy-only\n"
       << "(H.264+AAC), to up to 8 RTMP/RTMPS/SRT/RIST outputs over an in-process\n"
-      << "ring — one independent pipeline per output. POST /start (schema 2)\n"
+      << "ring — one independent pipeline per output. An output may opt into\n"
+      << "the transcode tier (outputs[].transcode). POST /start (schema 3)\n"
       << "configures outputs; see docs/CONTRACT.md.\n";
 }
 
@@ -120,15 +126,19 @@ auto steady_ms() -> int64_t
 }
 
 // The live fan-out session: ring + consumers. Owned by main, guarded by the
-// lifecycle mutex. Construction: ring → recorder → outputs → RIST last (data
-// only flows once every consumer exists). Teardown REVERSE of data flow:
-// RIST first (joins librist workers ⇒ producer can no longer touch the ring),
-// then ring close (wakes consumers), then outputs/recorder, then the ring
-// itself. (TRANSPORT_PROFILE §3.6's teardown note, tightened for memory
-// safety — recorded in DECISIONS.md.)
+// lifecycle mutex. Construction: ring → decoder (only for a transcode session)
+// → outputs → recorder → RIST last (data only flows once every consumer
+// exists). The decoder owns the frame_ring that transcode outputs pull from;
+// copy outputs and the recorder stay on the ts_ring. Teardown REVERSE of data
+// flow: RIST first (joins librist workers ⇒ producer can no longer touch the
+// ring), then ring close (wakes consumers), then the decoder (stops feeding,
+// closes the frame_ring), outputs/recorder, then the ring itself.
+// (TRANSPORT_PROFILE §3.6's teardown note, tightened for memory safety —
+// recorded in DECISIONS.md.)
 struct session
 {
   std::unique_ptr<ts_ring> ring;
+  std::unique_ptr<decoder> dec;  // non-null only when transcode is requested
   std::vector<std::unique_ptr<output>> outputs;
   std::unique_ptr<recorder> rec;
 };
@@ -257,6 +267,8 @@ auto main(int argc, char** argv) -> int
       egress.deny_cidrs = split_csv(csv);
     } else if (arg == "--egress-allow-private") {
       egress.allow_private = true;
+    } else if (arg == "--allow-enhanced-rtmp") {
+      opts.allow_enhanced_rtmp = true;
     } else if (arg == "--buffer-min") {
       if (!next(buffer_min)) {
         return 2;
@@ -330,6 +342,9 @@ auto main(int argc, char** argv) -> int
     if (sess.ring) {
       sess.ring->close();  // wake all blocked consumers
     }
+    if (sess.dec) {
+      sess.dec->stop();  // stop feeding + close the frame_ring
+    }
     for (std::unique_ptr<output>& out : sess.outputs) {
       out->stop();
     }
@@ -338,6 +353,7 @@ auto main(int argc, char** argv) -> int
       sess.rec->stop();
       sess.rec.reset();
     }
+    sess.dec.reset();
     sess.ring.reset();
   };
 
@@ -381,6 +397,19 @@ auto main(int argc, char** argv) -> int
       return false;
     }
 
+    // h265 -> rtmp/rtmps is gated behind --allow-enhanced-rtmp (Enhanced FLV
+    // via eflvmux). Checked here, where the operator flag is known; without it
+    // the request is 400 bad_enum naming outputs[i].transcode.codec.
+    if (auto res = validate_transcode_targets(cfg, opts.allow_enhanced_rtmp);
+        !res.ok)
+    {
+      http_status = 400;
+      err_code = res.error_code;
+      err_field = res.field;
+      err_msg = res.message;
+      return false;
+    }
+
     // Egress validation + IP pinning (M1.2) — after structural validation
     // (control.cpp), before anything launches.
     if (auto res = validate_and_pin_outputs(cfg, egress, default_resolver());
@@ -413,9 +442,35 @@ auto main(int argc, char** argv) -> int
       return false;
     }
 
-    // ---- construction: ring → recorder → outputs → RIST ----
+    // ---- construction: ring → decoder → outputs → recorder → RIST ----
     sess.ring = std::make_unique<ts_ring>(
         ts_ring::size_for_bandwidth(cfg.ingest.bandwidth));
+
+    // The shared decode stage is built ONLY when an output opts into the
+    // transcode tier; a copy-only session constructs nothing here and the
+    // default tier is byte-identical to before.
+    const bool any_transcode = std::any_of(
+        cfg.outputs.begin(),
+        cfg.outputs.end(),
+        [](const output_config& out) -> bool
+        { return out.transcode.target != transcode_target::none; });
+    if (any_transcode) {
+      sess.dec =
+          std::make_unique<decoder>(*sess.ring, cfg.in_codec, &stderr_log);
+      // A decode-stage failure is contained: copy outputs still run and
+      // transcode outputs idle until the session is restarted.
+      sess.dec->start();
+    }
+
+    for (const output_config& out_cfg : cfg.outputs) {
+      auto out = std::make_unique<output>(
+          out_cfg,
+          *sess.ring,
+          sess.dec ? &sess.dec->frames() : nullptr,
+          &stderr_log);
+      out->start();
+      sess.outputs.push_back(std::move(out));
+    }
 
     if (!opts.record_dir.empty()) {
       sess.rec = std::make_unique<recorder>(
@@ -423,12 +478,6 @@ auto main(int argc, char** argv) -> int
       // Recording failure is never session-fatal (§3.7): keep the object for
       // /status visibility (active=false).
       sess.rec->start();
-    }
-
-    for (const output_config& out_cfg : cfg.outputs) {
-      auto out = std::make_unique<output>(out_cfg, *sess.ring, &stderr_log);
-      out->start();
-      sess.outputs.push_back(std::move(out));
     }
 
     ts_ring* ring_ptr = sess.ring.get();
@@ -518,6 +567,8 @@ auto main(int argc, char** argv) -> int
       ostat.id = out->id();
       ostat.type = to_string(out->proto());
       ostat.transcode = out->transcode();
+      ostat.transcode_encoder = out->encoder_name();
+      ostat.frames_dropped = out->frames_dropped();
       ostat.state = out->state_name();
       ostat.connected_s = out->connected_s();
       ostat.reconnects = out->reconnects();
@@ -542,8 +593,8 @@ auto main(int argc, char** argv) -> int
             << ":" << control_port << "  rist @[::]:" << rist_port
             << (token.empty() ? "  [NO-AUTH]" : "  [token auth]")
             << (opts.psk.empty() ? "" : "  [psk]") << "\n"
-            << "Copy-only fan-out (schema 2): POST /start with outputs[]. "
-            << "Ctrl-C to quit." << std::endl;
+            << "Copy-only fan-out by default (schema 3): POST /start with "
+            << "outputs[]. Ctrl-C to quit." << std::endl;
 
   // --- idle-timeout watchdog (§1.5) -----------------------------------------
   std::atomic_bool shutting_down {false};

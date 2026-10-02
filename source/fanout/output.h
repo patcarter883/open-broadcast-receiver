@@ -12,9 +12,11 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <gst/gst.h>
 
+#include "fanout/frame_ring.h"
 #include "fanout/ring.h"
 #include "lib/lib.h"
 
@@ -48,8 +50,10 @@ public:
   using log_fn = std::function<void(const std::string&)>;
 
   // cfg must already be validated + pinned (validate_config +
-  // validate_and_pin_outputs). The ring reference must outlive this object.
-  output(output_config cfg, ts_ring& ring, log_fn log);
+  // validate_and_pin_outputs). The rings must outlive this object. `frames`
+  // is the shared decode stage's frame_ring, required for a transcode output
+  // and unused (may be nullptr) for a copy-only one.
+  output(output_config cfg, ts_ring& ring, frame_ring* frames, log_fn log);
   ~output();
   output(const output&) = delete;
   auto operator=(const output&) -> output& = delete;
@@ -89,6 +93,16 @@ public:
   {
     return (m_consumer >= 0) ? m_ring.dropped_bytes(m_consumer) : 0;
   }
+  // Chosen transcode encoder element name (e.g. "vah264enc"), or "" for a
+  // copy-only output / before the first pipeline build.
+  [[nodiscard]] auto encoder_name() const -> std::string;
+  // Whole-frame drops on this output's frame_ring cursor (transcode only).
+  [[nodiscard]] auto frames_dropped() const -> uint64_t
+  {
+    return (m_frame_consumer >= 0 && m_frames != nullptr)
+        ? m_frames->dropped_frames(m_frame_consumer)
+        : 0;
+  }
   [[nodiscard]] auto audio_dropped() const -> bool
   {
     return m_audio_dropped.load(std::memory_order_relaxed);
@@ -112,6 +126,12 @@ private:
   // One connect attempt: build → play → feed until error/stop. Returns true
   // if the failure is retryable, false if terminal (state already set).
   auto run_once() -> bool;
+  // Transcode feed step (video from frame_ring, AAC audio from ts_ring).
+  // Returns false when the attempt should end (appsrc flushing / stopping).
+  auto feed_transcode(bool& video_caps_set) -> bool;
+  // Set the encoded appsrc caps (raw NV12) from a decoded frame's metadata.
+  auto set_video_caps(std::size_t frame_bytes,
+                      const frame_ring::frame_meta& meta) -> void;
   auto build_pipeline(std::string& err) -> bool;
   auto destroy_pipeline() -> void;
   auto set_state(run_state next) -> void;
@@ -127,14 +147,17 @@ private:
 
   output_config m_cfg;
   ts_ring& m_ring;
+  frame_ring* m_frames = nullptr;  // shared decode stage (transcode only)
   log_fn m_log;
 
-  int m_consumer = -1;
+  int m_consumer = -1;        // ts_ring cursor (copy video / transcode audio)
+  int m_frame_consumer = -1;  // frame_ring cursor (transcode video)
   std::thread m_thread;
   std::atomic_bool m_stopping {false};
 
   GstElement* m_pipeline = nullptr;
-  GstElement* m_appsrc = nullptr;  // ref held via gst_bin_get_by_name
+  GstElement* m_appsrc = nullptr;        // video appsrc ("osrc")
+  GstElement* m_audio_appsrc = nullptr;  // transcode audio appsrc ("asrc")
   GstBus* m_bus = nullptr;
 
   std::atomic<run_state> m_state {run_state::starting};
@@ -143,8 +166,26 @@ private:
   std::atomic_bool m_audio_dropped {false};
   std::atomic<int64_t> m_running_since_ms {0};  // steady ms; 0 = not running
 
+  // Raw-frame read buffer for the frame_ring cursor (capacity()-sized; the
+  // ring insists a read destination hold a whole frame). Sized once in start().
+  std::vector<uint8_t> m_frame_buf;
+
   mutable std::mutex m_err_mutex;
   std::string m_last_error;
+
+  mutable std::mutex m_enc_mutex;
+  std::string m_encoder_name;
 };
+
+// Build the gst_parse_launch template for an output (TRANSPORT_PROFILE §3.5).
+// `encoder` is the concrete transcode encoder element name chosen from the
+// shared alternatives list; it is ignored (may be nullptr) for a copy-only
+// config. The template carries NO secrets and NO customer URLs: the sink is
+// created unconfigured (name=osink) and its connect properties are set by the
+// caller, so the string is loggable by definition. Exposed so the full-lane
+// test can assert and parse-launch the exact strings used.
+auto output_template(output_proto proto,
+                     const transcode_config& transcode,
+                     const char* encoder) -> std::string;
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_FANOUT_OUTPUT_H
