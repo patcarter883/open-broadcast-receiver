@@ -191,7 +191,7 @@ The PSK travels via the librist settings struct — never inside any URL.
   the transcode chain implies its own encoder from `transcode.codec`.)
 - **h265 transcode → RTMP/RTMPS is opt-in.** `outputs[].transcode.codec = "h265"` on an rtmp/rtmps output is
   rejected **400 `bad_enum`** (field `outputs[i].transcode.codec`) unless the receiver was started with
-  `--allow-enhanced-rtmp`: H.265 requires the Enhanced FLV muxer (`eflvmux`) and platform eRTMP-HEVC support varies.
+  `--allow-enhanced-rtmp`: H.265 requires the Enhanced FLV muxer (`eflvmux`) and platform eRTMP-HEVC support varies. **The chain is currently UNVERIFIED and looks broken** — a live `eflvmux` mux reads back as H.263 from two independent demuxers; the flag defaults off and must stay off until `flv-track-mode` is set correctly *and* a real eRTMP-HEVC destination accepts the stream (see DECISIONS DT-9 / plan §5.2). H.265 is verified over SRT/RIST.
   h264 → RTMP and h265 → SRT/RIST never require the flag.
 - **rtmp/rtmps egress needs AVC.** `rtmp_codec_unsupported` (400) fires **only when `source.codec != "h264"` AND at
   least one rtmp/rtmps output has no `transcode` block** — a copy-only rtmp output cannot carry a non-H.264 ES into
