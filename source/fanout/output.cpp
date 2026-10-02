@@ -52,26 +52,25 @@ auto redact_secret(std::string text, const std::string& secret) -> std::string
   return text;
 }
 
-// Elements each template needs (TRANSPORT_PROFILE §1.2 element_unavailable).
-auto required_elements(output_proto proto) -> std::vector<const char*>
-{
-  switch (proto) {
-    case output_proto::rtmp:
-    case output_proto::rtmps:
-      return {"appsrc", "tsparse", "tsdemux", "queue",
-              "h264parse", "aacparse", "flvmux", "rtmp2sink"};
-    case output_proto::srt:
-      return {"appsrc", "tsparse", "srtsink"};
-    case output_proto::rist:
-      return {"appsrc", "tsparse", "ristsink"};
-  }
-  return {};
-}
+// Elements each template needs (TRANSPORT_PROFILE §1.2 element_unavailable)
+// now live in lib (required_elements) so the preflight is unit-testable
+// without GStreamer; see also registry_has_element below.
 
 auto has_property(GstElement* elem, const char* name) -> bool
 {
   return g_object_class_find_property(G_OBJECT_GET_CLASS(elem), name)
       != nullptr;
+}
+
+// Real registry probe for the element preflight: exact factory existence.
+auto registry_has_element(const char* name) -> bool
+{
+  GstElementFactory* factory = gst_element_factory_find(name);
+  if (factory == nullptr) {
+    return false;
+  }
+  gst_object_unref(factory);
+  return true;
 }
 }  // namespace
 
@@ -146,16 +145,13 @@ auto output::set_state(run_state next) -> void
   }
 }
 
-auto output::first_missing_element(output_proto proto) -> std::string
+auto output::first_missing_element(output_proto proto,
+                                   const transcode_config& transcode,
+                                   codec in_codec)
+    -> std::optional<missing_requirement>
 {
-  for (const char* name : required_elements(proto)) {
-    GstElementFactory* factory = gst_element_factory_find(name);
-    if (factory == nullptr) {
-      return name;
-    }
-    gst_object_unref(factory);
-  }
-  return {};
+  return first_missing_requirement(
+      required_elements(proto, transcode, in_codec), &registry_has_element);
 }
 
 // ---------------------------------------------------------------------------

@@ -393,16 +393,24 @@ auto main(int argc, char** argv) -> int
       return false;
     }
 
-    // Element preflight (§1.2): 400 element_unavailable naming the element.
-    for (const output_config& out : cfg.outputs) {
-      const std::string missing = output::first_missing_element(out.type);
-      if (!missing.empty()) {
-        http_status = 400;
-        err_code = "element_unavailable";
-        err_field = "outputs[].type";
-        err_msg = "missing GStreamer element: " + missing;
-        return false;
+    // Element preflight (§1.2): 400 naming the missing element. A missing
+    // transcode-chain element is transcode_unavailable on
+    // outputs[i].transcode.codec; the base chain keeps element_unavailable.
+    for (std::size_t idx = 0; idx < cfg.outputs.size(); ++idx) {
+      const output_config& out = cfg.outputs[idx];
+      const auto missing =
+          output::first_missing_element(out.type, out.transcode, cfg.in_codec);
+      if (!missing) {
+        continue;
       }
+      http_status = 400;
+      err_code = missing->transcode ? "transcode_unavailable"
+                                    : "element_unavailable";
+      err_field = missing->transcode
+          ? "outputs[" + std::to_string(idx) + "].transcode.codec"
+          : "outputs[].type";
+      err_msg = "missing GStreamer element: " + missing->element;
+      return false;
     }
 
     // ---- construction: ring → recorder → outputs → RIST ----
@@ -509,6 +517,7 @@ auto main(int argc, char** argv) -> int
       output_stat ostat;
       ostat.id = out->id();
       ostat.type = to_string(out->proto());
+      ostat.transcode = out->transcode();
       ostat.state = out->state_name();
       ostat.connected_s = out->connected_s();
       ostat.reconnects = out->reconnects();

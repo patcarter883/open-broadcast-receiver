@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -67,6 +68,10 @@ public:
 
   [[nodiscard]] auto id() const -> const std::string& { return m_cfg.id; }
   [[nodiscard]] auto proto() const -> output_proto { return m_cfg.type; }
+  [[nodiscard]] auto transcode() const -> transcode_target
+  {
+    return m_cfg.transcode.target;
+  }
   [[nodiscard]] auto state() const -> run_state
   {
     return m_state.load(std::memory_order_acquire);
@@ -92,9 +97,15 @@ public:
   [[nodiscard]] auto connected_s() const -> int64_t;
   [[nodiscard]] auto last_error() const -> std::string;
 
-  // Registry pre-check for /start (400 element_unavailable). Returns the name
-  // of the first missing GStreamer element required by `proto`, or "".
-  static auto first_missing_element(output_proto proto) -> std::string;
+  // Registry pre-check for /start. Returns the first unsatisfied element
+  // requirement (base chain => element_unavailable; transcode chain =>
+  // transcode_unavailable), or nullopt when every requirement is met. For a
+  // transcode output the probe covers the decode -> convert -> encode chain
+  // and is satisfied by ANY alternative element name present.
+  static auto first_missing_element(output_proto proto,
+                                    const transcode_config& transcode,
+                                    codec in_codec)
+      -> std::optional<missing_requirement>;
 
 private:
   auto worker() -> void;
