@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1
+# ABR rig sender: builds abr_feed, which owns the GStreamer pipeline AND the
+# RIST sender in ONE process so the bitrate can actually be retuned — see
+# open-broadcast-receiver/test/tools/abr_feed.cpp.
+#
+# BUILD CONTEXT IS A STAGED TREE, not a repo root. abr_feed links the encoder's
+# single ABR definition rather than carrying a copy of the algorithm, so the
+# build needs files from BOTH repos; abr-test.sh stages exactly those into a
+# temp dir and builds from there. (Using either repo root as context would drag
+# in build/ trees and still not contain the other repo.) Layout in the stage:
+#
+#   src/abr_feed.cpp
+#   enc/lib/lib.h  enc/stats/bitrate_scale.{h,cpp}
+#   external/rist-cpp/
+#
+#   docker build -t obr-rig-abr:latest -f test/rig/Dockerfile.abr <stage>
+#
+FROM debian:sid AS build
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential cmake meson ninja-build pkg-config git \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY external/rist-cpp external/rist-cpp
+RUN cmake -S external/rist-cpp -B build-rist \
+      -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=/opt/rist \
+    && cmake --build build-rist -j"$(nproc)" --target install
+
+# The encoder's ABR, verbatim. The include layout mirrors the encoder's own so
+# its quoted includes ("stats/...", "lib/...") resolve unchanged.
+COPY enc/lib/lib.h        enc/lib/lib.h
+COPY enc/stats/bitrate_scale.h enc/stats/bitrate_scale.h
+COPY enc/stats/bitrate_scale.cpp enc/stats/bitrate_scale.cpp
+COPY src/abr_feed.cpp     src/abr_feed.cpp
+
+RUN g++ -std=c++20 -O2 -o /usr/local/bin/abr_feed \
+      src/abr_feed.cpp enc/stats/bitrate_scale.cpp \
+      -I enc \
+      -I/opt/rist/include -I/opt/rist/include/rist-cpp \
+      -I/opt/rist/include/librist \
+      $(pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0) \
+      /opt/rist/lib/libristnet.a /opt/rist/lib/librist.a \
+      $(pkg-config --libs gstreamer-1.0 gstreamer-app-1.0) -pthread
+
+FROM debian:sid
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly gstreamer1.0-libav iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/abr_feed /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/abr_feed"]
