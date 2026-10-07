@@ -28,7 +28,7 @@ api /status >/dev/null 2>&1 || fail "receiver control plane never came up"
 echo "== /start: one RTMP output to SRS =="
 srs_ip=$($COMPOSE exec -T receiver getent hosts srs | awk '{print $1}')
 [ -n "$srs_ip" ] || fail "could not resolve srs"
-post /start "{\"schema_version\":2,\"session_id\":\"smoke-1\",\"ingest\":{\"bandwidth\":6000},\"source\":{\"codec\":\"h264\"},\"outputs\":[{\"id\":\"rtmp1\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs_ip}:1935/live\",\"key_or_streamid\":\"smoke\"}]}" \
+post /start "{\"schema_version\":3,\"session_id\":\"smoke-1\",\"ingest\":{\"bandwidth\":6000},\"source\":{\"codec\":\"h264\"},\"outputs\":[{\"id\":\"rtmp1\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs_ip}:1935/live\",\"key_or_streamid\":\"smoke\"}]}" \
   | grep -q '"ok":true' || fail "/start rejected"
 
 echo "== start sender (RIST → receiver) =="

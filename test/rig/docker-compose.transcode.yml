@@ -1,0 +1,82 @@
+# MT1.9 transcode-tier rig (the tier's acceptance proof):
+#
+#   sender (AV1 over RIST) ──▶ receiver ──┬─RTMP──▶ srs           (AV1 → H.264)
+#                                         ├─SRT───▶ srt-h265      (AV1 → H.265)
+#                                         └─SRT───▶ srt-av1copy   (AV1, copied)
+#
+# One AV1 ingest, three concurrent destinations: two re-encoded to different
+# codecs, one copied verbatim. This is the topology the tier exists for, and the
+# only place the "AV1 cannot be copied to RTMP" gate (MT1.3) is exercised for
+# real. Driven by transcode.sh — not intended for standalone `up`.
+name: obr-transcode
+
+networks:
+  media: {}
+
+services:
+  receiver:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.receiver
+      args:
+        TIMING_MODE: "0"
+    command: >
+      --bind 0.0.0.0 --token smoketoken --rist-port 5000
+      --egress-allow-private --record-dir /rec --idle-timeout 300
+    networks: [ media ]
+    volumes: [ "rec:/rec" ]
+    # The GPU, as the node agent passes it (receiverRunArgs). Without it the
+    # VAAPI elements cannot initialise and the tier silently re-encodes on the
+    # CPU -- so a rig that omits this would "pass" while testing the wrong thing.
+    devices: [ "/dev/dri:/dev/dri" ]
+
+  srs:
+    image: ossrs/srs:5
+    networks: [ media ]
+
+  # SRT sinks. srtsrc in listener mode writes the received TS to a file the
+  # prober reads back, so the assertions run on real bytes rather than on the
+  # receiver's own opinion of itself.
+  srt-h265:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.sender
+    entrypoint:
+      ["gst-launch-1.0", "-q", "srtsrc", "uri=srt://0.0.0.0:9000?mode=listener",
+       "!", "filesink", "location=/out/h265.ts"]
+    networks: [ media ]
+    volumes: [ "out265:/out" ]
+
+  srt-av1copy:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.sender
+    entrypoint:
+      ["gst-launch-1.0", "-q", "srtsrc", "uri=srt://0.0.0.0:9001?mode=listener",
+       "!", "filesink", "location=/out/av1.ts"]
+    networks: [ media ]
+    volumes: [ "outav1:/out" ]
+
+  sender:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.sender
+    environment:
+      DEST_HOST: receiver
+      DEST_PORT: "5000"
+      BITRATE_KBPS: "3000"
+      SOURCE_CODEC: av1
+    networks: [ media ]
+    depends_on: [ receiver ]
+
+  prober:
+    build:
+      context: ../..
+      dockerfile: test/rig/Dockerfile.prober
+    networks: [ media ]
+    volumes: [ "out265:/out265", "outav1:/outav1" ]
+
+volumes:
+  rec: {}
+  out265: {}
+  outav1: {}

@@ -2,7 +2,9 @@
 # Bonding-rig sender image: headless encoder stand-in (FIXPLAN M1.6) —
 # gst-launch test source muxing H.264+AAC TS, piped into rist_feed
 # (vendored RISTNetSender, ADVANCED profile, timing-mode=0).
-FROM ubuntu:24.04 AS build
+# debian:sid for GStreamer 1.28: the sender must mux AV1 into MPEG-TS, which needs
+# mpegtsmux's `enable-custom-mappings` (absent before 1.28).
+FROM debian:sid AS build
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential cmake meson ninja-build pkg-config git \
     && rm -rf /var/lib/apt/lists/*
@@ -16,7 +18,7 @@ RUN cmake -S external/rist-cpp -B build-rist \
        -I/opt/rist/include -I/opt/rist/include/rist-cpp -I/opt/rist/include/librist \
        /opt/rist/lib/libristnet.a /opt/rist/lib/librist.a -pthread
 
-FROM ubuntu:24.04
+FROM debian:sid
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly gstreamer1.0-libav \

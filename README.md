@@ -13,7 +13,7 @@ This is a ground-up redevelopment of the original `ndi-rist-server`. The design
 rationale and the full wire contract live in:
 
 - [`DECISIONS.md`](DECISIONS.md) — every significant design decision + rejected alternatives.
-- [`docs/CONTRACT.md`](docs/CONTRACT.md) — the encoder ⇄ receiver control & telemetry contract (schema_version 2, the shared source of truth).
+- [`docs/CONTRACT.md`](docs/CONTRACT.md) — the encoder ⇄ receiver control & telemetry contract (schema_version 3, the shared source of truth).
 - [`docs/GSTREAMER.md`](docs/GSTREAMER.md) — verified fan-out pipeline templates.
 
 ## How it fits together
@@ -87,14 +87,14 @@ who reaches the port could redirect your stream).
 Restreaming to boxes on your own LAN? Destination validation blocks private
 ranges by default (SSRF hygiene) — opt out with `--egress-allow-private`.
 
-It then idles until the encoder (or `curl`) issues `POST /start` (schema 2):
+It then idles until the encoder (or `curl`) issues `POST /start` (schema 3):
 
 ```sh
 curl -s -X POST http://127.0.0.1:8080/start \
   -H "Authorization: Bearer $RECEIVER_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-        "schema_version": 2,
+        "schema_version": 3,
         "session_id": "demo-1",
         "ingest": { "bandwidth": 8000 },
         "source": { "codec": "h264" },

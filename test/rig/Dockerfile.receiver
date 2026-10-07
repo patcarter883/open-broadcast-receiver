@@ -6,9 +6,11 @@
 # CRASHES the receiver — proving the rig detects the original C1 defect —
 # before the timing-mode=0 run is required to pass.
 #
-# NOTE: uses the distro GStreamer (1.24 on noble); the production floor is
-# 1.28 — bump the base image when a 1.28 base is available.
-FROM ubuntu:24.04 AS build
+# Uses debian:sid for GStreamer 1.28, matching the source floor and the
+# production image. On a 1.24 base the sender could not mux AV1 into TS at all
+# (mpegtsmux has no `enable-custom-mappings` before 1.28), so the rig's whole
+# AV1 path was untestable here.
+FROM debian:sid AS build
 ARG TIMING_MODE=0
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential cmake meson ninja-build pkg-config git \
@@ -25,13 +27,18 @@ RUN if [ "$TIMING_MODE" = "1" ]; then \
 # BUILD_TESTING=OFF: the rig needs only the receiver binary, not the unit
 # tests — so the build context needs no test/CMakeLists.txt (.dockerignore
 # keeps most of test/ out; only test/rig + test/tools are shipped, for sender).
-RUN sed -i 's/>=1\.28/>=1.24/g' CMakeLists.txt \
-    && cmake -S . -B build -D CMAKE_BUILD_TYPE=Debug -D BUILD_TESTING=OFF \
+RUN cmake -S . -B build -D CMAKE_BUILD_TYPE=Debug -D BUILD_TESTING=OFF \
     && cmake --build build -j"$(nproc)"
 
-FROM ubuntu:24.04
+FROM debian:sid
+# plugins-ugly + libav are REQUIRED by the transcode tier: x264enc/x265enc live in
+# ugly. Without them the receiver's own element preflight refuses every transcode
+# destination (transcode_unavailable), so a transcode rig cannot pass here even
+# though the production image has them (see the top-level Dockerfile).
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad libgstreamer1.0-0 \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav libgstreamer1.0-0 \
+    libva2 libva-drm2 mesa-va-drivers \
     curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/build/open-broadcast-receiver /usr/local/bin/
