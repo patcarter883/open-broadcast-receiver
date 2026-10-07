@@ -52,9 +52,8 @@ set(BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/rist-build")
 set(BUILD_CMD cd ${BUILD_DIR} && meson -Dbuiltin_mbedtls=true -Dbuiltin_cjson=true -Dbuiltin_lz4=true --default-library=static -Db_vscrt=mt ${CMAKE_CURRENT_SOURCE_DIR}/rist && ninja)
 ExternalProject_Add(project_rist
         CONFIGURE_COMMAND ""
-        GIT_REPOSITORY https://github.com/patcarter883/librist.git
-        GIT_TAG v0.2.18-rc1-13+obr1
-        PATCH_COMMAND sh -c "git apply --reverse --check ${CMAKE_CURRENT_SOURCE_DIR}/patches/0001-mask-receiver_queue-index-in-receiver_mark_missing.patch 2>/dev/null || git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/0001-mask-receiver_queue-index-in-receiver_mark_missing.patch"
+        GIT_REPOSITORY https://code.videolan.org/rist/librist.git
+        GIT_TAG v0.2.20
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rist
         BINARY_DIR ${BUILD_DIR}
         BUILD_COMMAND ${BUILD_CMD}
@@ -67,9 +66,8 @@ ExternalProject_Add(project_rist
 else()
 ExternalProject_Add(project_rist
         CONFIGURE_COMMAND ""
-        GIT_REPOSITORY https://github.com/patcarter883/librist.git
-        GIT_TAG v0.2.18-rc1-13+obr1
-        PATCH_COMMAND sh -c "git apply --reverse --check ${CMAKE_CURRENT_SOURCE_DIR}/patches/0001-mask-receiver_queue-index-in-receiver_mark_missing.patch 2>/dev/null || git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/0001-mask-receiver_queue-index-in-receiver_mark_missing.patch"
+        GIT_REPOSITORY https://code.videolan.org/rist/librist.git
+        GIT_TAG v0.2.20
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rist
         BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/rist-build
         BUILD_COMMAND mkdir -p ${CMAKE_CURRENT_BINARY_DIR}/rist-build COMMAND cd ${CMAKE_CURRENT_BINARY_DIR}/rist-build COMMAND meson -Dbuiltin_mbedtls=true -Dbuiltin_cjson=true -Dbuiltin_lz4=true --default-library=static -Dc_args=-Wno-overlength-strings ${CMAKE_CURRENT_SOURCE_DIR}/rist COMMAND ninja
