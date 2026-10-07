@@ -23,6 +23,7 @@ services:
     command: >
       --bind 0.0.0.0 --token smoketoken --rist-port 5000
       --egress-allow-private --record-dir /rec --idle-timeout 300
+      --allow-enhanced-rtmp
     networks: [ media ]
     volumes: [ "rec:/rec" ]
     # The GPU, as the node agent passes it (receiverRunArgs). Without it the

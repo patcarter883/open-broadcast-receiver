@@ -238,14 +238,24 @@ auto output_template(output_proto proto,
                         transcode.scale_width,
                         transcode.scale_height);
   }
+
   switch (proto) {
     case output_proto::rtmp:
     case output_proto::rtmps: {
       const bool hevc = transcode.target == transcode_target::h265;
       const char* mux = transcode_muxer(proto, transcode.target);
+      // The profile is stated in caps, not a property: the VA encoders expose no
+      // profile property at all (vah264enc's and vah265enc's GStreamer property
+      // lists are identical and contain none), so caps are the only way. It has to
+      // be stated because two defaults depend on it -- `cabac` is true and
+      // "requires main profile at least", `dct8x8` is true and "requires high
+      // profile at least" -- so with no profile requested, both defaults ran
+      // against a profile that may not have permitted them. h264 asks for high
+      // (the superset, and what YouTube accepts); h265 asks for main, the
+      // interoperable choice for HEVC.
       const std::string vcaps = hevc
-          ? "video/x-h265,stream-format=hvc1,alignment=au"
-          : "video/x-h264,stream-format=avc,alignment=au";
+          ? "video/x-h265,stream-format=hvc1,alignment=au,profile=main"
+          : "video/x-h264,stream-format=avc,alignment=au,profile=high";
       // Encoded video is driven from the shared frame ring; audio stays on the
       // ts_ring AAC copy path so RTMP audio passthrough is unchanged. h265
       // uses the Enhanced FLV muxer (eflvmux) — legacy flvmux cannot carry

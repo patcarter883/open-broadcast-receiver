@@ -21,5 +21,11 @@ set -- --bind 0.0.0.0 --rist-port 5000
 [ -n "${OBR_RECORD_DIR:-}" ]   && set -- "$@" --record-dir "$OBR_RECORD_DIR"
 [ -n "${OBR_IDLE_TIMEOUT:-}" ] && set -- "$@" --idle-timeout "$OBR_IDLE_TIMEOUT"
 [ -n "${OBR_EGRESS_DENY:-}" ]  && set -- "$@" --egress-deny "$OBR_EGRESS_DENY"
+# Enhanced FLV (eflvmux) is opt-in because it is the newer muxer: flvmux is the
+# battle-tested path, so the receiver must not switch muxers for an operator who
+# did not ask. An h265 target on rtmp/rtmps is REFUSED without this, and YouTube
+# will only accept H.265 live via enhanced RTMP -- so the H.265-to-YouTube route
+# requires the node to set OBR_ALLOW_ENHANCED_RTMP.
+[ -n "${OBR_ALLOW_ENHANCED_RTMP:-}" ] && set -- "$@" --allow-enhanced-rtmp
 
 exec open-broadcast-receiver "$@"

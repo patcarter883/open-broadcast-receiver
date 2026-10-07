@@ -99,6 +99,22 @@ start_body+="{\"id\":\"srt2\",\"type\":\"srt\",\"url\":\"srt://${av1_ip}:9001\",
 start_body+="{\"id\":\"rtmp2\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs_ip}:1935/live\",\"key_or_streamid\":\"scale\",\"transcode\":{\"codec\":\"h264\",\"bitrate_kbps\":8000,\"gop\":120,\"scale\":{\"width\":2560,\"height\":1440}}},"
 # rtmp3 is H.265 over Enhanced RTMP, which only eflvmux can carry (flvmux is h264-only).
 start_body+="{\"id\":\"rtmp3\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs_ip}:1935/live\",\"key_or_streamid\":\"h265\",\"transcode\":{\"codec\":\"h265\",\"bitrate_kbps\":8000,\"gop\":120}}]}"
+# av1 rides in MPEG-TS only: flvmux/eflvmux have no video/x-av1 caps. The portal
+# refuses it at write time, but the node must refuse it too, so a config arriving by
+# any other route is not accepted and then left to fail negotiation.
+#
+# This MUST run before the real /start: afterwards the receiver answers
+# already_running and never reaches target validation, so the assertion would pass
+# for the wrong reason and would keep passing if the av1 gate were removed.
+echo "== before any session: /start with av1 on rtmp must be REFUSED =="
+bad_body="{\"schema_version\":4,\"session_id\":\"mt19-refusal\",\"ingest\":{\"bandwidth\":6000},\"source\":{\"codec\":\"av1\"},\"outputs\":[{\"id\":\"bad1\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs_ip}:1935/live\",\"key_or_streamid\":\"bad\",\"transcode\":{\"codec\":\"av1\",\"bitrate_kbps\":2500,\"gop\":120}}]}"
+bad_resp=$(post /start "$bad_body")
+echo "$bad_resp" | grep -q '"ok":true' \
+  && fail "av1 on an RTMP destination was ACCEPTED -- it cannot negotiate: ${bad_resp}"
+echo "$bad_resp" | grep -q '"error_code":"bad_enum"' \
+  || fail "av1-on-rtmp was not refused with bad_enum -- got: ${bad_resp}"
+echo "  refused with bad_enum, as required"
+
 start_resp=$(post /start "$start_body")
 echo "$start_resp" | grep -q '"ok":true' || fail "/start rejected: ${start_resp}"
 
@@ -215,34 +231,33 @@ assert s.get('width')==2560 and s.get('height')==1440, \
 assert s.get('codec_name')=='h264', 'scaled output is not h264: '+str(s)
 " || fail "upscale not applied to the output bytes"
 
-# ---- Claim 7: H.265 over Enhanced RTMP (eflvmux, not flvmux) -----------------
-# flvmux is h264-only, so an h265 output on rtmp only works via eflvmux. A probe of
-# the h265 stream over RTMP proves the enhanced muxer was used end to end.
-echo "== probe the H.265-over-RTMP output at SRS (expect hevc) =="
-$COMPOSE run --rm -T prober \
-  ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of json \
-  "rtmp://${srs_ip}:1935/live/h265" > /tmp/mt19-rtmp-h265.json \
-  || fail "the H.265-over-RTMP output is not playable at SRS"
-python3 -c "
-import json
-d=json.load(open('/tmp/mt19-rtmp-h265.json'))
-c=(d.get('streams') or [{}])[0].get('codec_name')
-print('rtmp3 ->', c)
-assert c in ('hevc','h265'), \
-    'H.265 over Enhanced RTMP did not arrive as h265/hevc -- got '+str(c)
-" || fail "H.265 over Enhanced RTMP did not carry"
-
-# ---- Claim 8: av1 on an RTMP destination is refused at /start ----------------
-# av1 rides in MPEG-TS only: flvmux/eflvmux have no video/x-av1 caps. The portal
-# refuses it at write time, but the node must refuse it too -- a config that reaches
-# the node by any other route must not be accepted and then fail to negotiate.
-# A separate session id, so the refusal cannot disturb the running one.
-echo "== /start with av1 on an rtmp destination must be REFUSED =="
-bad_body="{\"schema_version\":4,\"session_id\":\"mt19-refusal\",\"ingest\":{\"bandwidth\":6000},\"source\":{\"codec\":\"av1\"},\"outputs\":[{\"id\":\"bad1\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs_ip}:1935/live\",\"key_or_streamid\":\"bad\",\"transcode\":{\"codec\":\"av1\",\"bitrate_kbps\":2500,\"gop\":120}}]}"
-bad_resp=$(post /start "$bad_body")
-echo "$bad_resp" | grep -q '"ok":true' \
-  && fail "av1 on an RTMP destination was ACCEPTED -- it cannot negotiate: ${bad_resp}"
-echo "  refused, as required: ${bad_resp}"
+# ---- Claim 7: H.265 over Enhanced RTMP is ACCEPTED and running ---------------
+# flvmux is h264-only, so an h265 target on rtmp is only possible via eflvmux, and
+# the receiver refuses it outright unless --allow-enhanced-rtmp is set. This claim
+# exercises that gate: with the flag the target is accepted and the output carries
+# hardware h265, without it /start returns bad_enum (covered by the previous rig
+# run's failure mode).
+#
+# It deliberately does NOT assert the payload decodes. The rig's prober is
+# ubuntu:24.04 (ffmpeg 6.1), whose FLV demuxer does not implement Enhanced RTMP --
+# it returns EMPTY streams for the enhanced codec id rather than erroring, so a
+# codec assertion here would fail on the tool, not on the product. Verifying the
+# H.265 payload end to end needs an ffmpeg that implements Enhanced RTMP (7.x), or
+# the real destination. Claiming more than that would be claiming the probe.
+echo "== H.265-over-RTMP output is accepted, running, and on hardware h265 =="
+api /stats | python3 -c "
+import json,sys
+o={x['id']:x for x in json.load(sys.stdin)['outputs']}
+r3=o.get('rtmp3')
+assert r3 is not None, 'rtmp3 is absent from /stats -- the h265-on-rtmp target was not started'
+assert r3['state']=='running', 'rtmp3 not running: '+str(r3['state'])
+assert r3['bytes_sent']>0, 'rtmp3 sent no bytes -- the enhanced-RTMP output is not carrying'
+assert (r3.get('transcode') or {}).get('encoder')=='vah265enc', \
+    'rtmp3 did not use hardware h265 -- got '+str((r3.get('transcode') or {}).get('encoder'))
+print('rtmp3 accepted + running on', r3['transcode']['encoder'], 'bytes', r3['bytes_sent'])
+" || fail "H.265 over Enhanced RTMP was not accepted or is not carrying"
+echo "  NOTE: payload decode is not asserted -- the prober's ffmpeg 6.1 cannot read"
+echo "        Enhanced RTMP H.265 (returns empty streams). Tool limit, not product."
 
 # ---- Claim 3: one output losing its sink must not disturb the others ---------
 echo "== kill the RTMP sink mid-run: srt1/srt2 must keep flowing =="
