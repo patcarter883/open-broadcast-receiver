@@ -299,7 +299,8 @@ auto test_transcode() -> void
            "convert chain elements required");
     expect(has("vaav1dec") && has("av1dec") && has("dav1ddec"),
            "av1 decoder alternatives listed");
-    expect(has("vah264enc") && has("x264enc"), "h264 encoder alternatives");
+    expect(has("vah264enc") && !has("x264enc"),
+           "h264 encoder requirement is hardware only");
     expect(has("h264parse"), "target parser required");
 
     // ANY alternative satisfies presence.
@@ -308,18 +309,18 @@ auto test_transcode() -> void
     expect(!first_missing_requirement(reqs, everything).has_value(),
            "all elements present -> satisfied");
 
-    // Hardware path present, software alternative absent -> still satisfied.
+    // Hardware encoder present -> satisfied.
     const element_present_fn hw_only = [](const char* name) -> bool
     { return std::string_view {name} != "x264enc"; };
     expect(!first_missing_requirement(reqs, hw_only).has_value(),
-           "vah264enc alone satisfies the encoder requirement");
+           "vah264enc satisfies the encoder requirement");
 
-    // Both encoder alternatives absent -> missing, naming the first name and
-    // flagged as a transcode-chain element.
+    // No hardware encoder -> missing, named and flagged as a transcode-chain
+    // element, so the /start is refused rather than served by software.
     const element_present_fn no_encoder = [](const char* name) -> bool
     {
       const std::string_view elem {name};
-      return elem != "vah264enc" && elem != "x264enc";
+      return elem != "vah264enc";
     };
     const auto miss = first_missing_requirement(reqs, no_encoder);
     expect(miss.has_value() && miss->element == "vah264enc"

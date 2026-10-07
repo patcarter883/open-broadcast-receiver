@@ -13,8 +13,8 @@ cd "$(dirname "$0")"
 COMPOSE="docker compose -f docker-compose.smoke.yml"
 TOKEN=smoketoken
 
-api()  { $COMPOSE exec -T receiver curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080$1"; }
-post() { $COMPOSE exec -T receiver curl -s -X POST -H "Authorization: Bearer $TOKEN" -d "$2" "http://127.0.0.1:8080$1"; }
+api()  { $COMPOSE exec -T receiver curl -s -m 15 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080$1"; }
+post() { $COMPOSE exec -T receiver curl -s -m 90 -X POST -H "Authorization: Bearer $TOKEN" -d "$2" "http://127.0.0.1:8080$1"; }
 fail() { echo "SMOKE FAIL: $*" >&2; $COMPOSE logs --tail 80 receiver sender srs >&2 || true; $COMPOSE down -v || true; exit 1; }
 
 echo "== build images =="
@@ -28,7 +28,7 @@ api /status >/dev/null 2>&1 || fail "receiver control plane never came up"
 echo "== /start: one RTMP output to SRS =="
 srs_ip=$($COMPOSE exec -T receiver getent hosts srs | awk '{print $1}')
 [ -n "$srs_ip" ] || fail "could not resolve srs"
-post /start "{\"schema_version\":3,\"session_id\":\"smoke-1\",\"ingest\":{\"bandwidth\":6000},\"source\":{\"codec\":\"h264\"},\"outputs\":[{\"id\":\"rtmp1\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs_ip}:1935/live\",\"key_or_streamid\":\"smoke\"}]}" \
+post /start "{\"schema_version\":4,\"session_id\":\"smoke-1\",\"ingest\":{\"bandwidth\":6000},\"source\":{\"codec\":\"h264\"},\"outputs\":[{\"id\":\"rtmp1\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs_ip}:1935/live\",\"key_or_streamid\":\"smoke\"}]}" \
   | grep -q '"ok":true' || fail "/start rejected"
 
 echo "== start sender (RIST → receiver) =="

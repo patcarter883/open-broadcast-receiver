@@ -70,7 +70,9 @@ existing C++ `enum class` values, whose **integer order is fixed** and must not 
 
 A receiver MUST reject an unknown enum string with **400 `bad_enum`** naming the offending `field`.
 On the wire `transcode.codec` accepts only `"h264"`/`"h265"` (§4): `transcode_target::none` is the internal value
-for "no `transcode` block" and is never sent; `"av1"` is **not** a valid transcode target and is rejected as
+for "no `transcode` block" and is never sent. `"av1"` IS a valid transcode target (YouTube accepts AV1
+ingestion over RTMP/RTMPS — see its live encoder settings), but only where the container can carry it:
+MPEG-TS (srt/rist). An `av1` target on rtmp/rtmps is rejected as
 `bad_enum`. There is no `video.encoder` enum — an output's encoder, when it has one, is implied by
 `transcode.codec` and never selected independently. Audio is never declared: AAC passes through to
 FLV; a non-AAC audio ES degrades rtmp outputs to video-only (§4 validation) rather than failing them.
@@ -128,7 +130,7 @@ URL ⇒ 400 `bad_url` naming `outputs[i].url`.
 `outputs[].transcode` (all members optional except `codec`; absent `codec` or absent object ⇒ copy-only):
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `codec` | enum transcode_target | — | **required inside the object**; `"h264"` or `"h265"` only (`"av1"` ⇒ 400 `bad_enum`) |
+| `codec` | enum transcode_target | — | **required inside the object**; `"h264"`, `"h265"`, or `"av1"`. `"av1"` is refused on rtmp/rtmps (⇒ 400 `bad_enum`) because flvmux/eflvmux carry no `video/x-av1`; it is valid on srt/rist, whose MPEG-TS does |
 | `bitrate_kbps` | int (kbps) | 0 | encoder target bitrate; `0` = encoder default |
 | `gop` | int (frames) | 0 | encoder GOP length; `0` = encoder default |
 

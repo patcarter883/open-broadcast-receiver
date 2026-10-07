@@ -36,14 +36,19 @@ auto only(const std::vector<std::string>& present)
 
 auto main() -> int
 {
-  // Encoder alternatives: hardware first, software fallback second.
+  // Encoder alternatives: HARDWARE ONLY. There is deliberately no software
+  // fallback -- production does not use software encoding, and a silent CPU
+  // re-encode would be attributed to a GPU tier that never ran.
   {
     const auto h264 = transcode_encoder_alternatives(transcode_target::h264);
-    expect(h264 == (std::vector<std::string> {"vah264enc", "x264enc"}),
-           "h264 encoder alternatives + order");
+    expect(h264 == (std::vector<std::string> {"vah264enc"}),
+           "h264 encoder is hardware only");
     const auto h265 = transcode_encoder_alternatives(transcode_target::h265);
-    expect(h265 == (std::vector<std::string> {"vah265enc", "x265enc"}),
-           "h265 encoder alternatives + order");
+    expect(h265 == (std::vector<std::string> {"vah265enc"}),
+           "h265 encoder is hardware only");
+    const auto av1 = transcode_encoder_alternatives(transcode_target::av1);
+    expect(av1 == (std::vector<std::string> {"vaav1enc"}),
+           "av1 encoder is hardware only");
     expect(transcode_encoder_alternatives(transcode_target::none).empty(),
            "none has no encoder");
   }
@@ -107,10 +112,10 @@ auto main() -> int
         std::vector<std::string> {"vah264enc", "x264enc"};
     expect(choose_present(alts, only({"vah264enc", "x264enc"}))
                == std::optional<std::string> {"vah264enc"},
-           "hw present -> hw chosen");
+           "first present alternative is chosen");
     expect(choose_present(alts, only({"x264enc"}))
                == std::optional<std::string> {"x264enc"},
-           "hw absent -> software fallback");
+           "a later alternative is chosen when earlier ones are absent");
     expect(!choose_present(alts, only({"nope"})).has_value(),
            "none present -> nullopt");
   }

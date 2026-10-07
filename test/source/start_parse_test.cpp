@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Pat Carter
 
-// Unit tests for the POST /start body parser (schema_version 3, the optional
-// outputs[].transcode object). Framework-free; exit 0 = pass.
+// Unit tests for the POST /start body parser (schema_version 4: the optional
+// outputs[].transcode object, its `scale` block, and the av1 target).
+// Framework-free; exit 0 = pass.
 
 #include <cstdio>
 #include <cstdlib>
@@ -31,7 +32,7 @@ auto body_with_transcode(const std::string& transcode_json) -> std::string
     out_json += "," + transcode_json;
   }
   out_json += "}";
-  return std::string {"{\"schema_version\":3,\"session_id\":\"s1\","
+  return std::string {"{\"schema_version\":4,\"session_id\":\"s1\","
                       "\"source\":{\"codec\":\"av1\"},\"outputs\":["}
       + out_json + "]}";
 }
@@ -81,6 +82,48 @@ auto test_parse() -> void
     expect(code == "bad_enum", "vp9 -> bad_enum");
     expect(field == "outputs[0].transcode.codec",
            "vp9 -> outputs[0].transcode.codec");
+  }
+
+  // schema_version 4: a scale block is parsed into the config (output size is
+  // applied before the encoder, so it belongs to the transcode, not the output).
+  {
+    receiver_config cfg;
+    std::string code;
+    std::string field;
+    std::string msg;
+    const std::string body = body_with_transcode(
+        "\"transcode\":{\"codec\":\"h264\",\"scale\":{\"width\":3840,\"height\":2160}}");
+    expect(parse_start_body(body, cfg, code, field, msg),
+           "v4 body with scale parses");
+    expect(cfg.outputs[0].transcode.scale_width == 3840, "scale width parsed");
+    expect(cfg.outputs[0].transcode.scale_height == 2160, "scale height parsed");
+  }
+
+  // av1 IS a target now. (Whether it can reach a given protocol is a separate,
+  // structural check -- see validate_test.)
+  {
+    receiver_config cfg;
+    std::string code;
+    std::string field;
+    std::string msg;
+    const std::string body = body_with_transcode("\"transcode\":{\"codec\":\"av1\"}");
+    expect(parse_start_body(body, cfg, code, field, msg),
+           "av1 transcode target is accepted");
+    expect(cfg.outputs[0].transcode.target == transcode_target::av1,
+           "transcode.target == av1");
+  }
+
+  // A scale that is not an object is a schema error, not a silent ignore.
+  {
+    receiver_config cfg;
+    std::string code;
+    std::string field;
+    std::string msg;
+    const std::string body = body_with_transcode(
+        "\"transcode\":{\"codec\":\"h264\",\"scale\":3840}");
+    expect(!parse_start_body(body, cfg, code, field, msg),
+           "non-object scale rejected");
+    expect(code == "invalid_schema", "non-object scale -> invalid_schema");
   }
 
   // transcode present but codec missing => invalid_schema on the field.

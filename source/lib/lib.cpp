@@ -423,6 +423,8 @@ auto parse_transcode_target(std::string_view str,
     out = transcode_target::h264;
   } else if (str == "h265") {
     out = transcode_target::h265;
+  } else if (str == "av1") {
+    out = transcode_target::av1;
   } else {
     return false;
   }
@@ -573,11 +575,20 @@ auto transcode_source_parser_alternatives(codec in_codec)
 auto transcode_encoder_alternatives(transcode_target target)
     -> std::vector<std::string>
 {
+  // HARDWARE ONLY. Production re-encode must be real, not nominal: a silent
+  // software fallback would "work" on a node with no usable GPU while burning the
+  // CPU it needs for ingest and fan-out, and the output would be attributed to the
+  // tier that never ran. There is deliberately no x264enc/x265enc/av1enc here --
+  // if no hardware encoder is present the preflight refuses the /start, which the
+  // operator can see, instead of degrading invisibly.
   switch (target) {
     case transcode_target::h264:
-      return {"vah264enc", "x264enc"};
+      return {"vah264enc"};
     case transcode_target::h265:
-      return {"vah265enc", "x265enc"};
+      return {"vah265enc"};
+    case transcode_target::av1:
+      // Not every GPU encodes AV1; where it does not, an AV1 target is refused.
+      return {"vaav1enc"};
     case transcode_target::none:
       return {};
   }
@@ -591,6 +602,8 @@ auto transcode_target_parser(transcode_target target) -> const char*
       return "h264parse";
     case transcode_target::h265:
       return "h265parse";
+    case transcode_target::av1:
+      return "av1parse";
     case transcode_target::none:
       return nullptr;
   }
@@ -689,14 +702,43 @@ auto required_elements(output_proto proto,
 auto validate_transcode_targets(const receiver_config& cfg,
                                 bool allow_enhanced_rtmp) -> validation_result
 {
-  if (allow_enhanced_rtmp) {
-    return {};
-  }
   for (std::size_t idx = 0; idx < cfg.outputs.size(); ++idx) {
     const output_config& out = cfg.outputs[idx];
     const bool is_rtmp = out.type == output_proto::rtmp
         || out.type == output_proto::rtmps;
-    if (is_rtmp && out.transcode.target == transcode_target::h265) {
+
+    // ---- Structural. Independent of --allow-enhanced-rtmp, because no policy
+    // flag can conjure a muxer that does not exist. ----
+    // flvmux and eflvmux expose no video/x-av1 caps even in GStreamer 1.28, so an
+    // av1 -> rtmp/rtmps output has nothing to be built with. Refusing here keeps
+    // the failure at /start instead of pipeline negotiation.
+    if (is_rtmp && out.transcode.target == transcode_target::av1) {
+      return fail("bad_enum",
+                  std::format("outputs[{}].transcode.codec", idx),
+                  "av1 -> rtmp/rtmps is not supported (no video/x-av1 in "
+                  "flvmux/eflvmux); send av1 over srt or rist");
+    }
+    // A scale needs an encoder to apply it. A copy output is a passthrough, so
+    // dropping the scale silently would hand the destination a resolution the
+    // operator did not ask for and could not see.
+    const bool wants_scale =
+        out.transcode.scale_width > 0 || out.transcode.scale_height > 0;
+    if (wants_scale && out.transcode.target == transcode_target::none) {
+      return fail("bad_enum",
+                  std::format("outputs[{}].transcode.scale", idx),
+                  "scale requires a transcode target: a copy output is a "
+                  "passthrough and cannot be rescaled");
+    }
+    if (wants_scale
+        && (out.transcode.scale_width <= 0 || out.transcode.scale_height <= 0)) {
+      return fail("bad_enum",
+                  std::format("outputs[{}].transcode.scale", idx),
+                  "scale needs BOTH width and height");
+    }
+
+    // ---- Policy. ----
+    if (!allow_enhanced_rtmp && is_rtmp
+        && out.transcode.target == transcode_target::h265) {
       return fail("bad_enum",
                   std::format("outputs[{}].transcode.codec", idx),
                   "h265 -> rtmp/rtmps requires --allow-enhanced-rtmp "
@@ -705,6 +747,7 @@ auto validate_transcode_targets(const receiver_config& cfg,
   }
   return {};
 }
+
 
 auto first_missing_requirement(const std::vector<element_requirement>& reqs,
                                const element_present_fn& present)

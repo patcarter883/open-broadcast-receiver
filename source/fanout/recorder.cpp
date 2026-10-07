@@ -123,9 +123,9 @@ auto recorder::worker() -> void
 auto recorder::stop() -> void
 {
   m_stopping.store(true, std::memory_order_release);
-  if (m_thread.joinable()) {
-    m_thread.join();
-  }
+  // The consumer slot and the fd are released BEFORE the join: a writer parked in
+  // the frame ring or on the file is freed by them, and does not observe
+  // m_stopping on its own.
   if (m_consumer >= 0) {
     m_ring.remove_consumer(m_consumer);
     m_consumer = -1;
@@ -133,6 +133,9 @@ auto recorder::stop() -> void
   if (m_fd >= 0) {
     ::close(m_fd);
     m_fd = -1;
+  }
+  if (m_thread.joinable()) {
+    m_thread.join();
   }
   m_active.store(false, std::memory_order_release);
 }

@@ -203,10 +203,41 @@ auto output_template(output_proto proto,
     return {};
   }
 
-  // Transcode target is h264 or h265 (av1 is not representable and is
-  // rejected during parsing, so it can never reach here).
+  // Transcode targets are h264, h265 and av1. av1 is representable, but only over
+  // the MPEG-TS carriers: flvmux/eflvmux expose no video/x-av1 caps, so
+  // validate_transcode_targets refuses av1 -> rtmp/rtmps at /start and it can
+  // never reach the rtmp cases below.
   const std::string enc = encoder != nullptr ? encoder : "";
   const std::string parse = transcode_target_parser(transcode.target);
+
+  // An output size is applied to the RAW frames BEFORE the encoder, so the
+  // destination receives the size it was promised rather than the ingest size.
+  //
+  // Scaling runs on the GPU (vapostproc), which accepts plain system-memory frames
+  // and uploads internally -- so the frame ring stays a GStreamer-free byte arena
+  // and needs no change. Measured on the 1080p-upscale this tier actually performs
+  // (600 frames = 10 s of video, wall/video, below 1.0 is faster than realtime):
+  //
+  //                1080p->1440p   1080p->2160p
+  //   CPU bilinear      0.71           1.13   <- fails realtime
+  //   CPU lanczos       0.71           1.21   <- fails realtime
+  //   GPU vapostproc    0.44           0.75
+  //
+  // Two conclusions. The CPU scaler CANNOT hold realtime when the ladder is climbed
+  // to 2160p, so this is what makes that tier possible rather than an optimisation
+  // of it. And the GPU is ~40% faster at 1440p too, where the CPU was only just
+  // keeping ahead. vapostproc selects its own filtering, so the separate
+  // videoscale method=lanczos choice disappears with it.
+  //
+  // The size is applied to frames on their way INTO the encoder, so a destination
+  // receives the size it was promised rather than the ingest size.
+  std::string scale;
+  if (transcode.scale_width > 0 && transcode.scale_height > 0) {
+    scale = std::format("vapostproc "
+                        "! video/x-raw,width={},height={} ! ",
+                        transcode.scale_width,
+                        transcode.scale_height);
+  }
   switch (proto) {
     case output_proto::rtmp:
     case output_proto::rtmps: {
@@ -220,36 +251,51 @@ auto output_template(output_proto proto,
       // uses the Enhanced FLV muxer (eflvmux) — legacy flvmux cannot carry
       // H.265.
       return std::format(
-          "{}! queue ! {} name=venc ! {} config-interval=-1 ! {} ! mux. "
+          "{}! queue ! {}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
           "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=d "
           "d. ! queue ! aacparse "
           "! audio/mpeg,mpegversion=4,stream-format=raw ! mux. "
           "{} name=mux streamable=true "
           "! rtmp2sink name=osink async-connect=true",
           k_appsrc,
+          scale,
           enc,
           parse,
           vcaps,
           k_audio_appsrc,
           mux);
     }
-    case output_proto::srt:
+    case output_proto::srt: {
       // Re-encoded video to a fresh TS. AAC is carried only on the rtmp path;
       // the srt/rist transcode chain is video-only.
+      // enable-custom-mappings is set ONLY for av1: mpegtsmux has no standard
+      // stream_type for it ("custom mappings for which there are no official
+      // specifications"), so without the flag the mux never negotiates. Setting
+      // it for h264/h265 would change their stream_type mapping for no reason.
+      const char* custom = transcode.target == transcode_target::av1
+          ? " enable-custom-mappings=true" : "";
       return std::format(
-          "{}! queue ! {} name=venc ! {} config-interval=-1 "
-          "! mpegtsmux alignment=7 "
+          "{}! queue ! {}{} name=venc ! {} config-interval=-1 "
+          "! mpegtsmux alignment=7{} "
           "! srtsink name=osink wait-for-connection=false",
           k_appsrc,
+          scale,
           enc,
-          parse);
-    case output_proto::rist:
+          parse,
+          custom);
+    }
+    case output_proto::rist: {
+      const char* custom = transcode.target == transcode_target::av1
+          ? " enable-custom-mappings=true" : "";
       return std::format(
-          "{}! queue ! {} name=venc ! {} config-interval=-1 "
-          "! mpegtsmux alignment=7 ! ristsink name=osink",
+          "{}! queue ! {}{} name=venc ! {} config-interval=-1 "
+          "! mpegtsmux alignment=7{} ! ristsink name=osink",
           k_appsrc,
+          scale,
           enc,
-          parse);
+          parse,
+          custom);
+    }
   }
   return {};
 }
@@ -315,23 +361,87 @@ auto output::build_pipeline(std::string& err) -> bool
       gst_app_src_set_max_bytes(GST_APP_SRC(m_audio_appsrc),
                                 k_appsrc_max_bytes);
     }
-    // Encoder tuning: bitrate/GOP only where the element exposes them
-    // (all four encoders do; guard anyway so a future element cannot abort).
+    // ---- Encoder tuning: the relay's own mechanics -------------------------
+    // This is the RELAY's business, not policy: it is about making the hardware
+    // encoder behave correctly for live fan-out. Bitrate and GOP stay the portal's
+    // decision (the portal posts them; the relay only carries them).
+    //
+    // Every set is guarded by has_property, because the three hardware encoders
+    // differ -- vaav1enc has no b-frames property, for instance -- and an
+    // unguarded set would abort the pipeline for one target while working for
+    // another.
     GstElement* venc = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
     if (venc != nullptr) {
-      if (m_cfg.transcode.bitrate_kbps != 0
-          && has_property(venc, "bitrate"))
-      {
-        g_object_set(venc,
-                     "bitrate",
-                     static_cast<gint>(m_cfg.transcode.bitrate_kbps),
-                     nullptr);
+      // Rate control: CBR. This is also the element default, but it is set
+      // explicitly because the whole point of the tier is a predictable stream per
+      // destination, and a default is not a guarantee.
+      if (has_property(venc, "rate-control")) {
+        g_object_set(venc, "rate-control", 2 /* cbr */, nullptr);
+      }
+      // bitrate=0 means "auto-calculate", which the encoder resolves to a
+      // near-lossless rate -- measured at ~440 Mbps for 720p, which starved the
+      // other outputs of frames. A CBR encoder with no bitrate is not a
+      // configuration, so refuse the silence: log it loudly and leave the encoder
+      // alone rather than pretend a target was set.
+      if (m_cfg.transcode.bitrate_kbps != 0) {
+        if (has_property(venc, "bitrate")) {
+          g_object_set(venc,
+                       "bitrate",
+                       static_cast<gint>(m_cfg.transcode.bitrate_kbps),
+                       nullptr);
+        }
+      } else {
+        log(std::format(
+            "output {}: transcode has no bitrate_kbps; the hardware encoder will "
+            "auto-calculate a near-lossless rate\n",
+            m_cfg.id));
+      }
+      // Live fan-out: no B-frames and no B-pyramid. Both add encode latency and
+      // reordering delay for a stream whose only purpose is to be relayed now.
+      if (has_property(venc, "b-frames")) {
+        g_object_set(venc, "b-frames", 0, nullptr);
+      }
+      if (has_property(venc, "b-pyramid")) {
+        g_object_set(venc, "b-pyramid", FALSE, nullptr);
+      }
+      // target-usage 1..7, higher is faster and lower is better quality. Set to
+      // the vendor's balanced default (4) explicitly rather than inherited.
+      //
+      // Measured on this driver (amd VAAPI, RX 9070): 4 and 7 produce
+      // byte-identical output in identical time, so the setting is inert here and
+      // choosing 7 bought nothing. It is NOT inert on every VAAPI driver, so the
+      // value is pinned deliberately rather than left to whatever the driver
+      // happens to default to. Do not push it to 1: measured, it OVERRAN the
+      // requested bitrate by 24% (37.2 Mbps against a 30 Mbps target), which on a
+      // live uplink is exactly the overshoot the rate is there to prevent.
+      //
+      // Bitrate, not this knob, is what sets picture quality under CBR.
+      if (has_property(venc, "target-usage")) {
+        g_object_set(venc, "target-usage", 4, nullptr);
       }
       if (m_cfg.transcode.gop != 0 && has_property(venc, "key-int-max")) {
         g_object_set(venc,
                      "key-int-max",
                      static_cast<guint>(m_cfg.transcode.gop),
                      nullptr);
+      }
+      // Report what was ACTUALLY applied. The bitrate is the one setting whose
+      // absence is invisible: the encoder just runs at its auto rate, the output
+      // still looks healthy, and the only symptom is the byte rate -- which is
+      // exactly how a silent miss here hides.
+      {
+        gint applied_bitrate = -1;
+        guint applied_gop = 0;
+        if (has_property(venc, "bitrate")) {
+          g_object_get(venc, "bitrate", &applied_bitrate, nullptr);
+        }
+        if (has_property(venc, "key-int-max")) {
+          g_object_get(venc, "key-int-max", &applied_gop, nullptr);
+        }
+        log(std::format(
+            "output {}: encoder {} bitrate={} kbps gop={} (requested {}/{})\n",
+            m_cfg.id, chosen_encoder, applied_bitrate, applied_gop,
+            m_cfg.transcode.bitrate_kbps, m_cfg.transcode.gop));
       }
       gst_object_unref(venc);
     }
@@ -561,6 +671,14 @@ auto output::start() -> bool
 auto output::stop() -> void
 {
   m_stopping.store(true, std::memory_order_release);
+  // The pipeline goes to NULL BEFORE the join. A worker blocked inside a
+  // GStreamer call (a sink connecting, an appsrc push) never observes m_stopping,
+  // and the NULL transition is what releases it -- so the join must not be
+  // attempted until the pipeline is down, or stop blocks for as long as the
+  // block lasts. destroy_pipeline() issues that transition and is idempotent.
+  if (m_pipeline != nullptr) {
+    gst_element_set_state(m_pipeline, GST_STATE_NULL);
+  }
   if (m_thread.joinable()) {
     m_thread.join();
   }

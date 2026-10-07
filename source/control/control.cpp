@@ -191,6 +191,20 @@ auto parse_start_body_json(const json& jbody) -> receiver_config
       out.transcode.bitrate_kbps =
           get_int(tr_json, "bitrate_kbps", 0, field + ".transcode");
       out.transcode.gop = get_int(tr_json, "gop", 0, field + ".transcode");
+      // schema_version 4: optional output size. Parsed here, validated as a set
+      // in validate_transcode_targets (scale needs a target, and both axes).
+      if (tr_json.contains("scale")) {
+        const json& sc_json = tr_json.at("scale");
+        if (!sc_json.is_object()) {
+          perr("invalid_schema",
+               field + ".transcode.scale",
+               "must be an object");
+        }
+        out.transcode.scale_width =
+            get_int(sc_json, "width", 0, field + ".transcode.scale");
+        out.transcode.scale_height =
+            get_int(sc_json, "height", 0, field + ".transcode.scale");
+      }
     }
     cfg.outputs.push_back(std::move(out));
     ++idx;

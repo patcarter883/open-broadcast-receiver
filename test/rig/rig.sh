@@ -34,7 +34,7 @@ start_session() {
   srs1_ip=$($COMPOSE exec -T receiver getent hosts srs1 | awk '{print $1}')
   srs2_ip=$($COMPOSE exec -T receiver getent hosts srs2 | awk '{print $1}')
   srt_ip=$($COMPOSE exec -T receiver getent hosts srt-listener | awk '{print $1}')
-  post /start "{\"schema_version\":3,\"session_id\":\"rig-1\",\"ingest\":{\"bandwidth\":6000},\"source\":{\"codec\":\"h264\"},\"outputs\":[
+  post /start "{\"schema_version\":4,\"session_id\":\"rig-1\",\"ingest\":{\"bandwidth\":6000},\"source\":{\"codec\":\"h264\"},\"outputs\":[
     {\"id\":\"rtmp1\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs1_ip}:1935/live\",\"key_or_streamid\":\"rig\"},
     {\"id\":\"rtmp2\",\"type\":\"rtmp\",\"url\":\"rtmp://${srs2_ip}:1935/live\",\"key_or_streamid\":\"rig\"},
     {\"id\":\"srt\",\"type\":\"srt\",\"url\":\"srt://${srt_ip}:9000\",\"key_or_streamid\":\"\"}]}"

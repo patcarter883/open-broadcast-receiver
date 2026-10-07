@@ -67,6 +67,10 @@ services:
       BITRATE_KBPS: "3000"
       SOURCE_CODEC: av1
     networks: [ media ]
+    # The sender encodes with a HARDWARE encoder (production does not use software
+    # encoding), so it needs the render node exactly as the receiver does. Without
+    # it the sender cannot start its encoder and the rig fails at the source.
+    devices: [ "/dev/dri:/dev/dri" ]
     depends_on: [ receiver ]
 
   prober:

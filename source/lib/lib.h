@@ -57,7 +57,11 @@ enum class transcode_target : std::uint8_t
 {
   none,
   h264,
-  h265
+  h265,
+  // av1 is a valid TARGET, but only where it can be carried: MPEG-TS (srt/rist).
+  // flvmux and eflvmux expose no video/x-av1 caps even in GStreamer 1.28, so an
+  // av1 -> rtmp/rtmps output is refused rather than built and left un-negotiated.
+  av1
 };
 
 struct transcode_config
@@ -65,6 +69,14 @@ struct transcode_config
   transcode_target target = transcode_target::none;
   int bitrate_kbps = 0;  // 0 = encoder default
   int gop = 0;           // 0 = encoder default
+  // Output size, applied BEFORE the encoder so the destination receives the size
+  // it was promised rather than the ingest size. 0 = leave native.
+  //
+  // Upscaling is a property of a RE-ENCODE, never of a copy: a copy output is a
+  // tsparse passthrough and its frames are never touched, so a scale on a
+  // copy-only output is refused at /start instead of being silently ignored.
+  int scale_width = 0;
+  int scale_height = 0;
   auto operator==(const transcode_config&) const -> bool = default;
 };
 
@@ -107,7 +119,10 @@ struct receiver_defaults
 // optional outputs[].transcode object)
 // ---------------------------------------------------------------------------
 
-inline constexpr int k_schema_version = 3;
+// 4: outputs[].transcode gains `scale`, and `codec` gains "av1". Both change what
+// a body MEANS, so an older receiver must reject the body rather than ignore the
+// parts it does not know -- a silently dropped upscale is worse than a refusal.
+inline constexpr int k_schema_version = 4;
 inline constexpr std::size_t k_max_outputs = 8;
 
 struct ingest_config

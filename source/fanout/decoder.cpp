@@ -10,6 +10,8 @@
 
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
+
+#include <cstdio>
 #include <gst/video/video.h>
 
 namespace
@@ -28,6 +30,51 @@ auto registry_has_element(const char* name) -> bool
   gst_object_unref(factory);
   return true;
 }
+
+// Route tsdemux's dynamic src pads to the video branch BY CAPS. The decode stage
+// only needs video: the audio in the ingest is carried independently (the rtmp
+// transcode branch re-demuxes the source TS for its AAC), so an audio pad here is
+// ignored rather than linked to something that cannot take it.
+static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data)
+{
+  auto* targets = static_cast<pad_targets*>(data);
+  if (targets == nullptr) {
+    return;
+  }
+  GstElement* vqueue = targets->video;
+  GstElement* adrop = targets->other;
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  if (caps == nullptr) {
+    caps = gst_pad_query_caps(pad, nullptr);
+  }
+  if (caps == nullptr) {
+    return;
+  }
+  const char* name = gst_structure_get_name(gst_caps_get_structure(caps, 0));
+  const bool is_video = name != nullptr && g_str_has_prefix(name, "video/");
+  // stderr, not the receiver's log: this runs from a GStreamer streaming thread
+  // and must not touch anything that could deadlock, and it still lands in
+  // `docker logs`. Whether this fires AT ALL is the decisive fact.
+  fprintf(stderr, "[decoder] demux pad-added: caps=%s video=%d\n",
+          name != nullptr ? name : "(null)", is_video ? 1 : 0);
+  gst_caps_unref(caps);
+  // Video goes to the branch; every other pad goes to adrop. Leaving a pad
+  // unlinked is NOT safe: tsdemux returns GST_FLOW_NOT_LINKED until it has a
+  // linked src pad, and the live ingest exposes audio first.
+  GstElement* dest = is_video ? vqueue : adrop;
+  if (dest == nullptr) {
+    return;
+  }
+  GstPad* sink = gst_element_get_static_pad(dest, "sink");
+  if (sink != nullptr) {
+    if (!gst_pad_is_linked(sink)) {
+      const GstPadLinkReturn lr = gst_pad_link(pad, sink);
+      fprintf(stderr, "[decoder] demux pad link (%s) -> %s (%d)\n",
+              is_video ? "video" : "other", gst_pad_link_get_name(lr), (int)lr);
+    }
+    gst_object_unref(sink);
+  }
+}
 }  // namespace
 
 auto decoder_template(codec /*in_codec*/,
@@ -37,13 +84,30 @@ auto decoder_template(codec /*in_codec*/,
   // The parse element is chosen from the source codec and the decoder from the
   // same alternatives list required_elements() preflights (lib.h), so the
   // runtime can never pick an element the preflight did not check.
+  // The video branch queue is named and referenced with NO `d.` request: tsdemux
+  // src pads are dynamic, and on GStreamer 1.28.6 a pad-agnostic `d.` link can
+  // hand the AUDIO pad to the video branch. With an AV1+AAC ingest that fed AAC
+  // into av1parse and killed the whole decode stage with "Internal data stream
+  // error", starving every transcode output while the copy path stayed healthy
+  // (DT-12 -- the encoder hit exactly this; the decode stage had not).
   return std::format(
+      // caps=video/mpegts,systemstream=true is MANDATORY: tsparse will not link
+      // to an uncaps'd source, and the failure surfaces as a bare
+      // "Internal data stream error" on the decode stage -- starving every
+      // transcode output while the copy path (which never parses) stays healthy.
       "appsrc name=dsrc is-live=true do-timestamp=true format=time "
-      "block=true max-bytes=4194304 "
+      "block=true max-bytes=4194304 caps=video/mpegts,systemstream=true "
       "! tsparse set-timestamps=true alignment=7 "
       "! tsdemux name=d "
-      "d. ! queue ! {} ! {} ! videoconvert ! video/x-raw,format=NV12 "
-      "! appsink name=dsink sync=false max-buffers=8 drop=true",
+      "queue name=vqueue ! {} ! {} ! videoconvert ! video/x-raw,format=NV12 "
+      "! appsink name=dsink sync=false max-buffers=8 drop=true "
+      // adrop exists so EVERY demux src pad can be linked. tsdemux emits its pads
+      // as it parses, and it returns GST_FLOW_NOT_LINKED while it has NO linked src
+      // pad -- so if only the video pad is consumed and the audio pad is exposed
+      // first (which the live ingest does), the very first push into the decode
+      // appsrc is fatal and the video pad is never reached. Sinking the non-video
+      // pads costs nothing and removes the race entirely.
+      "fakesink name=adrop sync=false",
       source_parser,
       decoder);
 }
@@ -70,11 +134,18 @@ auto decoder::log(const std::string& msg) const -> void
 auto decoder::stop() -> void
 {
   m_stopping.store(true, std::memory_order_release);
+  // Everything that can RELEASE a blocked thread happens before the join, because
+  // a thread parked in a GStreamer call or waiting on the frame ring never sees
+  // m_stopping: the NULL transition frees the former, m_frames.close() wakes the
+  // latter. Joining first would block stop for as long as the park lasts.
+  if (m_pipeline != nullptr) {
+    gst_element_set_state(m_pipeline, GST_STATE_NULL);
+  }
+  m_frames.close();  // wake every blocked transcode consumer
   if (m_thread.joinable()) {
     m_thread.join();
   }
   destroy_pipeline();
-  m_frames.close();  // wake every blocked transcode consumer
   if (m_consumer >= 0) {
     m_ring.remove_consumer(m_consumer);
     m_consumer = -1;
@@ -118,6 +189,13 @@ auto decoder::build_pipeline(std::string& err) -> bool
 
   const std::string tmpl =
       decoder_template(m_in_codec, parser->c_str(), decode->c_str());
+  // Log the elements actually chosen and the exact pipeline. Every external factor
+  // has been checked (bytes, demuxer, plugins, GStreamer version, GPU, permissions)
+  // and the same template succeeds outside the receiver, so the remaining question
+  // is what THIS process builds and what it selects at runtime.
+  fprintf(stderr, "[decoder] source codec=%s parser=%s decoder=%s\n",
+          to_string(m_in_codec), parser->c_str(), decode->c_str());
+  fprintf(stderr, "[decoder] pipeline: %s\n", tmpl.c_str());
   GError* gerr = nullptr;
   m_pipeline = gst_parse_launch(tmpl.c_str(), &gerr);
   if (m_pipeline == nullptr || gerr != nullptr) {
@@ -129,6 +207,27 @@ auto decoder::build_pipeline(std::string& err) -> bool
     destroy_pipeline();
     return false;
   }
+
+  // Link tsdemux's src pads by caps -- never by a bare `d.` request (see the
+  // template comment). The queue is created by the parse and left unlinked, which
+  // gst_parse_launch tolerates without error (verified on 1.28.6).
+  GstElement* demux = gst_bin_get_by_name(GST_BIN(m_pipeline), "d");
+  GstElement* vqueue = gst_bin_get_by_name(GST_BIN(m_pipeline), "vqueue");
+  GstElement* adrop = gst_bin_get_by_name(GST_BIN(m_pipeline), "adrop");
+  if (demux == nullptr || vqueue == nullptr || adrop == nullptr) {
+    err = "decode pipeline is missing d/vqueue/adrop";
+    if (demux != nullptr) { gst_object_unref(demux); }
+    if (vqueue != nullptr) { gst_object_unref(vqueue); }
+    if (adrop != nullptr) { gst_object_unref(adrop); }
+    destroy_pipeline();
+    return false;
+  }
+  pad_targets targets {vqueue, adrop};
+  m_pad_targets = targets;
+  g_signal_connect(demux, "pad-added", G_CALLBACK(on_demux_pad_added), &m_pad_targets);
+  gst_object_unref(demux);
+  gst_object_unref(vqueue);
+  gst_object_unref(adrop);
 
   m_appsrc = gst_bin_get_by_name(GST_BIN(m_pipeline), "dsrc");
   m_appsink = gst_bin_get_by_name(GST_BIN(m_pipeline), "dsink");
@@ -170,6 +269,30 @@ auto decoder::start() -> bool
     m_failed.store(true, std::memory_order_relaxed);
     return false;
   }
+
+  // Report what the pipeline actually reached and whether the demux exposed
+  // anything: a bare "Internal data stream error" says nothing about which of the
+  // two failed, and this is cheap.
+  GstState st = GST_STATE_VOID_PENDING;
+  GstState pending = GST_STATE_VOID_PENDING;
+  const GstStateChangeReturn scr =
+      gst_element_get_state(m_pipeline, &st, &pending, GST_SECOND);
+  GstElement* d = gst_bin_get_by_name(GST_BIN(m_pipeline), "d");
+  int src_pads = 0;
+  if (d != nullptr) {
+    GstIterator* it = gst_element_iterate_src_pads(d);
+    GValue item = G_VALUE_INIT;
+    while (gst_iterator_next(it, &item) == GST_ITERATOR_OK) {
+      src_pads++;
+      g_value_reset(&item);
+    }
+    g_value_unset(&item);
+    gst_iterator_free(it);
+    gst_object_unref(d);
+  }
+  log(std::format("pipeline state={} ({}) demux src pads={}\n",
+                  static_cast<int>(st),
+                  gst_element_state_change_return_get_name(scr), src_pads));
 
   m_stopping.store(false, std::memory_order_release);
   m_thread = std::thread([this]() -> void { worker(); });
@@ -215,6 +338,8 @@ auto decoder::worker() -> void
 {
   std::vector<std::uint8_t> tsbuf(k_read_chunk);
   bool announced_failure = false;
+  bool announced_first_feed = false;
+  std::size_t total_fed = 0;
 
   while (!m_stopping.load(std::memory_order_acquire)) {
     // 1) bus: surface a decoder error once, then keep draining the ring so a
@@ -229,10 +354,21 @@ auto decoder::worker() -> void
       gchar* dbg = nullptr;
       gst_message_parse_error(msg, &gerr, &dbg);
       if (!announced_failure) {
+        // Name the element and keep GStreamer's own debug string. The generic
+        // "Internal data stream error" only says SOMETHING failed to negotiate;
+        // `dbg` carries which element and why, and it was being read and thrown
+        // away -- which is why this stage could fail with no usable evidence.
+        GstObject* src = GST_MESSAGE_SRC(msg);
+        const std::string who =
+            (src != nullptr && GST_OBJECT_NAME(src) != nullptr)
+            ? GST_OBJECT_NAME(src)
+            : "?";
         const std::string text =
             (gerr != nullptr && gerr->message != nullptr) ? gerr->message
                                                           : "unknown";
-        log("decode error: " + text + "\n");
+        log("decode error from " + who + ": " + text
+            + (dbg != nullptr ? (" -- " + std::string {dbg}) : std::string {})
+            + "\n");
         announced_failure = true;
       }
       m_failed.store(true, std::memory_order_relaxed);
@@ -249,6 +385,12 @@ auto decoder::worker() -> void
           m_consumer, tsbuf.data(), tsbuf.size(), k_read_timeout);
       if (got == 0) {
         break;
+      }
+      total_fed += got;
+      if (!announced_first_feed) {
+        log("first TS chunk fed to the decode stage: " + std::to_string(got)
+            + " bytes\n");
+        announced_first_feed = true;
       }
       GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
       gst_buffer_fill(gbuf, 0, tsbuf.data(), got);

@@ -30,6 +30,16 @@
 //
 // A decoder failure is contained: the feeder logs and stops producing, the
 // session and copy outputs are unaffected, and transcode outputs simply idle.
+// Where each tsdemux src pad goes. BOTH are required: tsdemux returns
+// GST_FLOW_NOT_LINKED while it has no linked src pad, and the live ingest exposes
+// its audio pad before its video pad -- so a stage that consumes only the video pad
+// dies on its first push and never reaches the video pad at all. The non-video pads
+// are sunk to remove that race (and because this stage does not decode audio).
+struct pad_targets {
+  GstElement* video = nullptr;  // transcode branch: queue -> parser -> decoder
+  GstElement* other = nullptr;  // everything else, sunk
+};
+
 class decoder
 {
 public:
@@ -85,6 +95,10 @@ private:
   GstElement* m_pipeline = nullptr;
   GstElement* m_appsrc = nullptr;  // ref held via gst_bin_get_by_name
   GstElement* m_appsink = nullptr;
+  // Kept alive for the lifetime of the pad-added signal connection, which is passed
+  // a pointer to this rather than to one element, because both destinations are
+  // needed to keep tsdemux flowing.
+  pad_targets m_pad_targets;
   GstBus* m_bus = nullptr;
 };
 
