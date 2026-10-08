@@ -77,6 +77,12 @@ auto print_usage(const char* argv0) -> void
       << "  --rtt-max <ms>          RIST recovery RTT max (default 500)\n"
       << "  --reorder-buffer <ms>   RIST reorder hold-off (default 30; keep well\n"
       << "                          below buffer-min or retransmission is starved)\n"
+      << "  --session-timeout <ms>  RIST peer session timeout (default 5000). A\n"
+      << "                          flow takes the MAX across peers, so this governs\n"
+      << "                          the receiver. librist raises it to >= 4x\n"
+      << "                          keepalive and then declares a peer dead at\n"
+      << "                          max(2x recovery buffer, this), so pair it with\n"
+      << "                          --buffer-max to have any effect.\n"
       << "  --help                  Show this help\n\n"
       << "The receiver terminates one RIST/TS ingest and fans it out, copy-only\n"
       << "(H.264+AAC), to up to 8 RTMP/RTMPS/SRT/RIST outputs over an in-process\n"
@@ -179,6 +185,7 @@ auto main(int argc, char** argv) -> int
   int rtt_min = receiver_defaults::rtt_min_ms;
   int rtt_max = receiver_defaults::rtt_max_ms;
   int reorder_buffer = receiver_defaults::reorder_buffer_ms;
+  int session_timeout = receiver_defaults::session_timeout_ms;
 
   for (int idx = 1; idx < argc; ++idx) {
     const std::string_view arg = argv[idx];
@@ -289,6 +296,10 @@ auto main(int argc, char** argv) -> int
       if (!next(reorder_buffer)) {
         return 2;
       }
+    } else if (arg == "--session-timeout") {
+      if (!next(session_timeout)) {
+        return 2;
+      }
     } else {
       std::cerr << "Unknown argument: " << arg << "\n";
       print_usage(argv[0]);
@@ -359,7 +370,7 @@ auto main(int argc, char** argv) -> int
 
   const auto do_start = [&ctx, &lifecycle, &sess, &teardown, &egress, &opts,
                          rist_port, buffer_min, buffer_max, rtt_min, rtt_max,
-                         reorder_buffer](receiver_config& cfg,
+                         reorder_buffer, session_timeout](receiver_config& cfg,
                                          std::string& err_code,
                                          std::string& err_field,
                                          std::string& err_msg,
@@ -376,6 +387,7 @@ auto main(int argc, char** argv) -> int
     cfg.ingest.rtt_min = rtt_min;
     cfg.ingest.rtt_max = rtt_max;
     cfg.ingest.reorder_buffer = reorder_buffer;
+    cfg.ingest.session_timeout = session_timeout;
 
     if (ctx.state.is_running.load(std::memory_order_acquire)) {
       std::string current_session;

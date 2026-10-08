@@ -72,6 +72,31 @@ private:
 
   mutable std::mutex m_flow_mutex;
   rist_flow_stat m_flow;
+
+  // ~1 s window for the OOB telemetry and for the GET /stats quality figure.
+  //
+  // librist delivers receiver_flow counters as PER-INTERVAL deltas —
+  // rist_receiver_flow_statistics() memsets flow->stats_instant on every
+  // emission — and it emits far more often than the ~1 Hz the wrapper asks for
+  // (the receiver flow's stats interval is never applied upstream, so the
+  // loop's `stats_next_time += stats_report_time` gate never advances and the
+  // callback runs at the protocol loop's event rate: measured on the rig at
+  // ~15/s idle and ~150/s under loss). A quality ratio over a ~7 ms window
+  // swings across its whole range on a single NACK, which is what ratcheted the
+  // encoder's ABR to the floor. Summing the deltas here reconstructs the true
+  // ~1 s window, so the OOB control signal matches the shape of the encoder's
+  // local (sender-side) figure.
+  static constexpr int64_t k_oob_interval_ms = 1000;
+  mutable std::mutex m_acc_mutex;
+  int64_t m_acc_start_ms = 0;
+  uint64_t m_acc_received = 0;
+  uint64_t m_acc_missing = 0;
+  uint64_t m_acc_recovered = 0;
+  uint64_t m_acc_recovered_one = 0;
+  uint64_t m_acc_lost = 0;
+  uint64_t m_acc_reordered = 0;
+  uint64_t m_acc_samples = 0;  // per-window emission count (diagnostic)
+  uint32_t m_acc_worst_rtt = 0;
 };
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_RECEIVE_RECEIVE_H
