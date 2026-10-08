@@ -112,6 +112,14 @@ struct receiver_defaults
   static constexpr int rtt_min_ms = 40;
   static constexpr int rtt_max_ms = 500;
   static constexpr int reorder_buffer_ms = 30;
+  // How long a peer may be silent before it is declared dead. A flow's session
+  // timeout is the MAX across its peers, so THIS value -- the receiver's own peer
+  // -- governs the receiver's flow regardless of what a bridge advertises
+  // (RISTNet.cpp copies mSessionTimeout onto every peer). librist raises it to at
+  // least 4 x keepalive, and then declares a peer dead at
+  // max(2 x recovery buffer, this value), so shortening this on its own changes
+  // nothing unless --buffer-max comes down with it.
+  static constexpr int session_timeout_ms = 5000;
 };
 
 // ---------------------------------------------------------------------------
@@ -134,6 +142,7 @@ struct ingest_config
   int rtt_min = receiver_defaults::rtt_min_ms;
   int rtt_max = receiver_defaults::rtt_max_ms;
   int reorder_buffer = receiver_defaults::reorder_buffer_ms;
+  int session_timeout = receiver_defaults::session_timeout_ms;
   auto operator==(const ingest_config&) const -> bool = default;
 };
 

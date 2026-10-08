@@ -119,13 +119,27 @@ auto rist_receive::start(const receiver_config& cfg,
     }
     const rist_stats_receiver_flow& flow = stats.stats.receiver_flow;
 
-    double quality = flow.quality;
-    if (quality < 0.0) {
-      quality = 0.0;
-    } else if (quality > 100.0) {
-      quality = 100.0;
+    // Accumulate this emission's PER-INTERVAL deltas into a ~1 s window.
+    // librist resets flow->stats_instant on every emission, so these are deltas
+    // for however long the last interval was — and upstream emits far more often
+    // than the ~1 Hz the wrapper asks for (a 0 stats interval never advances the
+    // loop's deadline, so the callback runs at the protocol loop's event rate:
+    // ~15/s idle, ~150/s under loss). Summing them is what turns the figure back
+    // into a true ~1 s window, the shape the encoder's local path uses.
+    const int64_t now_ms = steady_ms();
+    {
+      std::lock_guard<std::mutex> guard(m_acc_mutex);
+      if (m_acc_start_ms == 0) {
+        m_acc_start_ms = now_ms;
+      }
+      m_acc_received += flow.received;
+      m_acc_missing += flow.missing;
+      m_acc_recovered += flow.recovered;
+      m_acc_recovered_one += flow.recovered_one_retry;
+      m_acc_lost += flow.lost;
+      m_acc_reordered += flow.reordered;
+      m_acc_samples += 1;
     }
-    const auto link_quality = static_cast<uint8_t>(quality + 0.5);
 
     uint32_t worst_rtt = flow.rtt;
     if (flow.peers != nullptr) {
@@ -136,24 +150,86 @@ auto rist_receive::start(const receiver_config& cfg,
       }
     }
 
+    // Window bookkeeping. Fold this interval's worst RTT into the window
+    // maximum, and return early while the window is still open: the point of the
+    // window is that NOTHING is sent, reported or acted on until a full ~1 s of
+    // samples has accumulated.
+    uint64_t w_received = 0;
+    uint64_t w_missing = 0;
+    uint64_t w_recovered = 0;
+    uint64_t w_recovered_one = 0;
+    uint64_t w_lost = 0;
+    uint64_t w_reordered = 0;
+    uint64_t w_samples = 0;
+    uint32_t w_rtt = 0;
+    double w_quality = 100.0;
+    {
+      std::lock_guard<std::mutex> guard(m_acc_mutex);
+      if (worst_rtt > m_acc_worst_rtt) {
+        m_acc_worst_rtt = worst_rtt;
+      }
+      if (now_ms - m_acc_start_ms < k_oob_interval_ms) {
+        return;  // still inside the window — accumulate only
+      }
+      w_received = m_acc_received;
+      w_missing = m_acc_missing;
+      w_recovered = m_acc_recovered;
+      w_recovered_one = m_acc_recovered_one;
+      w_lost = m_acc_lost;
+      w_reordered = m_acc_reordered;
+      w_samples = m_acc_samples;
+      w_rtt = m_acc_worst_rtt;
+      m_acc_start_ms = now_ms;
+      m_acc_received = 0;
+      m_acc_missing = 0;
+      m_acc_recovered = 0;
+      m_acc_recovered_one = 0;
+      m_acc_lost = 0;
+      m_acc_reordered = 0;
+      m_acc_samples = 0;
+      m_acc_worst_rtt = 0;
+      // Quality over the WHOLE window. NOT received/(received+missing): librist
+      // keeps `missing` as a LIVE queue depth — incremented when a gap is seen
+      // (rist-common.c:1054) and DECREMENTED as the retransmit lands (:1517,
+      // :1555) — so by the time a ~1 s window closes it reads ~0 and the ratio
+      // pins at 100 no matter how much loss there was (measured: 8.7% of packets
+      // dropped on the wire, missing=0). A window figure must instead count every
+      // packet that had to be retransmitted, or was abandoned:
+      //     Q = 100 * received / (received + recovered + lost)
+      // which is the receiver-side analogue of the sender's retransmission
+      // penalty, and honours "the buffer should drop if there are
+      // retransmissions".
+      const uint64_t denom = w_received + w_recovered + w_lost;
+      w_quality = denom > 0
+          ? (100.0 * static_cast<double>(w_received)
+             / static_cast<double>(denom))
+          : 100.0;
+    }
+    if (w_quality < 0.0) {
+      w_quality = 0.0;
+    } else if (w_quality > 100.0) {
+      w_quality = 100.0;
+    }
+    const auto link_quality = static_cast<uint8_t>(w_quality + 0.5);
+
     if (m_state != nullptr) {
       m_state->link_quality.store(link_quality, std::memory_order_relaxed);
-      m_state->worst_rtt.store(worst_rtt, std::memory_order_relaxed);
+      m_state->worst_rtt.store(w_rtt, std::memory_order_relaxed);
     }
 
-    // Full snapshot for GET /stats (§1.4): everything this vendored librist's
-    // receiver_flow exposes, including the per-peer counters (presence
-    // verified at implementation — closes TRANSPORT_PROFILE §5.1).
+    // Full snapshot for GET /stats (§1.4): the ~1 s window, so what a reviewer
+    // reads is the same figure the encoder's ABR acts on, plus the latest
+    // per-peer counters.
     {
       std::lock_guard<std::mutex> guard(m_flow_mutex);
-      m_flow.quality = quality;
-      m_flow.rtt_ms = flow.rtt;
-      m_flow.received = flow.received;
-      m_flow.missing = flow.missing;
-      m_flow.recovered = flow.recovered;
-      m_flow.recovered_one_retry = flow.recovered_one_retry;
-      m_flow.lost = flow.lost;
-      m_flow.reordered = flow.reordered;
+      m_flow.quality = w_quality;
+      m_flow.rtt_ms = w_rtt;
+      m_flow.received = w_received;
+      m_flow.missing = w_missing;
+      m_flow.recovered = w_recovered;
+      m_flow.recovered_one_retry = w_recovered_one;
+      m_flow.lost = w_lost;
+      m_flow.reordered = w_reordered;
       m_flow.bandwidth_bps = flow.bandwidth;
       m_flow.retry_bandwidth_bps = flow.retry_bandwidth;
       m_flow.peers.clear();
@@ -171,17 +247,28 @@ auto rist_receive::start(const receiver_config& cfg,
       }
     }
 
-    // Send the 5-byte wan_telemetry back to the encoder (best-effort). The
-    // vendored sendOOBData is patched to NOT tear down the receiver on a
-    // transient failure (DECISIONS.md §6).
+    // Send the 5-byte wan_telemetry back to the encoder (best-effort), once per
+    // ~1 s window. The vendored sendOOBData is patched to NOT tear down the
+    // receiver on a transient failure (DECISIONS.md §6).
     rist_peer* peer_ptr = m_peer.load(std::memory_order_acquire);
+    bool oob_ok = false;
     if (peer_ptr != nullptr) {
       uint8_t pkt[sizeof(wan_telemetry)];
       pkt[0] = link_quality;
-      const uint32_t net_order = htonl(worst_rtt);
+      const uint32_t net_order = htonl(w_rtt);
       std::memcpy(&pkt[1], &net_order, sizeof(net_order));
-      m_receiver->sendOOBData(peer_ptr, pkt, sizeof(pkt));
+      oob_ok = m_receiver->sendOOBData(peer_ptr, pkt, sizeof(pkt));
     }
+
+    log("oob window: " + std::to_string(w_samples) + " flow-stats emission(s),"
+        " quality=" + std::to_string(static_cast<int>(link_quality))
+        + " received=" + std::to_string(w_received)
+        + " missing=" + std::to_string(w_missing)
+        + " recovered=" + std::to_string(w_recovered)
+        + " lost=" + std::to_string(w_lost)
+        + " rtt=" + std::to_string(w_rtt) + "ms"
+        + " peer=" + (peer_ptr != nullptr ? "yes" : "NULL")
+        + " oob_sent=" + (oob_ok ? "ok" : "FAIL") + "\n");
   };
 
   m_receiver->clientDisconnectedCallback =
@@ -200,6 +287,24 @@ auto rist_receive::start(const receiver_config& cfg,
   RISTNetReceiver::RISTNetReceiverSettings settings;
   settings.mProfile = RIST_PROFILE_ADVANCED;  // must match encoder
   settings.mLogLevel = RIST_LOG_INFO;
+  // Rig diagnostics. The ARQ path reports only at DEBUG — "Datagram N is
+  // missing, sending NACK!" and "too late ... to send NACK!" — and whether NACKs
+  // are being emitted at all is the difference between "the link is clean" and
+  // "loss is invisible to RIST" (the latter makes every quality figure read 100
+  // and starves ABR of any signal). Overridable so a diagnostic run can capture
+  // it without a rebuild: RIST_LOG_LEVEL=debug|info|warn|error.
+  if (const char* level = std::getenv("RIST_LOG_LEVEL")) {
+    const std::string want = level;
+    if (want == "debug") {
+      settings.mLogLevel = RIST_LOG_DEBUG;
+    } else if (want == "warn") {
+      settings.mLogLevel = RIST_LOG_WARN;
+    } else if (want == "error") {
+      settings.mLogLevel = RIST_LOG_ERROR;
+    } else {
+      settings.mLogLevel = RIST_LOG_INFO;
+    }
+  }
   if (settings.mLogSetting) {
     settings.mLogSetting->log_cb = &librist_log_cb;
   }
@@ -209,6 +314,10 @@ auto rist_receive::start(const receiver_config& cfg,
   settings.mPeerConfig.recovery_rtt_max = cfg.ingest.rtt_max;
   settings.mPeerConfig.recovery_reorder_buffer = cfg.ingest.reorder_buffer;
   settings.mPeerConfig.recovery_maxbitrate = cfg.ingest.bandwidth;
+  // The receiver's own peer timeout. This is the value that actually governs the
+  // flow (a flow takes the MAX across its peers), so tuning it here -- not on the
+  // bridge's output URL -- is what shortens a failover gap.
+  settings.mSessionTimeout = cfg.ingest.session_timeout;
   if (!opts.psk.empty()) {
     // Secrets never enter URLs: the PSK rides the settings struct into
     // rist_peer_config.secret. Hosted sessions always set it (BACKPLANE §1.1).
