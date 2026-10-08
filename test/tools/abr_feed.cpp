@@ -159,7 +159,20 @@ void on_stats(abr_state* f, const rist_stats& s)
 // sends back — lib.h:57 {uint8 link_quality; uint32 worst_case_rtt;} packed.
 void on_oob(abr_state* f, const uint8_t* buf, size_t size)
 {
-  if (f->source != abr_source::oob || size < k_telemetry_len) {
+  // EXACT size, not >=. A rist2rist bridge carries its OWN OOB traffic (auth and
+  // RTT/api messages — e.g. "auth,10.231.110.3:35329,0.0.0.0:6000"), and those
+  // arrive in this same callback. Accepting anything >= 5 bytes let those be
+  // scored as quality (buf[0] = 'a' = 97 -> 100), which is how a run through the
+  // bridge produced a handful of bogus samples. The receiver always sends the
+  // packed 5-byte wan_telemetry, so anything else is not telemetry.
+  if (f->source != abr_source::oob || size != k_telemetry_len) {
+    if (f->source == abr_source::oob && std::getenv("ABR_OOB_TRACE") != nullptr) {
+      std::fprintf(stderr,
+                   "abr_feed: oob NON-telemetry size=%zu first=%u bytes="
+                   "%.*s\n",
+                   size, size > 0 ? buf[0] : 0, static_cast<int>(size > 24 ? 24 : size),
+                   reinterpret_cast<const char*>(buf));
+    }
     return;
   }
   const double link_quality = static_cast<double>(buf[0]);
