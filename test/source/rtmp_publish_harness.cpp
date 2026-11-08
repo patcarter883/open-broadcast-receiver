@@ -26,7 +26,13 @@
 //                         probe has to drop the pad and video must still reach
 //                         the server.
 //   transcode-av          h264 transcode, frame ring plus a real AAC-in-MPEG-TS
-//                         clip in the ts_ring (the audio copy branch).
+//                         clip in the ts_ring (the audio copy branch). Judged on
+//                         what the MUXER's audio pad received: AAC-LC 48 kHz
+//                         stereo raw with codec_data 1190, and not zero buffers.
+//   transcode-av1         the real decode stage runs on an AV1-in-MPEG-TS file
+//                         and its frames are transcoded. --fixture-audio
+//                         declares that the file also carries AAC, which puts it
+//                         on the transcode-av audio assertions as well.
 //   copy-av               copy-only tier (tsparse/tsdemux/flvmux) fed an
 //                         H.264+AAC MPEG-TS clip.
 //   copy-video-only       copy-only tier fed a video-only MPEG-TS clip. Expected
@@ -100,6 +106,10 @@ struct options
   std::string stream = "test";
   std::string stat_url = "http://127.0.0.1:18080/stat";
   std::string fixture;  // AV1-in-MPEG-TS input for the transcode-av1 mode
+  // What that fixture carries. The AV1 clip is a file, so its tracks are
+  // declared rather than generated here; a clip with AAC takes the same audio
+  // path as transcode-av and must prove audio reaches the muxer.
+  bool fixture_has_audio = false;
   int duration_s = 12;
   int fps = 30;
   int width = 640;
@@ -136,11 +146,13 @@ struct options
   return m != mode::copy_video_only;
 }
 
-// transcode-av1 is fed an AV1 MPEG-TS that carries no audio, so it takes the
-// same video-only path as transcode-video-only (the audio-pad probe must
-// retire the capless pad).
-[[nodiscard]] auto has_audio(mode m) -> bool
+// transcode-av1 is fed an AV1 MPEG-TS from a file, so whether it carries audio
+// is a property of that file (--fixture-audio) rather than of the mode.
+[[nodiscard]] auto has_audio(mode m, bool fixture_audio) -> bool
 {
+  if (m == mode::transcode_av1) {
+    return fixture_audio;
+  }
   return m == mode::transcode_av || m == mode::copy_av;
 }
 
@@ -161,7 +173,9 @@ auto usage(const char* argv0) -> void
                "[--stream test]\n"
                "          [--stat-url http://127.0.0.1:18080/stat] "
                "[--duration 12] [--fps 30]\n"
-               "          [--fixture build/av1-fixture.ts]  (transcode-av1)\n",
+               "          [--fixture build/av1-fixture.ts]  (transcode-av1)\n"
+               "          [--fixture-audio]  (transcode-av1: the fixture carries "
+               "AAC)\n",
                argv0);
 }
 
@@ -617,6 +631,21 @@ auto bus_sync_handler(GstBus* /*bus*/, GstMessage* message, gpointer data)
   return GST_BUS_PASS;
 }
 
+// The muxer's audio pad is requested from the source TS's audio pad-added
+// signal, so it does not exist when the pipeline is parsed. Probes installed
+// only on the pads present at parse time therefore never see an audio buffer,
+// and an audio run reads as "audio never reached the muxer" while the muxer is
+// publishing audio. Sink pads are instrumented as they appear for that reason.
+auto mux_pad_added(GstElement* /*element*/, GstPad* pad, gpointer data) -> void
+{
+  auto* inst = static_cast<instruments*>(data);
+  if (GST_PAD_DIRECTION(pad) != GST_PAD_SINK) {
+    return;
+  }
+  gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, &mux_sink_probe, inst,
+                    nullptr);
+}
+
 auto install_instruments(instruments& inst, GstElement* pipeline) -> void
 {
   inst.pipeline = GST_ELEMENT(gst_object_ref(pipeline));
@@ -658,6 +687,7 @@ auto install_instruments(instruments& inst, GstElement* pipeline) -> void
                       nullptr);
     gst_object_unref(src);
   }
+  g_signal_connect(mux, "pad-added", G_CALLBACK(&mux_pad_added), &inst);
   gst_object_unref(mux);
 }
 
@@ -813,6 +843,8 @@ auto main(int argc, char** argv) -> int
       opts.stat_url = next();
     } else if (arg == "--fixture") {
       opts.fixture = next();
+    } else if (arg == "--fixture-audio") {
+      opts.fixture_has_audio = true;
     } else if (arg == "--duration") {
       opts.duration_s = std::atoi(next().c_str());
     } else if (arg == "--fps") {
@@ -886,7 +918,7 @@ auto main(int argc, char** argv) -> int
       return 1;
     }
   } else if (is_copy_mode(opts.run_mode)) {
-    ts_clip = has_audio(opts.run_mode)
+    ts_clip = has_audio(opts.run_mode, opts.fixture_has_audio)
         ? make_h264_aac_ts(opts.width, opts.height, opts.bitrate_kbps,
                            fixture_seconds)
         : make_h264_ts(opts.width, opts.height, opts.bitrate_kbps,
@@ -904,7 +936,7 @@ auto main(int argc, char** argv) -> int
       std::fprintf(stderr, "FAIL: could not generate NV12 frames\n");
       return 1;
     }
-    if (has_audio(opts.run_mode)) {
+    if (has_audio(opts.run_mode, opts.fixture_has_audio)) {
       ts_clip = make_aac_ts(128000, fixture_seconds);
       if (ts_clip.empty()) {
         std::fprintf(stderr, "FAIL: could not generate the AAC-in-TS fixture\n");
@@ -1108,15 +1140,47 @@ auto main(int argc, char** argv) -> int
   // additional assertions about behaviour that "bytes arrived" alone would not
   // pin down. Diagnostics must run while the attempt's pipeline still exists.
   const auto mux_audio_final = inst.mux_audio_buffers.load();
+  std::string mux_audio_caps;
+  bool mux_audio_pad_seen = false;
+  {
+    std::lock_guard<std::mutex> guard(inst.mutex);
+    mux_audio_caps = inst.audio_caps;
+  }
+  mux_audio_pad_seen = inst.audio_pad_seen.load();
   bool ok = server_grew == expects_publish(opts.run_mode);
   std::string mode_failure;
-  if (ok && server_grew && has_audio(opts.run_mode) && mux_audio_final == 0) {
-    ok = false;
-    mode_failure = "audio never reached the muxer";
+  if (ok && server_grew && has_audio(opts.run_mode, opts.fixture_has_audio)) {
+    if (!mux_audio_pad_seen) {
+      ok = false;
+      mode_failure = "the source TS carried audio but no muxer audio pad "
+                     "was requested";
+    } else if (mux_audio_final == 0) {
+      ok = false;
+      mode_failure = "audio never reached the muxer";
+    } else if (mux_audio_caps.find("stream-format=(string)raw")
+                   == std::string::npos
+               || mux_audio_caps.find("rate=(int)48000") == std::string::npos
+               || mux_audio_caps.find("channels=(int)2") == std::string::npos
+               || mux_audio_caps.find("codec_data=(buffer)1190")
+                      == std::string::npos) {
+      // The destination contract is AAC-LC 48 kHz stereo with the
+      // AudioSpecificConfig in codec_data; FLV carries exactly that. A muxer
+      // fed ADTS frames or another rate publishes audio YouTube cannot play.
+      ok = false;
+      mode_failure = "muxer audio input is not AAC-LC 48 kHz stereo raw with "
+                     "codec_data 1190";
+    }
   }
-  if (ok && server_grew && !has_audio(opts.run_mode) && mux_audio_final != 0) {
-    ok = false;
-    mode_failure = "audio reached the muxer in a video-only mode";
+  if (ok && server_grew && !has_audio(opts.run_mode, opts.fixture_has_audio)) {
+    if (mux_audio_final != 0) {
+      ok = false;
+      mode_failure = "audio reached the muxer in a video-only mode";
+    } else if (mux_audio_pad_seen) {
+      // flvmux emits nothing while a requested audio pad carries no buffers,
+      // so the only shape a video-only ingest may take is no audio pad at all.
+      ok = false;
+      mode_failure = "a video-only ingest handed the muxer an audio pad";
+    }
   }
   // The decode mode exists to prove the AV1 -> NV12 -> H.264 -> RTMP chain, so
   // publishing without the decode stage having produced frames would be a pass

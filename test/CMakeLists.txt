@@ -70,6 +70,19 @@ if(NOT OBR_TESTS_ONLY)
   target_compile_features(pipeline_build_test PRIVATE cxx_std_20)
   add_test(NAME pipeline_build_test COMMAND pipeline_build_test)
 
+  # audio_branch_test runs the transcode template's audio branch against real
+  # MPEG-TS sources it generates: an AAC-in-TS must negotiate the declared
+  # AAC-LC 48 kHz stereo raw caps, and a video-only TS must run through without
+  # exposing an audio pad or stalling.
+  add_executable(audio_branch_test source/audio_branch_test.cpp)
+  target_link_libraries(audio_branch_test PRIVATE
+    fanout_lib
+    PkgConfig::gstreamer
+    Threads::Threads)
+  target_compile_features(audio_branch_test PRIVATE cxx_std_20)
+  add_test(NAME audio_branch_test COMMAND audio_branch_test)
+  set_tests_properties(audio_branch_test PROPERTIES TIMEOUT 180)
+
   # decode_fallback_test exercises decoder selection with real pipelines: it
   # generates AV1 fixtures in-process, forces a hardware refusal (4:4:4 against
   # vaav1dec's profile=main caps) and asserts the stage degrades to av1dec with
