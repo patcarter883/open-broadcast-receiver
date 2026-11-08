@@ -45,25 +45,29 @@ capture box.
 Sample run (300-frame fixture, 10 s of ingest):
 
 ```
-t    rist_recv ts_in    out_state out_bytes_sent frames_dropped reconnects sink_path:ready  sink_bytes_received
-4    500       947520   running   39654720       0              0          none:false       0
-5    509       1705536  running   94263168       0              0          live/e2e:true    740250
-8    478       3854564  running   252686564      0              0          live/e2e:true    1891712
-12   0         6319432  running   418274632      0              0          live/e2e:true    3097955
+t    rist_recv ts_in    out_state out_bytes_published frames_dropped reconnects sink_path:ready  sink_bytes_received
+4    515       979104   running   19093               0              0          none:false       0
+5    477       1697640  running   910062              0              0          live/e2e:true    903670
+8    492       3982216  running   3790906             0              0          live/e2e:true    3799236
+12   1         6529992  running   6949594             0              0          live/e2e:true    6983040
 
-[decoder] in=207 chunks/6171 KiB demux=433 decoded=298 sink=298 level=0 KiB dec=vaav1dec fallback=0 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
-sink bytesReceived   740250 -> 3097955 (growth 2357705)
+[decoder] in=264 chunks/6376 KiB demux=432 decoded=297 sink=297 level=0 KiB dec=vaav1dec fallback=0 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
+sink bytesReceived   903670 -> 6983040 (growth 6079370)
 output state         running in 11 sample(s), reconnects 0
-read back from sink  codec_name=h264 width=1280 height=720 nb_read_frames=92 (905347 B pulled)
-VERDICT: PUBLISHES — 298 frames decoded by vaav1dec, sink received 2357705 B,
-         and a decodable H.264 stream reads back out of the RTMP server
+read back from sink  (1792270 B pulled, ffprobe -count_packets)
+  stream 0: video/h264 1280x720 packets=72
+  stream 1: audio/aac packets=143
+VERDICT: PUBLISHES — 297 frames decoded by vaav1dec, sink received 6830743 B,
+         and BOTH streams read back out of the RTMP server:
+         h264 video 72 packets, aac audio 143 packets
 ```
 
 The verdict needs all of: a `running` output, `reconnects 0` (a publish that only
 happened across rebuilt attempts is not a publish), the sink's own counter growing
 by ≥ 32 KiB, and an H.264 stream at the ingest resolution read back out of the
-server. `bytes_sent` is printed but never decides: for a transcode output it counts
-NV12 frames pushed into the appsrc and grows even when nothing reaches RTMP.
+server. `out_bytes_published` (the /stats `bytes_published_total`) tracks the
+server's counter to within a percent in the samples above, but it is measured at
+the sink pad and so cannot prove arrival: the verdict still rests on the server.
 
 Two configuration facts it depends on:
 
@@ -125,8 +129,21 @@ host.
 ```
 [decoder] in=31 chunks/440 KiB demux=126 decoded=86 sink=86 level=0 KiB dec=vaav1dec fallback=0 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
 [output local-rtmp] running=1 sink_bytesReceived=470601
-GUARD OK: 86 frames decoded by vaav1dec, output running, sink received 470601 bytes
+bytes_published_total=475457 frames_published_total=113 bytes_sent=475457
+published/sink=1.0103
+rist received_total=342 received_window=0 lost_total=0 lost_window=0
+old formula (decoded raw frames + ingest) would have reported 30172160 bytes = 64.11x the sink
+GUARD OK: 86 frames decoded by vaav1dec, output running, sink received 470601 bytes, /stats bytes_published_total=475457 (1.0103x the sink; the residual is rtmp2sink's not-yet-flushed buffer and the sink's own framing)
 ```
+
+The guard also fails unless `bytes_published_total` is within 0.7-1.3 of the
+sink's `bytesReceived`, `frames_published_total` is non-zero, `bytes_sent`
+equals `bytes_published_total`, and each `rist.*_total` is at least its
+`*_window`. That last check is visible in the sample: `received_total=342` with
+`received_window=0` — a consumer differencing the window figure reads zero while
+342 packets arrived. The `old formula` line is the figure the counter used to
+report (raw NV12 frame bytes plus ingest bytes) so the contrast is measured on
+the same run, not asserted from history.
 
 Two consecutive `ctest -R receiver_e2e_guard` runs take ~9 s each and leave no
 `mediamtx`, `rist_feed` or receiver process behind.
@@ -152,10 +169,11 @@ locally; the destination is a local nginx-rtmp sink.
     test/harness/rtmp_publish_harness.sh
 
 The point is the verdict rule: **the server's own byte count decides**. The
-receiver's `bytes_sent` counts pushes into the appsrc and has read healthy on a
-rig while the connection sat idle, so the harness never trusts it. Likewise the
-muxer's sink pads are probed rather than the appsrc's caps, because an appsrc can
-be negotiated and accepting buffers while everything downstream of it is stalled.
+receiver's `bytes_published_total` is measured at the destination sink pad and
+tracks the server closely, but it cannot prove the bytes arrived, so the harness
+never trusts it. Likewise the muxer's sink pads are probed rather than the
+appsrc's caps, because an appsrc can be negotiated and accepting buffers while
+everything downstream of it is stalled.
 
 ## What it drives
 
@@ -237,7 +255,7 @@ Per-run report:
     mux sink audio       same for the audio pad
     mux src emitted      buffers/bytes the muxer actually produced
     server bytes_in      the sink's counter, with baseline and delta
-    output bytes_sent    the appsrc push counter, printed for comparison only
+    output published     sink-pad bytes and buffers, printed for comparison only
 
 When a mode fails, the report also prints every element's state, each mux sink
 pad's caps and link state, the `osrc`/`asrc` caps, all bus ERROR/WARNING/EOS
@@ -375,9 +393,9 @@ All three, from data the receiver does not produce:
 3. 3 s of the published stream are pulled **back out** of the RTMP server with
    `ffmpeg -c copy` and probe as H.264 video with frames in it.
 
-`bytes_sent` is printed but never trusted: for a transcode output it counts the
-NV12 frames pushed into the video `appsrc` (≈230 MB for 10 s of 720p), so it
-grows healthily even when nothing reaches RTMP.
+`bytes_published_total` is printed but never trusted for the verdict: it is the
+bytes handed to the sink pad, so a stalled network path can leave it growing
+while the server takes nothing.
 
 On failure the verdict names the first stage that stopped — RIST ingest, TS
 ring, decode appsrc, tsdemux, decoder, or the output — with the counters that

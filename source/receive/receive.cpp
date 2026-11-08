@@ -70,6 +70,18 @@ auto rist_receive::start(const receiver_config& cfg,
   m_push = std::move(push);
   m_peer.store(nullptr, std::memory_order_release);
 
+  // A session's totals start at zero: rist_receive outlives a session (one
+  // listener object, started per /start), so the counters must be cleared here
+  // rather than relying on construction.
+  {
+    std::lock_guard<std::mutex> guard(m_acc_mutex);
+    m_acc.reset();
+  }
+  {
+    std::lock_guard<std::mutex> guard(m_flow_mutex);
+    m_flow = rist_flow_stat {};
+  }
+
   // (Re)create the receiver and wire callbacks. Recreated on the v4 retry
   // below — a failed initReceiver leaves the instance torn down.
   const auto wire_receiver = [this]() -> void
@@ -119,28 +131,6 @@ auto rist_receive::start(const receiver_config& cfg,
     }
     const rist_stats_receiver_flow& flow = stats.stats.receiver_flow;
 
-    // Accumulate this emission's PER-INTERVAL deltas into a ~1 s window.
-    // librist resets flow->stats_instant on every emission, so these are deltas
-    // for however long the last interval was — and upstream emits far more often
-    // than the ~1 Hz the wrapper asks for (a 0 stats interval never advances the
-    // loop's deadline, so the callback runs at the protocol loop's event rate:
-    // ~15/s idle, ~150/s under loss). Summing them is what turns the figure back
-    // into a true ~1 s window, the shape the encoder's local path uses.
-    const int64_t now_ms = steady_ms();
-    {
-      std::lock_guard<std::mutex> guard(m_acc_mutex);
-      if (m_acc_start_ms == 0) {
-        m_acc_start_ms = now_ms;
-      }
-      m_acc_received += flow.received;
-      m_acc_missing += flow.missing;
-      m_acc_recovered += flow.recovered;
-      m_acc_recovered_one += flow.recovered_one_retry;
-      m_acc_lost += flow.lost;
-      m_acc_reordered += flow.reordered;
-      m_acc_samples += 1;
-    }
-
     uint32_t worst_rtt = flow.rtt;
     if (flow.peers != nullptr) {
       for (uint32_t idx = 0; idx < flow.peer_count; ++idx) {
@@ -150,61 +140,58 @@ auto rist_receive::start(const receiver_config& cfg,
       }
     }
 
-    // Window bookkeeping. Fold this interval's worst RTT into the window
-    // maximum, and return early while the window is still open: the point of the
-    // window is that NOTHING is sent, reported or acted on until a full ~1 s of
-    // samples has accumulated.
-    uint64_t w_received = 0;
-    uint64_t w_missing = 0;
-    uint64_t w_recovered = 0;
-    uint64_t w_recovered_one = 0;
-    uint64_t w_lost = 0;
-    uint64_t w_reordered = 0;
-    uint64_t w_samples = 0;
-    uint32_t w_rtt = 0;
-    double w_quality = 100.0;
+    // Fold this emission's PER-INTERVAL deltas into a ~1 s window and into the
+    // session-cumulative totals. librist resets flow->stats_instant on every
+    // emission, so each field is a delta for however long the last interval was
+    // — and upstream emits far more often than the ~1 Hz the wrapper asks for
+    // (a 0 stats interval never advances the loop's deadline, so the callback
+    // runs at the protocol loop's event rate: ~15/s idle, ~150/s under loss).
+    // Summing them is what turns the figure back into a true ~1 s window, the
+    // shape the encoder's local path uses, while the totals are what a rate
+    // consumer differences.
+    rist_flow_window win;
     {
       std::lock_guard<std::mutex> guard(m_acc_mutex);
-      if (worst_rtt > m_acc_worst_rtt) {
-        m_acc_worst_rtt = worst_rtt;
-      }
-      if (now_ms - m_acc_start_ms < k_oob_interval_ms) {
+      if (!m_acc.add(rist_flow_delta {
+                         .received = flow.received,
+                         .missing = flow.missing,
+                         .recovered = flow.recovered,
+                         .recovered_one_retry = flow.recovered_one_retry,
+                         .lost = flow.lost,
+                         .reordered = flow.reordered,
+                         .worst_rtt_ms = worst_rtt},
+                     steady_ms(), k_oob_interval_ms, win))
+      {
         return;  // still inside the window — accumulate only
       }
-      w_received = m_acc_received;
-      w_missing = m_acc_missing;
-      w_recovered = m_acc_recovered;
-      w_recovered_one = m_acc_recovered_one;
-      w_lost = m_acc_lost;
-      w_reordered = m_acc_reordered;
-      w_samples = m_acc_samples;
-      w_rtt = m_acc_worst_rtt;
-      m_acc_start_ms = now_ms;
-      m_acc_received = 0;
-      m_acc_missing = 0;
-      m_acc_recovered = 0;
-      m_acc_recovered_one = 0;
-      m_acc_lost = 0;
-      m_acc_reordered = 0;
-      m_acc_samples = 0;
-      m_acc_worst_rtt = 0;
-      // Quality over the WHOLE window. NOT received/(received+missing): librist
-      // keeps `missing` as a LIVE queue depth — incremented when a gap is seen
-      // (rist-common.c:1054) and DECREMENTED as the retransmit lands (:1517,
-      // :1555) — so by the time a ~1 s window closes it reads ~0 and the ratio
-      // pins at 100 no matter how much loss there was (measured: 8.7% of packets
-      // dropped on the wire, missing=0). A window figure must instead count every
-      // packet that had to be retransmitted, or was abandoned:
-      //     Q = 100 * received / (received + recovered + lost)
-      // which is the receiver-side analogue of the sender's retransmission
-      // penalty, and honours "the buffer should drop if there are
-      // retransmissions".
-      const uint64_t denom = w_received + w_recovered + w_lost;
-      w_quality = denom > 0
-          ? (100.0 * static_cast<double>(w_received)
-             / static_cast<double>(denom))
-          : 100.0;
     }
+
+    // Window bookkeeping: nothing is sent, reported or acted on until a full
+    // ~1 s of samples has accumulated.
+    const uint64_t w_received = win.window.received;
+    const uint64_t w_missing = win.window.missing;
+    const uint64_t w_recovered = win.window.recovered;
+    const uint64_t w_recovered_one = win.window.recovered_one_retry;
+    const uint64_t w_lost = win.window.lost;
+    const uint64_t w_reordered = win.window.reordered;
+    const uint64_t w_samples = win.samples;
+    const uint32_t w_rtt = win.window.worst_rtt_ms;
+    // Quality over the WHOLE window. NOT received/(received+missing): librist
+    // keeps `missing` as a LIVE queue depth — incremented when a gap is seen
+    // (rist-common.c:1054) and DECREMENTED as the retransmit lands (:1517,
+    // :1555) — so by the time a ~1 s window closes it reads ~0 and the ratio
+    // pins at 100 no matter how much loss there was (measured: 8.7% of packets
+    // dropped on the wire, missing=0). A window figure must instead count every
+    // packet that had to be retransmitted, or was abandoned:
+    //     Q = 100 * received / (received + recovered + lost)
+    // which is the receiver-side analogue of the sender's retransmission
+    // penalty, and honours "the buffer should drop if there are
+    // retransmissions".
+    const uint64_t q_denom = w_received + w_recovered + w_lost;
+    double w_quality = q_denom > 0
+        ? (100.0 * static_cast<double>(w_received)
+           / static_cast<double>(q_denom))
+        : 100.0;
     if (w_quality < 0.0) {
       w_quality = 0.0;
     } else if (w_quality > 100.0) {
@@ -217,19 +204,23 @@ auto rist_receive::start(const receiver_config& cfg,
       m_state->worst_rtt.store(w_rtt, std::memory_order_relaxed);
     }
 
-    // Full snapshot for GET /stats (§1.4): the ~1 s window, so what a reviewer
-    // reads is the same figure the encoder's ABR acts on, plus the latest
+    // Full snapshot for GET /stats (§6a): the ~1 s window the encoder's ABR acts
+    // on, the cumulative totals a rate consumer differences, plus the latest
     // per-peer counters.
     {
       std::lock_guard<std::mutex> guard(m_flow_mutex);
       m_flow.quality = w_quality;
       m_flow.rtt_ms = w_rtt;
-      m_flow.received = w_received;
+      m_flow.received_window = w_received;
       m_flow.missing = w_missing;
-      m_flow.recovered = w_recovered;
-      m_flow.recovered_one_retry = w_recovered_one;
-      m_flow.lost = w_lost;
+      m_flow.recovered_window = w_recovered;
+      m_flow.recovered_one_retry_window = w_recovered_one;
+      m_flow.lost_window = w_lost;
       m_flow.reordered = w_reordered;
+      m_flow.received_total = win.received_total;
+      m_flow.recovered_total = win.recovered_total;
+      m_flow.recovered_one_retry_total = win.recovered_one_retry_total;
+      m_flow.lost_total = win.lost_total;
       m_flow.bandwidth_bps = flow.bandwidth;
       m_flow.retry_bandwidth_bps = flow.retry_bandwidth;
       m_flow.peers.clear();

@@ -335,12 +335,41 @@ done
 wait "${feed_pid}" 2>/dev/null || true
 feed_pid=""
 
+# ---- publish accounting ----------------------------------------------------
+# The receiver's publish figure is measured at the destination element's sink
+# pad (FLV bytes handed to rtmp2sink); MediaMTX counts the RTMP stream bytes it
+# received, so that side also carries chunk headers and the handshake. The
+# factors must agree to within the framing overhead; a wide gap means the
+# receiver is counting something other than what left the pipeline.
+sleep 2
+final_stats=$(curl -s -H "${AUTH_HEADER}" \
+  "http://127.0.0.1:${CTRL_PORT}/stats" 2>/dev/null)
+pub_bytes=$(jq -r '.outputs[0].bytes_published_total // 0' <<<"${final_stats}" 2>/dev/null)
+alias_bytes=$(jq -r '.outputs[0].bytes_sent // 0' <<<"${final_stats}" 2>/dev/null)
+pub_frames=$(jq -r '.outputs[0].frames_published_total // 0' <<<"${final_stats}" 2>/dev/null)
+rist_recv_total=$(jq -r '.rist.received_total // 0' <<<"${final_stats}" 2>/dev/null)
+rist_recv_window=$(jq -r '.rist.received_window // 0' <<<"${final_stats}" 2>/dev/null)
+rist_lost_total=$(jq -r '.rist.lost_total // 0' <<<"${final_stats}" 2>/dev/null)
+rist_lost_window=$(jq -r '.rist.lost_window // 0' <<<"${final_stats}" 2>/dev/null)
+sink=$(curl -s "http://127.0.0.1:${MTX_API_PORT}/v3/paths/list" 2>/dev/null)
+bytes=$(jq -r '.items[0].bytesReceived // 0' <<<"${sink}" 2>/dev/null)
+[[ "${bytes:-0}" =~ ^[0-9]+$ ]] && [ "${bytes}" -gt 0 ] && sink_bytes=${bytes}
+ratio=$(awk -v p="${pub_bytes:-0}" -v s="${sink_bytes}" \
+  'BEGIN { if (s > 0) printf "%.4f", p / s; else print "0" }')
+# The figure the old counter reported for this same run (raw decoded frame
+# bytes plus ingest bytes), kept as the measured contrast.
+old_formula=$(( ${decoded:-0} * FIXTURE_WIDTH * FIXTURE_HEIGHT * 3 / 2 + ${in_kib:-0} * 1024 ))
+
 echo
 echo "=== decoded ==="
 echo "${decoder_line:-<no [decoder] counters line>}"
 echo
 echo "=== published ==="
 echo "[output local-rtmp] running=${out_running} sink_bytesReceived=${sink_bytes}"
+echo "bytes_published_total=${pub_bytes:-0} frames_published_total=${pub_frames:-0} bytes_sent=${alias_bytes:-0}"
+echo "published/sink=${ratio}"
+echo "rist received_total=${rist_recv_total:-0} received_window=${rist_recv_window:-0} lost_total=${rist_lost_total:-0} lost_window=${rist_lost_window:-0}"
+echo "old formula (decoded raw frames + ingest) would have reported ${old_formula} bytes = $(awk -v o="${old_formula}" -v s="${sink_bytes}" 'BEGIN { if (s > 0) printf "%.2fx", o / s; else print "n/a" }') the sink"
 
 fail=0
 if [ -z "${decoder_line}" ]; then
@@ -367,6 +396,32 @@ if [ "${sink_bytes}" -eq 0 ]; then
   echo "FAIL: the RTMP sink received no bytes" >&2
   fail=1
 fi
+if [ "${pub_bytes:-0}" -eq 0 ]; then
+  echo "FAIL: /stats reports bytes_published_total=0 after publishing" >&2
+  fail=1
+fi
+if [ "${pub_frames:-0}" -eq 0 ]; then
+  echo "FAIL: /stats reports frames_published_total=0 after publishing" >&2
+  fail=1
+fi
+if [ "${alias_bytes:-0}" != "${pub_bytes:-0}" ]; then
+  echo "FAIL: bytes_sent (${alias_bytes:-0}) is not the alias of bytes_published_total (${pub_bytes:-0})" >&2
+  fail=1
+fi
+if ! awk -v r="${ratio}" 'BEGIN { exit !(r >= 0.7 && r <= 1.3) }'; then
+  echo "FAIL: bytes_published_total/sink_bytesReceived=${ratio} is outside 0.7-1.3" >&2
+  fail=1
+fi
+# The cumulative figure covers every window, so it can never be smaller than the
+# last one; if it is, the two are not being accumulated independently.
+if [ "${rist_recv_total:-0}" -lt "${rist_recv_window:-0}" ]; then
+  echo "FAIL: rist.received_total (${rist_recv_total:-0}) is below received_window (${rist_recv_window:-0})" >&2
+  fail=1
+fi
+if [ "${rist_lost_total:-0}" -lt "${rist_lost_window:-0}" ]; then
+  echo "FAIL: rist.lost_total (${rist_lost_total:-0}) is below lost_window (${rist_lost_window:-0})" >&2
+  fail=1
+fi
 
 if [ "${fail}" -ne 0 ]; then
   echo
@@ -376,5 +431,5 @@ if [ "${fail}" -ne 0 ]; then
   exit 1
 fi
 
-echo "GUARD OK: ${decoded} frames decoded by ${decoder_elem}, output running, sink received ${sink_bytes} bytes"
+echo "GUARD OK: ${decoded} frames decoded by ${decoder_elem}, output running, sink received ${sink_bytes} bytes, /stats bytes_published_total=${pub_bytes:-0} (${ratio}x the sink; the residual is rtmp2sink's not-yet-flushed buffer and the sink's own framing)"
 exit 0

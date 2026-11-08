@@ -96,6 +96,15 @@ struct es_sources
   }
 };
 
+// Probe data for the destination sink's sink pad: the publish counters the pad
+// probe increments. Pointers, so the probe needs no allocation and stays valid
+// for the output's lifetime.
+struct sink_publish_counters
+{
+  std::atomic<uint64_t>* bytes;
+  std::atomic<uint64_t>* frames;
+};
+
 // output — one self-contained fan-out destination (TRANSPORT_PROFILE §3.2):
 // its own small GstPipeline, its own bus handling, its own state machine and
 // backoff, its own ring cursor feeding its own appsrc. Errors are local by
@@ -173,9 +182,23 @@ public:
   {
     return m_reconnects.load(std::memory_order_relaxed);
   }
+  // Bytes the destination sink has taken off its sink pad — muxed protocol
+  // payload on its way to the wire, not the frame payload queued into the
+  // appsrc upstream of the encoder and muxer.
+  [[nodiscard]] auto bytes_published_total() const -> uint64_t
+  {
+    return m_bytes_published.load(std::memory_order_relaxed);
+  }
+  // Media buffers handed to that sink pad (video and audio tags for flvmux).
+  [[nodiscard]] auto frames_published_total() const -> uint64_t
+  {
+    return m_frames_published.load(std::memory_order_relaxed);
+  }
+  // Deprecated alias for bytes_published_total(), kept so existing readers get
+  // the truthful figure instead of the old appsrc-push sum.
   [[nodiscard]] auto bytes_sent() const -> uint64_t
   {
-    return m_bytes_sent.load(std::memory_order_relaxed);
+    return bytes_published_total();
   }
   [[nodiscard]] auto dropped_bytes() const -> uint64_t
   {
@@ -228,9 +251,8 @@ public:
   // A new reference to the current attempt's pipeline, or nullptr between
   // attempts (caller owns the reference). The local RTMP harness
   // (test/source/rtmp_publish_harness.cpp) uses it to probe the muxer's pads and
-  // read element state: only what the muxer emitted and what the server received
-  // show that an output publishes, while bytes_sent counts pushes into the
-  // appsrc and can read healthy with nothing leaving the box.
+  // read element state: a sink pad that has taken buffers says the pipeline is
+  // running, while the server's counter says the bytes arrived.
   [[nodiscard]] auto pipeline() const -> GstElement*;
 
   // Registry pre-check for /start. Returns the first unsatisfied element
@@ -370,7 +392,12 @@ private:
   // Set when the muxer's audio pad has been reported with the caps it received,
   // so the report names the negotiated format (raw + codec_data) once.
   std::atomic_bool m_muxer_audio_logged {false};
-  std::atomic<uint64_t> m_bytes_sent {0};
+  // What the sink pad itself received: the protocol element's input bytes and
+  // buffer count. This is the publish truth /stats reports.
+  std::atomic<uint64_t> m_bytes_published {0};
+  std::atomic<uint64_t> m_frames_published {0};
+  sink_publish_counters m_publish_probe {&m_bytes_published,
+                                         &m_frames_published};
   std::atomic_bool m_audio_dropped {false};
   // Buffers the muxer's audio pad actually received. Caps on that pad are not
   // data; a linked pad with no buffers is how flvmux stalls without an error,

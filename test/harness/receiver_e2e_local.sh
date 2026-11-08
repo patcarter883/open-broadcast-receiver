@@ -26,11 +26,10 @@
 #   * decode progress   — the decoder's own staged counters in its log lines
 #                         (in chunks / demux / decoded / sink / state).
 #   * publish           — the RTMP SERVER's byte counter for the path
-#                         (MediaMTX /v3/paths/list bytesReceived), which cannot
-#                         be inflated by the receiver. This matters: for a
-#                         transcode output `bytes_sent` counts NV12 frames
-#                         pushed into the video appsrc, so it grows even when
-#                         nothing reaches RTMP.
+#                         (MediaMTX /v3/paths/list bytesReceived). The output's
+#                         own `bytes_sent` aliases bytes_published_total and is
+#                         measured at the destination sink pad, but only the
+#                         server's counter proves the bytes arrived.
 #   * stream readback   — the stream is pulled back OUT of the RTMP server and
 #                         probed with `ffprobe -count_packets`: real packet
 #                         counts for h264 video, plus for aac audio when the
@@ -432,27 +431,27 @@ start_bg feed env FIXTURE="${FIXTURE}" FEED="${FEED}" RATE="${rate}" RIST_PORT="
 feed_pid=${LAST_STARTED_PID}
 
 sample() {  # $1 = elapsed seconds
-  local stats sink path ready_str bytes_sent state
+  local stats sink path ready_str sink_bytes state
   stats=$(curl -s -H "Authorization: Bearer ${TOKEN}" \
             "http://127.0.0.1:${CTRL_PORT}/stats" 2>/dev/null)
   sink=$(curl -s "http://127.0.0.1:${MTX_API_PORT}/v3/paths/list" 2>/dev/null)
   path=$(jq -r '.items[0] | if . == null then "none" else .name end' <<<"${sink}" 2>/dev/null)
   ready_str=$(jq -r '.items[0].ready // false' <<<"${sink}" 2>/dev/null)
-  bytes_sent=$(jq -r '.items[0].bytesReceived // 0' <<<"${sink}" 2>/dev/null)
+  sink_bytes=$(jq -r '.items[0].bytesReceived // 0' <<<"${sink}" 2>/dev/null)
   state=$(jq -r '.outputs[0].state // "?"' <<<"${stats}" 2>/dev/null)
   local rist_recv ts_in out_bytes dropped reconnects
   rist_recv=$(jq -r '.rist.received // 0' <<<"${stats}" 2>/dev/null)
   ts_in=$(jq -r '.ts_in.bytes_total // 0' <<<"${stats}" 2>/dev/null)
-  out_bytes=$(jq -r '.outputs[0].bytes_sent // 0' <<<"${stats}" 2>/dev/null)
+  out_bytes=$(jq -r '.outputs[0].bytes_published_total // 0' <<<"${stats}" 2>/dev/null)
   dropped=$(jq -r '.outputs[0].transcode.frames_dropped // 0' <<<"${stats}" 2>/dev/null)
   reconnects=$(jq -r '.outputs[0].reconnects // 0' <<<"${stats}" 2>/dev/null)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$1" "${rist_recv}" "${ts_in}" "${state}" "${out_bytes}" "${dropped}" \
-    "${reconnects}" "${path}:${ready_str}" "${bytes_sent}" \
+    "${reconnects}" "${path}:${ready_str}" "${sink_bytes}" \
     | tee -a "${SAMPLE_LOG}"
 }
 
-echo "t	rist_recv	ts_in	out_state	out_bytes_sent	frames_dropped	reconnects	sink_path:ready	sink_bytes_received"
+echo "t	rist_recv	ts_in	out_state	out_bytes_published	frames_dropped	reconnects	sink_path:ready	sink_bytes_received"
 pull_pid=""
 PULL_FILE="${LOG_DIR}/pulled-from-sink.flv"
 rm -f "${PULL_FILE}"
@@ -587,9 +586,10 @@ elif [[ "${max_reconnects}" -ne 0 ]]; then
 elif [[ "${sink_growth}" -lt 32768 ]]; then
   echo "VERDICT: decode OK (${decoded} frames, ${decoder_elem}), but STALLED before RTMP:"
   echo "         the sink received ${sink_growth} B (handshake only); output state was"
-  echo "         '$(tail -1 "${SAMPLE_LOG}" | cut -f4)' with bytes_sent"
-  echo "         $(tail -1 "${SAMPLE_LOG}" | cut -f5) — that counter is NV12 frames"
-  echo "         pushed into the video appsrc, not bytes on the wire."
+  echo "         '$(tail -1 "${SAMPLE_LOG}" | cut -f4)' with bytes_published_total"
+  echo "         $(tail -1 "${SAMPLE_LOG}" | cut -f5) — the output handed the sink pad"
+  echo "         that much and the destination still took only the handshake.
+"
   verdict=1
 elif [[ "${audio_mux_ok}" -ne 1 ]]; then
   echo "VERDICT: PARTIAL — the stream published, but the audio branch did not hand"

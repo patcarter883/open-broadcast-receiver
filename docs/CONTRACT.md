@@ -404,8 +404,11 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
   "ok": true, "schema_version": 5, "session_id": "s_9f2c", "ts": 1789620000123,
   "ring_size_bytes": 16777216,
   "rist": {
-    "quality": 97.4, "rtt_ms": 41, "received": 182034, "missing": 210, "recovered": 208,
-    "recovered_one_retry": 190, "lost": 2, "reordered": 44,
+    "quality": 97.4, "rtt_ms": 41,
+    "received_total": 19042318, "recovered_total": 208, "recovered_one_retry_total": 190, "lost_total": 2,
+    "received_window": 182034, "missing": 210, "recovered_window": 208,
+    "recovered_one_retry_window": 190, "lost_window": 2, "reordered": 44,
+    "received": 182034, "recovered": 208, "recovered_one_retry": 190, "lost": 2,
     "bandwidth_bps": 6210000, "retry_bandwidth_bps": 12000,
     "peers": [
       { "id": 1, "rtt_ms": 38, "avg_rtt_ms": 40.1, "received": 91000, "received_bytes": 119000000, "bandwidth_bps": 3100000 },
@@ -414,12 +417,33 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
   },
   "ts_in": { "bytes_total": 238100000 },
   "outputs": [
-    { "id": "yt", "state": "running", "bytes_sent": 912345678, "dropped_bytes": 0, "reconnects": 0 },
-    { "id": "fb", "state": "running", "bytes_sent": 909000000, "dropped_bytes": 0, "reconnects": 0, "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } }
+    { "id": "yt", "state": "running", "bytes_published_total": 18226344, "frames_published_total": 900, "bytes_sent": 18226344, "dropped_bytes": 0, "reconnects": 0 },
+    { "id": "fb", "state": "running", "bytes_published_total": 17900000, "frames_published_total": 898, "bytes_sent": 17900000, "dropped_bytes": 0, "reconnects": 0, "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } }
   ],
   "recording": { "active": true, "bytes": 912345678, "dropped_bytes": 0 }
 }
 ```
+- **`outputs[].bytes_published_total` (sink truth).** Cumulative bytes handed to the output's protocol element —
+  measured at the destination sink's sink pad, i.e. muxed FLV/MPEG-TS bytes on their way to the wire, not the raw
+  frames or ingest payload queued into the appsrc upstream of the encoder and muxer. On a transcode output those
+  upstream bytes are decoded frame bytes and are unrelated to egress. The recording-sink guard reports 475457
+  bytes against 470601 the sink received (1.01x); the residual is the sink element's not-yet-flushed buffer and
+  the destination's own framing.
+- **`outputs[].frames_published_total`.** Cumulative media buffers handed to that same sink pad (one per FLV tag /
+  TS packet group, so it counts audio tags too when an audio branch is live).
+- **`outputs[].bytes_sent`.** Deprecated alias of `bytes_published_total` — identical value, one release of
+  compatibility. It no longer reports the appsrc-push sum.
+- **`rist.*_window` vs `rist.*_total`.** librist emits its receiver-flow counters as **per-interval deltas**, so a
+  single reading is neither a window nor a total. The receiver sums them into two figures:
+  - `received_total`, `recovered_total`, `recovered_one_retry_total`, `lost_total` — **cumulative since the
+    session's listener started**. Difference or rate these.
+  - `received_window`, `recovered_window`, `recovered_one_retry_window`, `lost_window` — what the **last completed
+    ~1 s window** counted. These are already rates; differencing them yields garbage, and a consumer must not.
+  - `received`, `recovered`, `recovered_one_retry`, `lost` — deprecated aliases of the `_window` values for one
+    release. `missing` is librist's live retransmit-queue depth at window close, and `reordered` the latest instant
+    reading; neither is a count to difference.
+- **`ts_in.bytes_total` (ingest truth).** Cumulative RIST payload bytes received; the agent derives ingest bitrate
+  from its deltas. It is not publish egress and does not track `bytes_published_total`.
 - `outputs[].transcode`: present only for outputs that opted into the transcode tier, carrying the target `codec`,
   the chosen `encoder` element name and `frames_dropped` (whole-frame drop-oldest on the shared decode frame ring);
   **copy-only outputs omit it entirely**. The decoder stage decodes the ingest elementary stream once and publishes

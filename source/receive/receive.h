@@ -83,20 +83,13 @@ private:
   // callback runs at the protocol loop's event rate: measured on the rig at
   // ~15/s idle and ~150/s under loss). A quality ratio over a ~7 ms window
   // swings across its whole range on a single NACK, which is what ratcheted the
-  // encoder's ABR to the floor. Summing the deltas here reconstructs the true
-  // ~1 s window, so the OOB control signal matches the shape of the encoder's
-  // local (sender-side) figure.
+  // encoder's ABR to the floor. The accumulator sums the deltas into the true
+  // ~1 s window and into the session totals, so the OOB control signal matches
+  // the shape of the encoder's local (sender-side) figure and /stats carries
+  // both a window and a cumulative figure.
   static constexpr int64_t k_oob_interval_ms = 1000;
   mutable std::mutex m_acc_mutex;
-  int64_t m_acc_start_ms = 0;
-  uint64_t m_acc_received = 0;
-  uint64_t m_acc_missing = 0;
-  uint64_t m_acc_recovered = 0;
-  uint64_t m_acc_recovered_one = 0;
-  uint64_t m_acc_lost = 0;
-  uint64_t m_acc_reordered = 0;
-  uint64_t m_acc_samples = 0;  // per-window emission count (diagnostic)
-  uint32_t m_acc_worst_rtt = 0;
+  rist_flow_accumulator m_acc;
 };
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_RECEIVE_RECEIVE_H

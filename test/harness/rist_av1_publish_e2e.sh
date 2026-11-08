@@ -19,7 +19,7 @@
 #
 # PASS requires, all measured:
 #   * the output never reconnected during the run,
-#   * the receiver's bytes_sent grew,
+#   * the receiver's bytes_published_total grew,
 #   * mediamtx logged "is publishing to path '<app>/<key>'",
 #   * mediamtx wrote >= 256 KiB of recordable media (a handshake alone is ~3 KiB,
 #     so "greater than zero" would pass a connect-and-send-nothing publish).
@@ -41,7 +41,7 @@ rec_dir="$work/rec"
 # These are overridable because a fixed 5000/UDP collides with anything else on
 # the box that listens there (a rist2rist proxy, another harness). Without an
 # override the run "passes" the fixture check, ships its packets to the other
-# socket, and fails with bytes_sent=0 and no explanation.
+# socket, and fails with bytes_published_total=0 and no explanation.
 control_port="${CONTROL_PORT:-18081}"
 rtmp_port="${RTMP_PORT:-1935}"
 api_port="${API_PORT:-9997}"
@@ -165,13 +165,13 @@ bytes_per_s=$(( $(stat -c %s "$fixture") / seconds + 1 ))
 ) &
 feed_pid=$!
 
-printf '%-4s %-14s %-12s %-6s %-9s %s\n' t bytes_sent state recon dropped recorded_bytes
+printf '%-4s %-22s %-12s %-6s %-9s %s\n' t bytes_published_total state recon dropped recorded_bytes
 first_bytes=0
 last_bytes=0
 publishing=0
 for ((t = 2; t <= seconds + 6; t += 2)); do
   stats="$(curl -s "http://127.0.0.1:$control_port/stats")"
-  sent="$(jq -r '.outputs[0].bytes_sent // 0' <<<"$stats")"
+  sent="$(jq -r '.outputs[0].bytes_published_total // 0' <<<"$stats")"
   state="$(jq -r '.outputs[0].state // "?"' <<<"$stats")"
   recon="$(jq -r '.outputs[0].reconnects // 0' <<<"$stats")"
   dropped="$(jq -r '.outputs[0].transcode.frames_dropped // 0' <<<"$stats")"
@@ -190,11 +190,11 @@ recorded="${recorded:-0}"
 reconnects="$(curl -s "http://127.0.0.1:$control_port/stats" | jq -r '.outputs[0].reconnects // 0')"
 
 echo
-echo "bytes_sent: first=$first_bytes last=$last_bytes delta=$((last_bytes - first_bytes))"
+echo "bytes_published_total: first=$first_bytes last=$last_bytes delta=$((last_bytes - first_bytes))"
 echo "recorded:   $recorded bytes   publishing_logged=$publishing   reconnects=$reconnects"
 
 fail=0
-[ "$last_bytes" -gt "$first_bytes" ] || { echo "FAIL: bytes_sent did not grow"; fail=1; }
+[ "$last_bytes" -gt "$first_bytes" ] || { echo "FAIL: bytes_published_total did not grow"; fail=1; }
 [ "$publishing" -eq 1 ] || { echo "FAIL: the sink never reported a publish"; fail=1; }
 [ "$recorded" -ge 262144 ] || { echo "FAIL: the sink recorded under 256 KiB ($recorded)"; fail=1; }
 [ "$reconnects" -eq 0 ] || { echo "FAIL: the output reconnected $reconnects time(s)"; fail=1; }

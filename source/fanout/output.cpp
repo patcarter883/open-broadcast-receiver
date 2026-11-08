@@ -129,6 +129,24 @@ auto count_buffer_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer dat
   return GST_PAD_PROBE_PASS;
 }
 
+// Counts what the destination sink actually takes: buffer bytes and buffer
+// count at the protocol element's sink pad. The appsrc push count upstream of
+// the encoder says nothing about egress — on a transcode output it counts raw
+// decoded frames — so the publish figure is measured here.
+auto count_published_probe(GstPad* /*pad*/,
+                           GstPadProbeInfo* info,
+                           gpointer data) -> GstPadProbeReturn
+{
+  auto* counters = static_cast<sink_publish_counters*>(data);
+  GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (buf != nullptr) {
+    counters->bytes->fetch_add(gst_buffer_get_size(buf),
+                               std::memory_order_relaxed);
+    counters->frames->fetch_add(1, std::memory_order_relaxed);
+  }
+  return GST_PAD_PROBE_PASS;
+}
+
 }  // namespace
 
 
@@ -982,6 +1000,8 @@ auto output::build_pipeline(std::string& err) -> bool
   if (GstPad* pad = gst_element_get_static_pad(sink, "sink"); pad != nullptr) {
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, &count_buffer_probe,
                       &m_sink_in, nullptr);
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, &count_published_probe,
+                      &m_publish_probe, nullptr);
     gst_object_unref(pad);
   }
   gst_object_unref(sink);
@@ -1545,7 +1565,6 @@ auto output::run_once() -> bool
       set_last_error("appsrc rejected buffer (pipeline flushing)");
       return true;
     }
-    m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
   }
   return true;  // stopping
 }
@@ -1861,7 +1880,6 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
         {
           break;
         }
-        m_bytes_sent.fetch_add(agot, std::memory_order_relaxed);
       }
     }
   }
@@ -1899,7 +1917,6 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
       return false;
     }
     ++m_feed.pushed;
-    m_bytes_sent.fetch_add(vgot, std::memory_order_relaxed);
     if (m_first_video_push == std::chrono::steady_clock::time_point {}) {
       m_first_video_push = std::chrono::steady_clock::now();
     }
@@ -1943,7 +1960,6 @@ auto output::feed_es_audio() -> bool
       set_last_error("audio appsrc rejected buffer (pipeline flushing)");
       return false;
     }
-    m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
   }
 }
 
@@ -1993,7 +2009,6 @@ auto output::feed_es_copy() -> bool
     return false;
   }
   ++m_feed.pushed;
-  m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
   if (m_first_video_push == std::chrono::steady_clock::time_point {}) {
     m_first_video_push = std::chrono::steady_clock::now();
   }

@@ -48,6 +48,11 @@ add_executable(control_json_test source/control_json_test.cpp)
 target_link_libraries(control_json_test PRIVATE control_lib Threads::Threads)
 target_compile_features(control_json_test PRIVATE cxx_std_20)
 
+add_executable(rist_counter_test source/rist_counter_test.cpp)
+target_link_libraries(rist_counter_test PRIVATE control_lib receiver_lib
+    Threads::Threads)
+target_compile_features(rist_counter_test PRIVATE cxx_std_20)
+
 add_executable(appsrc_cap_test source/appsrc_cap_test.cpp)
 target_include_directories(appsrc_cap_test PRIVATE ${CMAKE_SOURCE_DIR}/source)
 target_compile_features(appsrc_cap_test PRIVATE cxx_std_20)
@@ -62,6 +67,7 @@ add_test(NAME start_parse_test COMMAND start_parse_test)
 add_test(NAME transcode_select_test COMMAND transcode_select_test)
 add_test(NAME source_codec_test COMMAND source_codec_test)
 add_test(NAME control_json_test COMMAND control_json_test)
+add_test(NAME rist_counter_test COMMAND rist_counter_test)
 add_test(NAME appsrc_cap_test COMMAND appsrc_cap_test)
 
 # GStreamer pipeline-string tests need the media stack, so they are only added
