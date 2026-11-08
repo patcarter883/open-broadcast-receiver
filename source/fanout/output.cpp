@@ -230,15 +230,25 @@ auto output_template(output_proto proto,
             + "! tsparse alignment=7 ! ristsink name=osink";
       case output_proto::rtmp:
       case output_proto::rtmps:
+        // The demuxer is left unchained: a `d.` link binds whichever pad
+        // tsdemux announces first, and a TS may announce its audio pad first.
+        // The branches are named and demux_pad_added links each pad to the
+        // branch its caps belong to: video/x-h264 -> vq, audio/mpeg -> aq,
+        // everything else -> the ddrop funnel.
+        //
+        // The audio branch ends at `acaps` and is attached to the muxer only
+        // when the source TS exposes an audio pad, so flvmux never holds a
+        // capless audio pad and video publishes on the first frame.
         return std::string {k_appsrc}
             + "! tsparse set-timestamps=true alignment=7 "
               "! tsdemux name=d "
-              "d. ! queue ! h264parse config-interval=-1 "
+              "queue name=vq ! h264parse config-interval=-1 "
               "! video/x-h264,stream-format=avc,alignment=au ! mux. "
-              "d. ! queue ! aacparse "
-              "! audio/mpeg,mpegversion=4,stream-format=raw ! mux. "
+              "queue name=aq ! aacparse ! capsfilter name=acaps "
+              "caps=audio/mpeg,mpegversion=4,stream-format=raw "
               "flvmux name=mux streamable=true latency=1000000000 "
-              "! rtmp2sink name=osink async-connect=true";
+              "! rtmp2sink name=osink async-connect=true "
+              "funnel name=ddrop ! fakesink sync=false async=false";
     }
     return {};
   }
@@ -334,7 +344,7 @@ auto output_template(output_proto proto,
           // the frames needed to catch up have already been dropped by the
           // ring. The media is live, so its pacing comes from ingest.
           "! rtmp2sink name=osink async-connect=true sync=false "
-          "funnel name=adrop ! fakesink sync=false async=false",
+          "funnel name=ddrop ! fakesink sync=false async=false",
           k_appsrc,
           scale,
           k_raw_nv12,
@@ -643,59 +653,109 @@ auto output::build_pipeline(std::string& err) -> bool
   return true;
 }
 
+auto output::link_pad_to(GstPad* pad,
+                         const char* element_name,
+                         const char* pad_name) -> bool
+{
+  if (m_pipeline == nullptr) {
+    return false;
+  }
+  GstElement* element = gst_bin_get_by_name(GST_BIN(m_pipeline), element_name);
+  if (element == nullptr) {
+    return false;
+  }
+  // A requested pad (funnel's sink_%u) takes one stream per request; a static
+  // pad is a single branch and a second stream of the same kind goes elsewhere.
+  GstPad* sink = g_str_has_suffix(pad_name, "%u")
+      ? gst_element_request_pad_simple(element, pad_name)
+      : gst_element_get_static_pad(element, pad_name);
+  bool linked = false;
+  if (sink != nullptr && !gst_pad_is_linked(sink)) {
+    const GstPadLinkReturn lr = gst_pad_link(pad, sink);
+    linked = lr == GST_PAD_LINK_OK;
+    if (!linked) {
+      log(std::format("demux pad {} could not join {} ({})\n", GST_PAD_NAME(pad),
+                      element_name, gst_pad_link_get_name(lr)));
+    }
+  }
+  if (sink != nullptr) {
+    gst_object_unref(sink);
+  }
+  gst_object_unref(element);
+  return linked;
+}
+
+// One rule for every demuxer pad: the branch a pad reaches is decided by the
+// pad's caps, never by the order pads are announced in. A pad whose caps no
+// branch handles is linked to the drop funnel — a tsdemux src pad left unlinked
+// fails the whole pipeline with "streaming stopped, reason=not-linked", so every
+// pad gets a peer, and no pad is ever handed to a parser that cannot take it.
+// The copy path's demux ("d") has a video branch; the transcode path's ("ad")
+// does not, because its video comes from the frame ring.
 auto output::demux_pad_added(GstElement* demux,
                              GstPad* pad,
                              gpointer self) -> void
 {
   auto* out = static_cast<output*>(self);
-  gchar* name = gst_pad_get_name(pad);
-  const bool is_audio = name != nullptr && g_str_has_prefix(name, "audio");
-  g_free(name);
-  if (!is_audio) {
-    // The transcode audio branch demuxes the source TS only to copy its AAC. A
-    // stream with no audio still exposes its video pad there, and a tsdemux
-    // whose src pad is left unlinked fails the whole pipeline with
-    // "streaming stopped, reason=not-linked" -- the output then reconnects
-    // forever and nothing publishes. Sink those pads into the drop funnel: the
-    // video is already carried by the frame ring, and the copy path links its
-    // own pads from the template.
-    const char* demux_name = GST_OBJECT_NAME(demux);
-    if (demux_name == nullptr || g_strcmp0(demux_name, "ad") != 0) {
+  // Which branch this pad can feed is decided by the caps it arrives with --
+  // never by its pad name and never by the order tsdemux announces its pads in.
+  // A TS can expose its audio pad first, and a chained template link would then
+  // put audio into the video branch.
+  std::string media;
+  bool aac = false;
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  if (caps != nullptr) {
+    if (gst_caps_get_size(caps) > 0) {
+      const GstStructure* str = gst_caps_get_structure(caps, 0);
+      if (const char* name = gst_structure_get_name(str); name != nullptr) {
+        media = name;
+      }
+      gint version = 0;
+      aac = gst_structure_has_name(str, "audio/mpeg")
+          && gst_structure_get_int(str, "mpegversion", &version)
+          && (version == 4 || version == 2);
+    }
+    gst_caps_unref(caps);
+  }
+  const bool video = media.starts_with("video/");
+  const bool audio = media.starts_with("audio/");
+  const bool copy_path = g_strcmp0(GST_OBJECT_NAME(demux), "d") == 0;
+
+  if (audio) {
+    if (!aac) {
+      // An AC-3 (or other) audio ES cannot enter a branch declared as AAC-LC,
+      // so it is sunk and reported instead of negotiating a link it can never
+      // satisfy. The output publishes video only.
+      out->m_audio_dropped.store(true, std::memory_order_relaxed);
+      out->log("non-AAC audio ES: output runs video-only (audio_dropped)\n");
+      out->sink_into_drop(pad);
       return;
     }
-    out->sink_into_drop(pad);
-    return;
-  }
-
-  // Transcode path: route the audio pad into the declared audio branch, and
-  // attach that branch to the muxer only now that the TS has proven it carries
-  // audio. A second audio pad has nowhere to go; it is sunk like the demux's
-  // non-audio pads so its absence from the mux cannot stall the pipeline.
-  if (GstElement* acaps = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "acaps");
-      acaps != nullptr) {
-    gst_object_unref(acaps);
+    // Both tiers carry AAC through the same branch: aq -> aacparse -> acaps,
+    // attached to the muxer here, i.e. only once the TS has shown it carries
+    // audio. A second audio pad, or a link that does not take, is sunk by
+    // attach_audio_branch so it cannot stall the muxer.
     out->attach_audio_branch(pad);
     return;
   }
 
-  // Copy path: the audio branch is already linked by request pads in the
-  // template, so this only reports a non-AAC ES for /stats audio_dropped.
-  GstCaps* caps = gst_pad_get_current_caps(pad);
-  if (caps == nullptr) {
-    return;
+  if (video && copy_path && media == "video/x-h264") {
+    // The copy path carries the video ES itself, so this pad has to reach
+    // h264parse whichever position the demuxer exposed it in. FLV carries
+    // H.264 only, so any other video ES falls through to the drop funnel.
+    if (out->link_pad_to(pad, "vq", "sink")) {
+      return;
+    }
   }
-  bool aac = false;
-  if (gst_caps_get_size(caps) > 0) {
-    const GstStructure* str = gst_caps_get_structure(caps, 0);
-    gint version = 0;
-    aac = gst_structure_has_name(str, "audio/mpeg")
-        && gst_structure_get_int(str, "mpegversion", &version)
-        && (version == 4 || version == 2);
-  }
-  gst_caps_unref(caps);
-  if (!aac) {
-    out->m_audio_dropped.store(true, std::memory_order_relaxed);
-    out->log("non-AAC audio ES: output runs video-only (audio_dropped)\n");
+
+  // Video on the transcode path's audio demux (its video comes from the frame
+  // ring), a video ES FLV cannot carry, private-data streams, and a pad that
+  // arrived without caps. An unlinked demux pad stops the pipeline with
+  // "streaming stopped, reason=not-linked", which no reconnect can resolve.
+  if (!out->link_pad_to(pad, "ddrop", "sink_%u")) {
+    out->log(std::format("demux pad {} has no branch and no drop sink\n",
+                         GST_PAD_NAME(pad) != nullptr ? GST_PAD_NAME(pad)
+                                                      : "?"));
   }
 }
 
@@ -1113,11 +1173,11 @@ auto output::attach_audio_branch(GstPad* demux_pad) -> void
 // into the drop funnel.
 auto output::sink_into_drop(GstPad* pad) -> void
 {
-  GstElement* adrop = gst_bin_get_by_name(GST_BIN(m_pipeline), "adrop");
-  if (adrop == nullptr) {
+  GstElement* ddrop = gst_bin_get_by_name(GST_BIN(m_pipeline), "ddrop");
+  if (ddrop == nullptr) {
     return;
   }
-  GstPad* sink = gst_element_request_pad_simple(adrop, "sink_%u");
+  GstPad* sink = gst_element_request_pad_simple(ddrop, "sink_%u");
   if (sink != nullptr) {
     if (!gst_pad_is_linked(sink)) {
       const GstPadLinkReturn lr = gst_pad_link(pad, sink);
@@ -1129,7 +1189,7 @@ auto output::sink_into_drop(GstPad* pad) -> void
     }
     gst_object_unref(sink);
   }
-  gst_object_unref(adrop);
+  gst_object_unref(ddrop);
 }
 
 // Transcode feed: encoded VIDEO comes from the shared decode frame ring; AAC

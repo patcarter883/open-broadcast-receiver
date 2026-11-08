@@ -138,6 +138,10 @@ private:
   // Transcode feed step (video from frame_ring, AAC audio from ts_ring).
   // Returns false when the attempt should end (appsrc flushing / stopping).
   auto feed_transcode(bool& video_caps_set) -> bool;
+  // Link `pad` to `element_name`'s static pad (or to a requested pad when the
+  // pad name ends in %u). Returns true only when this call made the link.
+  auto link_pad_to(GstPad* pad, const char* element_name, const char* pad_name)
+      -> bool;
   // Set the encoded appsrc caps (raw NV12) from a decoded frame's metadata.
   auto set_video_caps(std::size_t frame_bytes,
                       const frame_ring::frame_meta& meta) -> void;
