@@ -4,7 +4,10 @@
 // Unit tests for the link-derived transcode rate (DECISIONS §20): the encoder
 // target follows the measured ingest rate with a quality floor, an absolute
 // ceiling and re-target hysteresis, and the portal's `bitrate_kbps` is only the
-// rate until a measurement exists. Framework-free; exit 0 = pass. No GStreamer.
+// rate until a measurement exists. The connect bootstrap is the rate an attempt
+// opens at before publish is confirmed, and is capped below that target so the
+// transit buffer outlasts the RTMP handshake. Framework-free; exit 0 = pass. No
+// GStreamer.
 
 #include <cstdio>
 #include <cstdlib>
@@ -91,6 +94,35 @@ auto main() -> int
   expect(bitrate_change_is_material(18000, 22000), "22% is worth re-targeting");
   expect(bitrate_change_is_material(0, 5000), "entering a real target is material");
   expect(bitrate_change_is_material(5000, 0), "leaving for the default is material");
+
+  // Connect bootstrap: an attempt opens at a rate the transit buffer can hold
+  // through the RTMP handshake, and the measured-link target is what the encoder
+  // is re-targeted to once publish is confirmed. A 5747 kbps measurement against
+  // a declared 2000 kbps derives 5172 kbps for the steady target; the attempt
+  // has to open at 2000 instead, not at that target.
+  expect_eq(derive_transcode_bitrate_kbps(5747, 2000), 5172,
+            "the steady target on a 5747 kbps measurement is still 5172");
+  expect_eq(derive_transcode_bootstrap_kbps(5747, 2000), 2000,
+            "the connect bootstrap is the declared 2000, not the 5172 target");
+  expect(derive_transcode_bootstrap_kbps(5747, 0)
+             == policy::bootstrap_ceiling_kbps,
+         "with no declared rate the bootstrap is the ceiling, not the target");
+  expect(derive_transcode_bootstrap_kbps(5747, 0)
+             < derive_transcode_bitrate_kbps(5747, 0),
+         "the bootstrap is strictly below the target it ramps to");
+  expect_eq(derive_transcode_bootstrap_kbps(5747, 800), 800,
+            "a declared rate below the ceiling is used as-is");
+  expect(derive_transcode_bootstrap_kbps(1000, 2000)
+             == derive_transcode_bitrate_kbps(1000, 2000),
+         "a link measured below the bootstrap keeps its own lower target");
+  // First attempt, no measurement yet: the bootstrap is the declared rate, which
+  // is what a fresh session has always opened with.
+  expect_eq(derive_transcode_bootstrap_kbps(0, 2000), 2000,
+            "no measurement leaves the bootstrap at the declared rate");
+  expect_eq(derive_transcode_bootstrap_kbps(0, 29860), 29860,
+            "no measurement does not cap the declared rate");
+  expect_eq(derive_transcode_bootstrap_kbps(0, 0), 0,
+            "no measurement and no declared rate leaves the encoder default");
 
   std::printf("bitrate_test: all assertions passed\n");
   return 0;

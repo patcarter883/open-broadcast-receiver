@@ -42,6 +42,14 @@
 //   copy-video-only       copy-only tier fed a video-only MPEG-TS clip. No audio
 //                         pad is announced, so the muxer's audio pad is never
 //                         requested and video alone publishes.
+//   reconnect             transcode-video-only plus a deliberate publisher drop.
+//                         Once the publish and the measured-link ramp are proven,
+//                         the sink is restarted so the publish is severed and the
+//                         destination is briefly unreachable. The output must
+//                         rebuild at the connect bootstrap rate (not the measured
+//                         target), republish within the connect window, and ramp
+//                         back to the measured target once the new publish is
+//                         confirmed.
 //
 // Exit status 0 = observed behaviour matched the mode's expectation, 1 = it did
 // not (or the harness could not run). The numbers are always printed.
@@ -98,7 +106,8 @@ enum class mode
   copy_av,
   copy_audio_first,
   copy_non_aac,
-  copy_video_only
+  copy_video_only,
+  reconnect
 };
 
 struct options
@@ -116,6 +125,11 @@ struct options
   int height = 360;
   int bitrate_kbps = 2000;
   int gop = 30;
+  // reconnect mode: the link measurement the controller reports once the publish
+  // is established (the encoder must be at the derived target before the drop),
+  // and the command that drops the publisher (e.g. `docker restart <sink>`).
+  int measured_kbps = 6000;
+  std::string sink_restart_cmd;
 };
 
 [[nodiscard]] auto mode_name(mode m) -> const char*
@@ -135,6 +149,8 @@ struct options
       return "copy-non-aac";
     case mode::copy_video_only:
       return "copy-video-only";
+    case mode::reconnect:
+      return "reconnect";
   }
   return "unknown";
 }
@@ -175,12 +191,14 @@ auto usage(const char* argv0) -> void
   std::fprintf(stderr,
                "usage: %s [--mode transcode-av|transcode-video-only|"
                "transcode-av1|copy-av|"
-               "copy-audio-first|copy-non-aac|copy-video-only]\n"
+               "copy-audio-first|copy-non-aac|copy-video-only|reconnect]\n"
                "          [--host 127.0.0.1] [--port 11935] [--app live] "
                "[--stream test]\n"
                "          [--stat-url http://127.0.0.1:18080/stat] "
                "[--duration 12] [--fps 30]\n"
-               "          [--fixture build/av1-fixture.ts]  (transcode-av1)\n",
+               "          [--fixture build/av1-fixture.ts]  (transcode-av1)\n"
+               "          [--measured-kbps 6000 --sink-restart-cmd 'docker "
+               "restart <sink>']  (reconnect)\n",
                argv0);
 }
 
@@ -206,6 +224,9 @@ auto usage(const char* argv0) -> void
   }
   if (text == "copy-video-only") {
     return mode::copy_video_only;
+  }
+  if (text == "reconnect") {
+    return mode::reconnect;
   }
   return std::nullopt;
 }
@@ -1053,6 +1074,10 @@ auto main(int argc, char** argv) -> int
       opts.height = std::atoi(next().c_str());
     } else if (arg == "--bitrate") {
       opts.bitrate_kbps = std::atoi(next().c_str());
+    } else if (arg == "--measured-kbps") {
+      opts.measured_kbps = std::atoi(next().c_str());
+    } else if (arg == "--sink-restart-cmd") {
+      opts.sink_restart_cmd = next();
     } else {
       usage(argv[0]);
       return 1;
@@ -1253,6 +1278,55 @@ auto main(int argc, char** argv) -> int
   std::optional<long long> last_server = baseline.bytes_in;
   auto next_poll = started;
 
+  // Media pacing for the whole run, in elapsed seconds since `started`. Any loop
+  // that keeps the output alive calls this: a copy output takes TS bytes, a
+  // transcode output takes whole NV12 frames plus (for the RTMP audio branch)
+  // AAC-in-TS on the same ts_ring, and transcode-av1 only feeds TS because its
+  // frame ring is filled by the real decode stage.
+  const auto pump = [&](double elapsed) -> void {
+    if (is_copy_mode(opts.run_mode) || is_decode_mode(opts.run_mode)) {
+      const auto want = static_cast<std::size_t>(
+          elapsed / static_cast<double>(fixture_seconds)
+          * static_cast<double>(ts_clip.size()));
+      while (ts_cursor < want && ts_cursor < ts_clip.size()) {
+        const std::size_t chunk =
+            std::min<std::size_t>(1316, ts_clip.size() - ts_cursor);
+        ts_ring_instance.write(ts_clip.data() + ts_cursor, chunk);
+        ts_cursor += chunk;
+      }
+      return;
+    }
+    const std::uint64_t target =
+        static_cast<std::uint64_t>(elapsed * opts.fps) + 1U;
+    while (frames_pushed < target) {
+      const auto& frame = clip.frames[frames_pushed % clip.frames.size()];
+      frame_ring::frame_meta meta;
+      meta.pts = frames_pushed
+          * static_cast<std::uint64_t>(1'000'000'000LL / opts.fps);
+      meta.dts = meta.pts;
+      meta.flags = (frames_pushed % static_cast<std::uint64_t>(opts.fps) == 0)
+          ? frame_ring::k_flag_keyframe
+          : 0U;
+      meta.format = static_cast<std::int32_t>(GST_VIDEO_FORMAT_NV12);
+      meta.stride = opts.width;
+      if (!frame_ring_instance.write(meta, frame.data(), frame.size())) {
+        break;
+      }
+      ++frames_pushed;
+    }
+    if (!ts_clip.empty()) {
+      const auto want = static_cast<std::size_t>(
+          elapsed / static_cast<double>(fixture_seconds)
+          * static_cast<double>(ts_clip.size()));
+      while (ts_cursor < want && ts_cursor < ts_clip.size()) {
+        const std::size_t chunk =
+            std::min<std::size_t>(1316, ts_clip.size() - ts_cursor);
+        ts_ring_instance.write(ts_clip.data() + ts_cursor, chunk);
+        ts_cursor += chunk;
+      }
+    }
+  };
+
   while (std::chrono::steady_clock::now() < deadline) {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed =
@@ -1266,51 +1340,7 @@ auto main(int argc, char** argv) -> int
       }
     }
 
-    // A copy output takes TS bytes; a transcode output takes whole NV12 frames
-    // plus (for the RTMP audio branch) AAC-in-TS on the same ts_ring. The
-    // transcode-av1 mode is the exception: its frame ring is filled by the real
-    // decode stage, so the harness only feeds TS and never writes a frame.
-    if (is_copy_mode(opts.run_mode) || is_decode_mode(opts.run_mode)) {
-      const auto want = static_cast<std::size_t>(
-          elapsed / static_cast<double>(fixture_seconds)
-          * static_cast<double>(ts_clip.size()));
-      while (ts_cursor < want && ts_cursor < ts_clip.size()) {
-        const std::size_t chunk =
-            std::min<std::size_t>(1316, ts_clip.size() - ts_cursor);
-        ts_ring_instance.write(ts_clip.data() + ts_cursor, chunk);
-        ts_cursor += chunk;
-      }
-    } else {
-      const std::uint64_t target =
-          static_cast<std::uint64_t>(elapsed * opts.fps) + 1U;
-      while (frames_pushed < target) {
-        const auto& frame = clip.frames[frames_pushed % clip.frames.size()];
-        frame_ring::frame_meta meta;
-        meta.pts = frames_pushed
-            * static_cast<std::uint64_t>(1'000'000'000LL / opts.fps);
-        meta.dts = meta.pts;
-        meta.flags = (frames_pushed % static_cast<std::uint64_t>(opts.fps) == 0)
-            ? frame_ring::k_flag_keyframe
-            : 0U;
-        meta.format = static_cast<std::int32_t>(GST_VIDEO_FORMAT_NV12);
-        meta.stride = opts.width;
-        if (!frame_ring_instance.write(meta, frame.data(), frame.size())) {
-          break;
-        }
-        ++frames_pushed;
-      }
-      if (!ts_clip.empty()) {
-        const auto want = static_cast<std::size_t>(
-            elapsed / static_cast<double>(fixture_seconds)
-            * static_cast<double>(ts_clip.size()));
-        while (ts_cursor < want && ts_cursor < ts_clip.size()) {
-          const std::size_t chunk =
-              std::min<std::size_t>(1316, ts_clip.size() - ts_cursor);
-          ts_ring_instance.write(ts_clip.data() + ts_cursor, chunk);
-          ts_cursor += chunk;
-        }
-      }
-    }
+    pump(elapsed);
 
     if (now >= next_poll) {
       next_poll = now + std::chrono::milliseconds {500};
@@ -1334,6 +1364,156 @@ auto main(int argc, char** argv) -> int
     // feed runs at --fps without a per-frame sleep_until that would busy-spin
     // when the target has already been passed.
     std::this_thread::sleep_for(std::chrono::milliseconds {10});
+  }
+
+  // ---- reconnect scenario -----------------------------------------------
+  // A drop is only meaningful once a publish exists, so this runs after the
+  // server counter proved one: the sink is restarted under the running output and
+  // the rebuild has to reach publish again.
+  const bool reconnect_mode = opts.run_mode == mode::reconnect;
+  bool reconnect_ok = true;
+  std::string reconnect_failure;
+  int steady_kbps = 0;
+  int bootstrap_kbps = 0;
+  int pre_drop_kbps = 0;
+  bool saw_bootstrap = false;
+  bool sink_dropped = false;
+  bool republished = false;
+  bool ramped_back = false;
+  std::uint64_t reconnects_before = 0;
+  std::uint64_t reconnects_during = 0;
+  long long post_drop_bytes = 0;
+
+  if (reconnect_mode) {
+    if (!server_grew) {
+      reconnect_ok = false;
+      reconnect_failure = "no publish to drop: the first publish never reached "
+                          "the server";
+    } else if (opts.sink_restart_cmd.empty()) {
+      reconnect_ok = false;
+      reconnect_failure = "reconnect mode needs --sink-restart-cmd";
+    }
+  }
+
+  if (reconnect_mode && reconnect_ok) {
+    // The encoder has to be at the measured-link target before the drop, so the
+    // rebuild's bootstrap rate is a visible fall back and the ramp back after the
+    // republish is observable.
+    steady_kbps =
+        derive_transcode_bitrate_kbps(opts.measured_kbps, opts.bitrate_kbps);
+    bootstrap_kbps =
+        derive_transcode_bootstrap_kbps(opts.measured_kbps, opts.bitrate_kbps);
+    if (bootstrap_kbps >= steady_kbps) {
+      // Without a gap between the two the rebuild's rate proves nothing: a
+      // bootstrap equal to the measured target is the defect, not the subject.
+      reconnect_ok = false;
+      reconnect_failure = std::format(
+          "the scenario cannot distinguish the connect bootstrap ({} kbps) from "
+          "the measured target ({} kbps)",
+          bootstrap_kbps, steady_kbps);
+    }
+  }
+
+  if (reconnect_mode && reconnect_ok) {
+    out.retarget_bitrate(opts.measured_kbps);
+    const auto ramp_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds {5};
+    while (std::chrono::steady_clock::now() < ramp_deadline
+           && out.bitrate_kbps() != steady_kbps)
+    {
+      pump(std::chrono::duration<double>(std::chrono::steady_clock::now()
+                                         - started)
+               .count());
+      std::this_thread::sleep_for(std::chrono::milliseconds {10});
+    }
+    pre_drop_kbps = out.bitrate_kbps();
+    if (pre_drop_kbps != steady_kbps) {
+      reconnect_ok = false;
+      reconnect_failure = std::format(
+          "encoder stayed at {} kbps after a {} kbps measurement; the measured "
+          "target {} kbps was never applied",
+          pre_drop_kbps, opts.measured_kbps, steady_kbps);
+    } else {
+      // Taken before the drop: the attempt the drop kills and the attempts that
+      // retry a destination which is not back yet are what the bound is about.
+      reconnects_before = out.reconnects();
+      std::printf("reconnect            dropping the publisher: %s\n",
+                  opts.sink_restart_cmd.c_str());
+      std::fflush(stdout);
+      if (std::system(opts.sink_restart_cmd.c_str()) != 0) {
+        reconnect_ok = false;
+        reconnect_failure = "the sink restart command failed";
+      }
+    }
+  }
+
+  if (reconnect_mode && reconnect_ok) {
+    const auto republish_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds {45};
+    auto next_stat = std::chrono::steady_clock::now();
+    while (!republished && std::chrono::steady_clock::now() < republish_deadline) {
+      const auto now = std::chrono::steady_clock::now();
+      pump(std::chrono::duration<double>(now - started).count());
+      // The bootstrap rate is applied by every rebuild, so seeing it on the
+      // running encoder is the rebuild having started at the capped rate rather
+      // than the measured target.
+      if (out.bitrate_kbps() == bootstrap_kbps) {
+        saw_bootstrap = true;
+      }
+      if (now >= next_stat) {
+        next_stat = now + std::chrono::milliseconds {250};
+        const stat_probe probe = fetch_server_bytes(opts.stat_url);
+        // The restarted sink holds no stream until the output publishes again, so
+        // an empty counter is the destination being gone, not the old session
+        // still counting.
+        if (!probe.bytes_in || *probe.bytes_in == 0) {
+          sink_dropped = true;
+        } else if (sink_dropped && *probe.bytes_in >= k_server_bytes_proof) {
+          post_drop_bytes = *probe.bytes_in;
+          republished = true;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds {10});
+    }
+    reconnects_during = out.reconnects() - reconnects_before;
+    if (!republished) {
+      reconnect_ok = false;
+      reconnect_failure = std::format(
+          "no republish within 45 s of the drop ({} reconnect attempt(s), state "
+          "{}, last error {})",
+          reconnects_during, out.state_name(),
+          out.last_error().empty() ? "(none)" : out.last_error());
+    } else {
+      // Settle on the republished session: the measured-link rate must come back,
+      // otherwise the cap would have replaced live tracking instead of bounding
+      // the connect phase.
+      const auto settle_until = std::chrono::steady_clock::now()
+          + std::chrono::seconds {2};
+      while (std::chrono::steady_clock::now() < settle_until) {
+        pump(std::chrono::duration<double>(std::chrono::steady_clock::now()
+                                           - started)
+                 .count());
+        std::this_thread::sleep_for(std::chrono::milliseconds {10});
+      }
+      ramped_back = out.bitrate_kbps() == steady_kbps
+          && std::string_view {out.state_name()} == "running";
+      if (!ramped_back) {
+        reconnect_ok = false;
+        reconnect_failure = std::format(
+            "after republishing the encoder is at {} kbps in state {}; the "
+            "measured target was not restored",
+            out.bitrate_kbps(), out.state_name());
+      } else if (reconnects_during > 4) {
+        // A sink that is still restarting costs one attempt per refused connect,
+        // so a handful is a destination coming back. The defect this bounds is
+        // an output that retries past the connect window without republishing,
+        // which the republish check above already fails.
+        reconnect_ok = false;
+        reconnect_failure = std::format(
+            "the rebuild needed {} attempts to republish",
+            reconnects_during);
+      }
+    }
   }
 
   // Settle: the last buffers may still be in flight when the loop exits.
@@ -1393,6 +1573,10 @@ auto main(int argc, char** argv) -> int
   // The decode mode exists to prove the AV1 -> NV12 -> H.264 -> RTMP chain, so
   // publishing without the decode stage having produced frames would be a pass
   // for the wrong reason.
+  if (ok && reconnect_mode && !reconnect_ok) {
+    ok = false;
+    mode_failure = reconnect_failure;
+  }
   if (ok && is_decode_mode(opts.run_mode)) {
     if (decoded_frames == 0) {
       ok = false;
@@ -1555,6 +1739,22 @@ auto main(int argc, char** argv) -> int
   std::printf("server bytes_in      %lld (baseline %lld, delta %lld)\n",
               last_server ? *last_server : -1LL, *baseline.bytes_in,
               server_delta);
+  if (reconnect_mode) {
+    std::printf("connect bootstrap    %d kbps (measured target %d kbps)\n",
+                bootstrap_kbps, steady_kbps);
+    std::printf("pre-drop bitrate     %d kbps\n", pre_drop_kbps);
+    std::printf("bootstrap on rebuild %s\n", saw_bootstrap ? "yes" : "no");
+    std::printf("server dropped       %s\n", sink_dropped ? "yes" : "no");
+    if (republished) {
+      std::printf("republished          yes (%lld server bytes_in after the drop)\n",
+                  post_drop_bytes);
+    } else {
+      std::printf("republished          no\n");
+    }
+    std::printf("ramped back          %s\n", ramped_back ? "yes" : "no");
+    std::printf("reconnect attempts   %llu\n",
+                static_cast<unsigned long long>(reconnects_during));
+  }
   std::printf("output bytes_sent    %llu  (appsrc pushes, not evidence)\n",
               static_cast<unsigned long long>(bytes_sent));
   std::printf("audio pad            dropped=%s caps=%s\n",

@@ -481,3 +481,26 @@ measurement). Capping the portal value instead of replacing it: the portal's fig
 cap leaves a 29860 target in place on every link that measures lower. A per-frame ABR loop on the transcode
 output (the encoder is CBR and the measurement is a 1 s window; re-targeting on a 10% band is the same control
 at a rate the VAAPI rate control can follow).
+
+## 22. A connect attempt opens at a bootstrap rate and is not judged by the mid-stream stall window
+
+**Choice.** An attempt whose destination has not confirmed a publish runs the encoder at
+`derive_transcode_bootstrap_kbps()`: the declared `bitrate_kbps` when the link has no measurement yet, otherwise
+`min(declared bitrate or 2000 kbps, the measured target)`. Publish is confirmed when a second buffer reaches the
+destination sink's sink pad — the first one is held for the RTMP handshake, chunk-size and publish exchange, so a
+second arrival means that exchange returned and the server took media. Confirmation applies the measured target
+(§21, unchanged) and hands the transit buffer over to the 5 s stall window; before confirmation a 20 s connect
+window bounds the attempt instead.
+
+**Rationale.** `rtmp2sink` holds the first FLV tag for the length of the handshake and publish exchange (6-7 s
+against a local sink). A rebuild that opened at the measured-link target filled the transit buffer inside the
+5 s stall window, so the watchdog tore the output down before the header could land, and every subsequent
+attempt did the same: a dropped publish never came back. The two failure modes are different and need different
+budgets — a buffer held while the connect exchange is in flight is a connect in progress, and only a buffer held
+after media has been accepted is a sink that stopped draining.
+
+**Rejected.** Raising the single stall timeout to cover both cases: it would leave a genuinely wedged mid-stream
+sink undetected for the connect window on every attempt, and it would not fix the fill rate that makes the window
+unreachable in the first place. Lowering the steady-state rate instead of the connect rate: measured-link
+tracking is the reason §21 exists. Dropping the bootstrap and relying on the connect window alone: the buffer
+still fills, so the first publish after a drop lands only if the handshake completes before the buffer is full.
