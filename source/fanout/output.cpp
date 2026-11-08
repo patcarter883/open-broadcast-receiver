@@ -298,7 +298,14 @@ auto output_template(output_proto proto,
           // and unlinks the mux's audio pad if it has received nothing, so audio
           // can never gate the first video frame.
           "{}! queue ! {}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
+          // The audio branch demuxes the whole carried TS, so it sees the video
+          // PID too. tsdemux is deliberately left unchained: its pads are
+          // sometimes-pads and a chained link binds whichever pad appears
+          // first -- for an AV1+AAC multiplex that is the video pad, which then
+          // occupies the audio chain and starves the muxer. demux_pad_added
+          // links the audio pad to aq and every other pad to adrop.
           "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=ad "
+          "funnel name=adrop ! fakesink sync=false async=false "
           "queue name=aq ! aacparse "
           "! audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
           "codec_data=(buffer)1190 ! mux. "
@@ -616,12 +623,31 @@ auto output::demux_pad_added(GstElement* /*demux*/,
   gchar* name = gst_pad_get_name(pad);
   const bool is_audio = name != nullptr && g_str_has_prefix(name, "audio");
   g_free(name);
+
+  // Transcode path: the audio branch demuxes the whole carried TS, so every
+  // non-audio pad it exposes (the video PID) needs somewhere to go. An unlinked
+  // pad makes tsdemux return NOT_LINKED, which stops the audio branch. adrop is
+  // a funnel with async=false so it never holds the bin in ASYNC.
+  GstElement* adrop = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "adrop");
   if (!is_audio) {
+    if (adrop != nullptr) {
+      GstPad* sink = gst_element_request_pad_simple(adrop, "sink_%u");
+      if (sink != nullptr) {
+        if (gst_pad_link(pad, sink) != GST_PAD_LINK_OK) {
+          out->log("non-audio pad could not be linked to adrop\n");
+        }
+        gst_object_unref(sink);
+      }
+      gst_object_unref(adrop);
+    }
     return;
   }
+  if (adrop != nullptr) {
+    gst_object_unref(adrop);
+  }
 
-  // Transcode path: route the audio pad to the declared audio branch. Its caps
-  // are fixed in the template, so nothing here reads the demuxer's caps.
+  // Audio pad: route it to the declared audio branch. Its caps are fixed in the
+  // template, so nothing here reads the demuxer's caps.
   GstElement* aq = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "aq");
   if (aq != nullptr) {
     GstPad* sink = gst_element_get_static_pad(aq, "sink");
@@ -872,6 +898,7 @@ auto output::run_once() -> bool
   }
 
   m_run_started = std::chrono::steady_clock::now();
+  m_first_frame_at = std::chrono::steady_clock::time_point {};
   m_audio_probe_done = false;
 
   std::vector<uint8_t> buf(k_read_chunk);
@@ -979,7 +1006,8 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   // PAUSED with no error anywhere. Probed from the feed thread because this
   // binary runs no GLib main loop, so a g_timeout would never fire.
   if (!m_audio_probe_done && m_audio_appsrc != nullptr
-      && std::chrono::steady_clock::now() - m_run_started
+      && m_first_frame_at != std::chrono::steady_clock::time_point {}
+      && std::chrono::steady_clock::now() - m_first_frame_at
           > std::chrono::seconds(4))
   {
     m_audio_probe_done = true;
@@ -1097,6 +1125,9 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
       return false;
     }
     m_bytes_sent.fetch_add(vgot, std::memory_order_relaxed);
+    if (m_first_frame_at == std::chrono::steady_clock::time_point {}) {
+      m_first_frame_at = std::chrono::steady_clock::now();
+    }
   }
 
   return !m_stopping.load(std::memory_order_acquire);

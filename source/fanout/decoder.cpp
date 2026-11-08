@@ -3,6 +3,8 @@
 
 #include "fanout/decoder.h"
 
+#include "fanout/pts_synth.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -869,9 +871,21 @@ auto decoder::publish_sample(GstSample* sample) -> void
     return;
   }
 
+  // The destination's muxer needs a monotonic timeline: a decoded frame with
+  // no PTS (vaav1dec leaves it unset when its PES carried none) would otherwise
+  // be published at 0, in the middle of the stream, and the sink would hold the
+  // frames after it.
+  if (info.fps_n > 0) {
+    m_pts.set_frame_duration(static_cast<std::int64_t>(GST_SECOND)
+                             * info.fps_d / info.fps_n);
+  }
+  const pts_synth::stamp stamp = m_pts.next(
+      GST_BUFFER_PTS_IS_VALID(buf) != FALSE,
+      static_cast<std::int64_t>(GST_BUFFER_PTS(buf)));
+
   frame_ring::frame_meta meta;
-  meta.pts = GST_BUFFER_PTS_IS_VALID(buf) ? GST_BUFFER_PTS(buf) : 0;
-  meta.dts = GST_BUFFER_DTS_IS_VALID(buf) ? GST_BUFFER_DTS(buf) : 0;
+  meta.pts = static_cast<std::uint64_t>(stamp.pts);
+  meta.dts = static_cast<std::uint64_t>(stamp.dts);
   // An absent DELTA_UNIT flag means a keyframe (IDR / sync point).
   meta.flags = GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT)
       ? 0U

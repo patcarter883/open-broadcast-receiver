@@ -174,6 +174,11 @@ private:
   // watchdog in feed_transcode.
   std::chrono::steady_clock::time_point m_stall_since {};
   std::chrono::steady_clock::time_point m_run_started {};
+  // When the first video frame was handed to the encoder on this attempt. The
+  // audio-branch probe measures from HERE, not from pipeline start: the output
+  // is built before any RIST payload exists, so a pipeline-start clock retires
+  // a perfectly good audio branch before its first buffer can arrive.
+  std::chrono::steady_clock::time_point m_first_frame_at {};
   bool m_audio_probe_done {false};
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};

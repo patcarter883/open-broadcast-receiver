@@ -11,6 +11,11 @@ add_executable(ring_test source/ring_test.cpp)
 target_link_libraries(ring_test PRIVATE ring_lib Threads::Threads)
 target_compile_features(ring_test PRIVATE cxx_std_20)
 
+add_executable(pts_synth_test source/pts_synth_test.cpp)
+target_link_libraries(pts_synth_test PRIVATE Threads::Threads)
+target_include_directories(pts_synth_test PRIVATE ${CMAKE_SOURCE_DIR}/source)
+target_compile_features(pts_synth_test PRIVATE cxx_std_20)
+
 add_executable(frame_ring_test source/frame_ring_test.cpp)
 target_link_libraries(frame_ring_test PRIVATE ring_lib Threads::Threads)
 target_compile_features(frame_ring_test PRIVATE cxx_std_20)
@@ -32,6 +37,7 @@ target_link_libraries(control_json_test PRIVATE control_lib Threads::Threads)
 target_compile_features(control_json_test PRIVATE cxx_std_20)
 
 add_test(NAME ring_test COMMAND ring_test)
+add_test(NAME pts_synth_test COMMAND pts_synth_test)
 add_test(NAME frame_ring_test COMMAND frame_ring_test)
 add_test(NAME validate_test COMMAND validate_test)
 add_test(NAME start_parse_test COMMAND start_parse_test)
@@ -82,6 +88,14 @@ if(NOT OBR_TESTS_ONLY)
   set_tests_properties(decode_fixture_test PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 180)
+
+  # rist_feed puts an MPEG-TS byte stream on the wire exactly as the rig's
+  # sender does (ADVANCED profile, SOURCE timing, 7x188-byte chunks), so the
+  # end-to-end publish harness feeds a real receiver over a real RIST socket
+  # instead of calling the decode stage in-process.
+  add_executable(rist_feed tools/rist_feed.cpp)
+  target_link_libraries(rist_feed PRIVATE ristnet Threads::Threads)
+  target_compile_features(rist_feed PRIVATE cxx_std_20)
 
   # Local RTMP publish harness: drives the real output pipeline against a local
   # nginx-rtmp sink and judges it by the server's own byte count. It publishes,
