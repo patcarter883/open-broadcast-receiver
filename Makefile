@@ -7,6 +7,7 @@
 #   make image-pinned     # same, base image pinned to docker/base-image.lock
 #   make image-push       # THE publish command: pinned base, builds and pushes
 #                         #   <sha> (and :latest) to the registry
+#   make image-push TAG=x LATEST=0   # push only tag x, leave :latest alone
 #   make image-multiarch  # amd64+arm64, pushed (needs a registry login)
 #
 # AV1-in-MPEG-TS fixture (de-risks end-to-end integration; see
@@ -19,25 +20,30 @@
 IMAGE     ?= ghcr.io/patcarter883/open-broadcast-receiver
 PLATFORMS ?= linux/amd64
 TAG       ?=
+LATEST    ?= 1
 BUILD     := packaging/build-image.sh
 TAG_ARG   := $(if $(TAG),--tag $(TAG))
+LATEST_ARG := $(if $(filter 0,$(LATEST)),--no-latest)
 BUILD_DIR ?= build
 FIXTURE   ?= $(BUILD_DIR)/av1-fixture.ts
 
 .PHONY: image image-push image-pinned image-multiarch fixture fixture-decode help
 
 image:
-	IMAGE=$(IMAGE) $(BUILD) $(TAG_ARG) --platform $(PLATFORMS)
+	IMAGE=$(IMAGE) $(BUILD) $(TAG_ARG) $(LATEST_ARG) --platform $(PLATFORMS)
 
 # The publish path. Pinned base (docker/base-image.lock) so a rebuild of the
 # same commit resolves the same Debian packages, single platform so it can be
 # pushed as a plain image rather than a manifest list, tags <sha> + :latest.
 # Needs a registry login out of band; see docs/IMAGE.md.
+#
+# LATEST=0 suppresses the :latest tag: use it for a probe or throwaway tag that
+# must not repoint what sessions pull.
 image-push:
-	IMAGE=$(IMAGE) $(BUILD) $(TAG_ARG) --platform $(PLATFORMS) --pinned --push
+	IMAGE=$(IMAGE) $(BUILD) $(TAG_ARG) $(LATEST_ARG) --platform $(PLATFORMS) --pinned --push
 
 image-pinned:
-	IMAGE=$(IMAGE) $(BUILD) $(TAG_ARG) --platform $(PLATFORMS) --pinned
+	IMAGE=$(IMAGE) $(BUILD) $(TAG_ARG) $(LATEST_ARG) --platform $(PLATFORMS) --pinned
 
 image-multiarch:
 	IMAGE=$(IMAGE) $(BUILD) $(TAG_ARG) --platform linux/amd64,linux/arm64 --pinned --push
