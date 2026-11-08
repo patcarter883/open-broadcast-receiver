@@ -81,6 +81,56 @@ struct transcode_config
 };
 
 // ---------------------------------------------------------------------------
+// Transcode rate policy: the encoder target follows the link the receiver can
+// actually see.
+//
+// The portal's `bitrate_kbps` is computed from destination metadata (codec,
+// resolution, frame rate), which is why a 1440p h265 destination arrives as
+// ~29860 kbps no matter what the uplink is doing. The receiver holds the one
+// first-hand link figure in the path: the payload rate arriving over RIST,
+// measured once a second from the cumulative byte counter. A target above that
+// figure cannot be delivered by the link the content is already crossing, so
+// the target is derived from it and the portal value is used only until a
+// measurement exists (session just started, or the feed has not produced a
+// full window yet).
+//
+// The share keeps the re-encode below the measured rate instead of equal to
+// it: the transcode output and the retransmission it triggers both ride the
+// same budget, and a target that matches the measured rate leaves no room for
+// either.
+// ---------------------------------------------------------------------------
+struct transcode_bitrate_policy
+{
+  static constexpr int link_share_percent = 90;  // of the measured rate
+  // Quality floor: below this a transcode is not worth publishing, so a link
+  // measured above the floor never gets a lower target. A link measured BELOW
+  // the floor wins -- asking for more than the link carries is the failure this
+  // policy exists to prevent.
+  static constexpr int floor_kbps = 1000;
+  // Absolute ceiling: a single live re-encode above this is past what the
+  // hardware tier and a live uplink sustain, whatever the measurement says.
+  static constexpr int ceiling_kbps = 24000;
+  // Re-target hysteresis: a new target is only pushed to the running encoder
+  // when it differs by at least this much (kbps) AND this share (percent), so
+  // per-second measurement jitter does not thrash the rate control.
+  static constexpr int reselect_min_kbps = 500;
+  static constexpr int reselect_min_percent = 10;
+};
+
+// The encoder target for one transcode output. `measured_link_kbps` is the
+// measured payload rate (0 = no measurement); `portal_kbps` is the /start
+// value (0 = the portal asked for the encoder default). Returns 0 only when
+// there is neither a measurement nor a portal value, meaning "leave the
+// encoder at its own default".
+auto derive_transcode_bitrate_kbps(int measured_link_kbps, int portal_kbps)
+    -> int;
+
+// True when moving from `current_kbps` to `next_kbps` is worth re-targeting a
+// running encoder for (see reselect_min_* above).
+auto bitrate_change_is_material(int current_kbps, int next_kbps) -> bool;
+
+
+// ---------------------------------------------------------------------------
 // RIST OOB telemetry back-channel (receiver -> encoder). Byte-for-byte
 // identical to open-broadcast-encoder/source/lib/lib.h:53-59. The encoder
 // rejects any OOB payload whose size != sizeof(wan_telemetry). FROZEN: this

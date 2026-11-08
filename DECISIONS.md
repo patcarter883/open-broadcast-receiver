@@ -393,12 +393,16 @@ Preferring A records is the smallest change that removes the pin: no new element
 AAAA-only destination still resolves and pins an IPv6 address. Every record is still vetted, so the
 "any private record rejects the name" rebinding rule (§15) is untouched.
 
-**Rejected.** `/etc/gai.conf` `precedence ::ffff:0:0/96 100` in the image: measured on this glibc it does not
-reorder the answer at all — rule 5 (matching label) is evaluated before precedence, so Ubuntu/Debian's usual
-recipe is a no-op here, and it would only ever cover code inside this image (not the same binary run on a node).
-Also rejected: `AI_ADDRCONFIG` (silently drops AAAA records and only reflects the *local* address config, which
+**Rejected.** `AI_ADDRCONFIG` (silently drops AAAA records and only reflects the *local* address config, which
 is exactly the thing that is wrong in this failure); and a happy-eyeballs connect loop in the sink path (more
-moving parts than the bug).
+moving parts than the bug). See §20 for the image-level `/etc/gai.conf` layer, which covers the paths that dial
+by name (rtmps) rather than by pin.
+
+**Pinning is per attempt, not per session.** The pin is what makes a single `getaddrinfo` answer safe to use, not
+a promise that the answer stays valid. `output::worker` re-resolves and re-vets the name before every reconnect,
+so an address a CDN retires costs one backoff interval instead of the rest of the session; when the fresh answer
+is refused by the egress policy the previous pin is kept and the attempt fails visibly. The vetted list is never
+reused across attempts, which is what keeps §15's rebinding rule true per attempt rather than merely at `/start`.
 
 ## 19. The decode branch pins the parser's output to the decoder's sink caps
 
@@ -425,3 +429,55 @@ not discovery). A hardcoded per-codec caps table in the receiver (drifts silentl
 `av1parse`'s own default layout plus waiting for `not-negotiated` to be reported by the bus: the failure then
 costs the no-frame window and names no field, and on a session whose only output is a transcode tier the whole
 output is down for those seconds.
+
+## 20. The image ranks IPv4 first too, because not every caller dials a pin
+
+**Choice.** The runtime stage ships `/etc/gai.conf` with
+`precedence ::ffff:0:0/96 100` as a normal image layer, alongside §18's A-record pin. The pin covers the rtmp
+path (which connects to the vetted literal); the policy covers every caller that dials a NAME inside this image,
+which is the rtmps path (hostname kept so TLS validates against the platform, not an address) and anything else
+that ends up in `getaddrinfo`.
+
+**Rationale.** Measured on this image (`debian:sid`, glibc in the container):
+
+- container on the default bridge (only `::1` on `lo`): `getaddrinfo(AF_UNSPEC)` already returns all A records
+  before the AAAA ones with OR without the file. Rule 3 ("avoid unusable destinations") has already demoted the
+  family, so the recipe is inert here — which is why measuring it on a single-stack container makes it look like
+  a no-op.
+- container on an IPv6 network with a GUA (`2001:db8:77::/64`): WITHOUT the file the answer is
+  `v6 v6 v6 v6 v4 v4 v4 v4` — the production failure, and one `--add-host` away from the usual workaround. WITH
+  the file it is `v4 v4 v4 v4 v6 v6 v6 v6`.
+
+So the earlier claim that "glibc's rule 5 is evaluated before precedence, the recipe is a no-op" holds only on a
+host where IPv6 is unusable anyway; on the host shape that actually breaks (a v6 address present, no v6 path out)
+the file is exactly what reorders the answer. Both layers stay: the pin is what makes the vetted list
+authoritative, and the policy is what keeps a name-dialled connection on the same family. Neither depends on a
+specific address.
+
+**Rejected.** Writing `/etc/gai.conf` at runtime from the entrypoint (the layer is read-only, and a run-time
+mutation would be invisible to `docker inspect` and to the next image build). `--add-host a.rtmp.youtube.com:<ip>`
+at container start: pins one A record of a rotating set, and the pin outlives every reason it was chosen.
+`AI_ADDRCONFIG` in the resolver (§18).
+
+## 21. Transcode rate comes from the measured link, not from destination metadata
+
+**Choice.** `derive_transcode_bitrate_kbps()` returns `min(90% of the measured ingest rate, 24000 kbps)`, with a
+1000 kbps floor that yields when the link itself measures below it, and hysteresis (≥500 kbps AND ≥10%) before a
+running encoder is re-targeted. `outputs[].transcode.bitrate_kbps` is used only until a measurement exists. The
+measurement is payload bytes arriving over RIST, sampled once a second by a controller thread in `main`; the
+output re-derives and writes `bitrate` on the live `venc` when the change is material.
+
+**Rationale.** The portal derives the transcode rate from the destination row (codec, resolution, frame rate) and
+emits ~29860 kbps for a 1440p h265 destination on a ~20 Mbit cellular uplink: a number four times what the path
+has ever carried, produced without any knowledge of the link. The receiver is the only place in the chain that
+sees the rate the link actually delivers, and a transcode target above the rate the same content is arriving at
+cannot be justified by anything the receiver knows. Deriving it there keeps the value honest without a new wire
+field, a portal round-trip, or a second control channel; the portal value survives as the fallback for the first
+second and for a silent window, so nothing regresses before the first sample.
+
+**Rejected.** Adding a `measured_kbps` field to the wire contract (the encoder does not report one either — it
+left `measured_budget_kbps` empty on purpose — so the field would be filled by the one end that has no
+measurement). Capping the portal value instead of replacing it: the portal's figure is not an upper bound, so a
+cap leaves a 29860 target in place on every link that measures lower. A per-frame ABR loop on the transcode
+output (the encoder is CBR and the measurement is a 1 s window; re-targeting on a 10% band is the same control
+at a rate the VAAPI rate control can follow).

@@ -40,10 +40,14 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     libva2 libva-drm2 mesa-va-drivers \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 10001 -m obr
-# Address-family policy: the node networks carry no IPv6 route, so every
-# getaddrinfo() caller in this image (rtmp2sink included) must rank IPv4 above
-# IPv6 when a name answers both. Without it, the first returned address can be
-# an IPv6 one the container cannot reach, and the publish never connects.
+# Address-family policy: a name that answers both families must rank IPv4 first
+# for every getaddrinfo() caller in this image that dials a NAME (rtmps keeps
+# the hostname for TLS validation). The rtmp path does not rely on this file --
+# the receiver pins a vetted A record itself -- but a node network carries no
+# IPv6 route, so the policy is baked in rather than left to glibc's RFC 6724
+# sort, which returns AAAA first whenever the container holds a
+# routable-looking IPv6 address (measured: DECISIONS §20). Image layer, not a
+# run-time flag, so every session gets it and no address is hardcoded.
 RUN printf '%s\n' '# IPv4 first: this image runs on nodes without an IPv6 route.' \
                   'precedence ::ffff:0:0/96 100' > /etc/gai.conf
 COPY --from=build /src/build/open-broadcast-receiver /usr/local/bin/

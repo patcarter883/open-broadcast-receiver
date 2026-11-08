@@ -98,11 +98,16 @@ auto count_buffer_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer dat
 
 }  // namespace
 
-output::output(output_config cfg, ts_ring& ring, frame_ring* frames, log_fn log)
+output::output(output_config cfg,
+               ts_ring& ring,
+               frame_ring* frames,
+               log_fn log,
+               repin_fn repin)
     : m_cfg {std::move(cfg)}
     , m_ring {ring}
     , m_frames {frames}
     , m_log {std::move(log)}
+    , m_repin {std::move(repin)}
 {
 }
 
@@ -161,6 +166,53 @@ auto output::pipeline() const -> GstElement*
     return nullptr;
   }
   return GST_ELEMENT(gst_object_ref(m_pipeline));
+}
+
+auto output::retarget_bitrate(int measured_link_kbps) -> void
+{
+  if (m_cfg.transcode.target == transcode_target::none) {
+    return;  // copy-only: no encoder to re-target
+  }
+  if (measured_link_kbps < 0) {
+    measured_link_kbps = 0;
+  }
+  m_measured_link_kbps.store(measured_link_kbps, std::memory_order_relaxed);
+
+  const int target = derive_transcode_bitrate_kbps(
+      measured_link_kbps, m_cfg.transcode.bitrate_kbps);
+  if (target <= 0) {
+    return;
+  }
+  const int applied = m_applied_bitrate_kbps.load(std::memory_order_relaxed);
+  if (!bitrate_change_is_material(applied, target)) {
+    return;
+  }
+
+  // The pipeline belongs to the worker thread; take a reference under the same
+  // mutex pipeline() uses, then touch the encoder outside it. If no attempt is
+  // live, the value is picked up by the next build's target computation.
+  GstElement* pipe = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(m_pipe_mutex);
+    if (m_pipeline != nullptr) {
+      pipe = GST_ELEMENT(gst_object_ref(m_pipeline));
+    }
+  }
+  if (pipe != nullptr) {
+    GstElement* venc = gst_bin_get_by_name(GST_BIN(pipe), "venc");
+    if (venc != nullptr) {
+      if (has_property(venc, "bitrate")) {
+        g_object_set(venc, "bitrate", static_cast<gint>(target), nullptr);
+        m_applied_bitrate_kbps.store(target, std::memory_order_relaxed);
+        log(std::format(
+            "bitrate {} -> {} kbps (link measured {} kbps, portal {} kbps)\n",
+            applied, target, measured_link_kbps,
+            m_cfg.transcode.bitrate_kbps));
+      }
+      gst_object_unref(venc);
+    }
+    gst_object_unref(pipe);
+  }
 }
 
 auto output::set_last_error(const std::string& err) -> void
@@ -472,6 +524,15 @@ auto output::build_pipeline(std::string& err) -> bool
     // another.
     GstElement* venc = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
     if (venc != nullptr) {
+      // The target this attempt starts with: the link-derived rate when the
+      // controller has a measurement, else the portal's figure (0 = leave the
+      // encoder's default alone). The controller re-targets it live as the
+      // measurement moves; starting from the portal value would open every
+      // session at a rate the link has never been observed to carry.
+      const int target_kbps = derive_transcode_bitrate_kbps(
+          m_measured_link_kbps.load(std::memory_order_relaxed),
+          m_cfg.transcode.bitrate_kbps);
+
       // Rate control: CBR. This is also the element default, but it is set
       // explicitly because the whole point of the tier is a predictable stream per
       // destination, and a default is not a guarantee.
@@ -483,17 +544,19 @@ auto output::build_pipeline(std::string& err) -> bool
       // other outputs of frames. A CBR encoder with no bitrate is not a
       // configuration, so refuse the silence: log it loudly and leave the encoder
       // alone rather than pretend a target was set.
-      if (m_cfg.transcode.bitrate_kbps != 0) {
+      if (target_kbps != 0) {
         if (has_property(venc, "bitrate")) {
           g_object_set(venc,
                        "bitrate",
-                       static_cast<gint>(m_cfg.transcode.bitrate_kbps),
+                       static_cast<gint>(target_kbps),
                        nullptr);
+          m_applied_bitrate_kbps.store(target_kbps, std::memory_order_relaxed);
         }
       } else {
+        m_applied_bitrate_kbps.store(0, std::memory_order_relaxed);
         log(std::format(
-            "output {}: transcode has no bitrate_kbps; the hardware encoder will "
-            "auto-calculate a near-lossless rate\n",
+            "output {}: no measured link and no bitrate_kbps; the hardware "
+            "encoder will auto-calculate a near-lossless rate\n",
             m_cfg.id));
       }
       // Live fan-out: no B-frames and no B-pyramid. Both add encode latency and
@@ -545,10 +608,12 @@ auto output::build_pipeline(std::string& err) -> bool
           g_object_get(venc, "device-path", &va_device, nullptr);
         }
         log(std::format(
-            "output {}: encoder {} bitrate={} kbps gop={} (requested {}/{}) "
-            "hardware-required, va-device={}\n",
+            "output {}: encoder {} bitrate={} kbps gop={} (target {}/gop {}, "
+            "link {} kbps, portal {} kbps) hardware-required, va-device={}\n",
             m_cfg.id, chosen_encoder, applied_bitrate, applied_gop,
-            m_cfg.transcode.bitrate_kbps, m_cfg.transcode.gop,
+            target_kbps, m_cfg.transcode.gop,
+            m_measured_link_kbps.load(std::memory_order_relaxed),
+            m_cfg.transcode.bitrate_kbps,
             va_device != nullptr ? va_device : "n/a"));
         g_free(va_device);
       }
@@ -883,7 +948,29 @@ auto output::worker() -> void
   auto backoff = std::chrono::duration_cast<std::chrono::milliseconds>(
       k_backoff_initial);
 
+  bool first_attempt = true;
   while (!m_stopping.load(std::memory_order_acquire)) {
+    // A pinned address is a property of the ATTEMPT, not of the session: the
+    // /start pin is used as-is for the first connect, and every reconnect
+    // re-resolves and re-vets the name first. A platform that retires or
+    // rebalances an address therefore costs one backoff interval, not the rest
+    // of the session. The egress policy is applied to the fresh answer, so a
+    // name that rebinds to a private address is refused and the previous pin is
+    // kept (the connect then fails on its own, visibly) rather than followed.
+    if (!first_attempt && m_repin
+        && !m_stopping.load(std::memory_order_acquire)) {
+      output_config fresh = m_cfg;
+      if (m_repin(fresh)) {
+        if (fresh.pinned_ip != m_cfg.pinned_ip) {
+          log("re-resolved " + m_cfg.host + ": new address\n");
+          m_cfg.pinned_ip = fresh.pinned_ip;
+        }
+      } else {
+        log("re-resolve refused; keeping the pinned address\n");
+      }
+    }
+    first_attempt = false;
+
     const auto attempt_started = std::chrono::steady_clock::now();
     const bool retryable = run_once();
     destroy_pipeline();

@@ -49,12 +49,22 @@ public:
   };
 
   using log_fn = std::function<void(const std::string&)>;
+  // Re-resolve + re-vet the destination before a connect attempt, updating
+  // `pinned_ip`. Supplied by main, which owns the egress policy; called on the
+  // output's own thread. Returns false when the name does not resolve or every
+  // A/AAAA record is refused, in which case the caller keeps the previous pin
+  // rather than tearing the output down.
+  using repin_fn = std::function<bool(output_config&)>;
 
   // cfg must already be validated + pinned (validate_config +
   // validate_and_pin_outputs). The rings must outlive this object. `frames`
   // is the shared decode stage's frame_ring, required for a transcode output
   // and unused (may be nullptr) for a copy-only one.
-  output(output_config cfg, ts_ring& ring, frame_ring* frames, log_fn log);
+  output(output_config cfg,
+         ts_ring& ring,
+         frame_ring* frames,
+         log_fn log,
+         repin_fn repin = {});
   ~output();
   output(const output&) = delete;
   auto operator=(const output&) -> output& = delete;
@@ -97,6 +107,18 @@ public:
   // Chosen transcode encoder element name (e.g. "vah264enc"), or "" for a
   // copy-only output / before the first pipeline build.
   [[nodiscard]] auto encoder_name() const -> std::string;
+  // Encoder target in kbps currently applied, or 0 while the encoder runs at
+  // its own default (copy-only outputs always report 0).
+  [[nodiscard]] auto bitrate_kbps() const -> int
+  {
+    return m_applied_bitrate_kbps.load(std::memory_order_relaxed);
+  }
+  // Hand the latest measured link rate to this output. A transcode output
+  // re-derives its encoder target from it (see transcode_bitrate_policy) and
+  // re-targets the running encoder when the change is material; a copy-only
+  // output ignores it. Called from the link-rate controller thread, never from
+  // the pipeline's own.
+  auto retarget_bitrate(int measured_link_kbps) -> void;
   // Whole-frame drops on this output's frame_ring cursor (transcode only).
   [[nodiscard]] auto frames_dropped() const -> uint64_t
   {
@@ -263,6 +285,16 @@ private:
 
   mutable std::mutex m_enc_mutex;
   std::string m_encoder_name;
+
+  // Re-resolve hook (may be empty: literal-IP destinations and unit tests).
+  repin_fn m_repin;
+
+  // Latest measured ingest rate handed in by the link-rate controller (0 = no
+  // measurement yet) and the target actually written to the encoder (0 = the
+  // encoder's own default). Both are read at pipeline build time, which is why
+  // they are atomics rather than plain members.
+  std::atomic<int> m_measured_link_kbps {0};
+  std::atomic<int> m_applied_bitrate_kbps {0};
 };
 
 // Build the gst_parse_launch template for an output (TRANSPORT_PROFILE §3.5).
