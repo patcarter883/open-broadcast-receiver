@@ -36,9 +36,13 @@
 // output is pinned to the sink caps the decoder declares, so the stream is
 // produced in the layout the hardware decoder takes instead of whatever
 // av1parse defaults to. An attempt whose caps cannot be met, that posts an
-// error, or that produces no frame inside k_attempt_window is torn down and the
-// next entry in the chain is built -- with the reason naming the field the
-// decoder refused when the caps are what failed.
+// error, or that produces no frame once it has been given a real slice of the
+// stream is torn down and the next entry in the chain is built -- with the
+// reason naming the field the decoder refused when the caps are what failed.
+// The no-frame decision is data-armed (fanout/decode_health.h): it requires a
+// minimum volume of fed TS and of demuxed video buffers before it may fire, and
+// the window grows with the bytes that have arrived, so a slow ingest cannot be
+// mistaken for a broken decoder.
 // Where each tsdemux src pad goes. Both destinations exist in the bin from
 // build_pipeline(): tsdemux returns GST_FLOW_NOT_LINKED while it has no linked
 // src pad, and the live ingest exposes its AUDIO pad before its video pad, so
@@ -176,8 +180,10 @@ private:
   std::atomic<std::int64_t> m_attempt_start_ns {0};
   std::atomic<std::int64_t> m_attempt_feed_start_ns {0};
   // Counter values at the moment the attempt was built, so each clock measures
-  // progress made by THIS attempt rather than by any that preceded it.
+  // progress made by THIS attempt rather than by any that preceded it. The byte
+  // base is what the data-armed no-frame decision measures its minimum against.
   std::atomic<std::uint64_t> m_attempt_base_in {0};
+  std::atomic<std::uint64_t> m_attempt_base_bytes {0};
   std::atomic<std::uint64_t> m_attempt_base_demux {0};
   std::atomic<std::uint64_t> m_attempt_base_decoder {0};
   bool m_simulate_failure = false;

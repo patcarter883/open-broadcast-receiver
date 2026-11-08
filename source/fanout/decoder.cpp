@@ -3,6 +3,8 @@
 
 #include "fanout/decoder.h"
 
+#include "fanout/decode_health.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -31,19 +33,6 @@ constexpr auto k_stats_period = std::chrono::seconds(2);
 // Decoded frames published per feed iteration; the appsink drops beyond its
 // own queue, so draining it fully keeps the frame ring current.
 constexpr int k_publish_burst = 8;
-// How long a decoder attempt may run after the demuxer first hands it a video
-// buffer without emitting a decoded frame before it is retired and the next
-// decoder in the chain is built. A working decoder emits within a frame or two
-// of the stream's first keyframe; the window is wide enough to cover preroll
-// plus one keyframe interval, so a stream whose first received bytes start
-// mid-GOP is not mistaken for a broken decoder. It is still the bound that turns
-// a silently wedged hardware decoder (pipeline parked in ASYNC, no bus error)
-// into a fallback instead of a stall.
-constexpr auto k_attempt_window = std::chrono::seconds(5);
-// The same bound for the step before it: TS bytes have been fed to tsdemux, which
-// has produced no video buffer at all. Measured from the first fed chunk of the
-// attempt, so a stream that has not started yet never enters it.
-constexpr auto k_demux_window = std::chrono::seconds(5);
 
 auto now_steady() -> std::chrono::steady_clock::time_point
 {
@@ -665,6 +654,8 @@ auto decoder::start_attempt(std::size_t index, std::string& err) -> bool
   m_attempt_feed_start_ns.store(0, std::memory_order_relaxed);
   m_attempt_base_in.store(
       m_in_chunks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  m_attempt_base_bytes.store(
+      m_in_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
   m_attempt_base_demux.store(
       m_demux_buffers.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
@@ -788,6 +779,14 @@ auto decoder::check_attempt_health() -> bool
   // the decoder clock starts when tsdemux first hands the branch a video buffer
   // (which happens once the stream's headers have been parsed, so the decoder's
   // own preroll starts from there).
+  //
+  // Arming is not enough on a trickling ingest: the clock would run while only
+  // tens of kilobytes of the stream had been fed, which says nothing about the
+  // demuxer or the decoder. So each decision also requires a minimum volume
+  // (decode_health::k_min_fed_bytes, plus k_min_video_buffers for the decoder)
+  // before it may fire, and the window itself grows with the bytes that have
+  // arrived. Both decisions live in decode_health.h so they are testable without
+  // a pipeline.
   if (m_pipeline == nullptr) {
     return false;
   }
@@ -802,13 +801,13 @@ auto decoder::check_attempt_health() -> bool
     m_attempt_start_ns.store(steady_ns(), std::memory_order_relaxed);
   }
 
-  const auto window_elapsed = [](std::int64_t start_ns,
-                                 std::chrono::seconds window) -> bool
+  const auto elapsed_ms = [](std::int64_t start_ns) -> std::chrono::milliseconds
   {
-    return start_ns != 0
-        && steady_ns() - start_ns
-               >= std::chrono::duration_cast<std::chrono::nanoseconds>(window)
-                      .count();
+    if (start_ns == 0) {
+      return std::chrono::milliseconds {0};
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::nanoseconds {steady_ns() - start_ns});
   };
   const auto state_text = [this]() -> std::string
   {
@@ -819,20 +818,40 @@ auto decoder::check_attempt_health() -> bool
                        gst_element_state_get_name(pending));
   };
 
-  if (window_elapsed(m_attempt_start_ns.load(std::memory_order_relaxed),
-                     k_attempt_window)
-      && m_decoder_buffers.load(std::memory_order_relaxed)
-             == m_attempt_base_decoder.load(std::memory_order_relaxed)) {
+  const std::uint64_t bytes_now = m_in_bytes.load(std::memory_order_relaxed);
+  const std::uint64_t base_bytes = m_attempt_base_bytes.load(std::memory_order_relaxed);
+  const std::uint64_t base_demux = m_attempt_base_demux.load(std::memory_order_relaxed);
+  const std::uint64_t base_decoder =
+      m_attempt_base_decoder.load(std::memory_order_relaxed);
+  const decode_health::attempt_health health {
+      .fed_bytes = bytes_now > base_bytes ? bytes_now - base_bytes : 0,
+      .video_buffers = demux_now > base_demux ? demux_now - base_demux : 0,
+      .decoded_buffers =
+          m_decoder_buffers.load(std::memory_order_relaxed) > base_decoder
+          ? m_decoder_buffers.load(std::memory_order_relaxed) - base_decoder
+          : 0,
+      .elapsed = elapsed_ms(m_attempt_start_ns.load(std::memory_order_relaxed)),
+  };
+
+  if (decode_health::no_frame_failure(health)) {
     log_stats();
-    return degrade(std::format("no decoded frame in {} s ({})",
-                               k_attempt_window.count(), state_text()));
+    return degrade(std::format(
+        "no decoded frame in {} ms with {} KiB fed and {} video buffers ({})",
+        health.elapsed.count(), health.fed_bytes / 1024U, health.video_buffers,
+        state_text()));
   }
-  if (window_elapsed(m_attempt_feed_start_ns.load(std::memory_order_relaxed),
-                     k_demux_window)
-      && demux_now == m_attempt_base_demux.load(std::memory_order_relaxed)) {
+  // The step before it: tsdemux has been fed but has exposed no video pad. The
+  // clock starts at the attempt's first fed TS chunk and, like the decoder's,
+  // only expires once the attempt has been given a real slice of the stream.
+  // The bytes are measured from the same base as the decoder's.
+  if (decode_health::demux_failure(
+          health.fed_bytes, health.video_buffers,
+          elapsed_ms(m_attempt_feed_start_ns.load(std::memory_order_relaxed)))) {
     log_stats();
-    return degrade(std::format("tsdemux produced no video in {} s ({})",
-                               k_demux_window.count(), state_text()));
+    return degrade(std::format(
+        "tsdemux produced no video in {} ms with {} KiB fed ({})",
+        elapsed_ms(m_attempt_feed_start_ns.load(std::memory_order_relaxed)).count(),
+        health.fed_bytes / 1024U, state_text()));
   }
   return false;
 }
