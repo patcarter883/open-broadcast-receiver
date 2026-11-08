@@ -11,6 +11,7 @@
 // pre-existing constraint); the transcode rule still emits the specified
 // chain.
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -191,6 +192,49 @@ auto main() -> int
     expect(!has(h264d, "profile="),
            "no profile is pinned where the decoder lists several");
     expect(parses(h264d), "h264 decoder template parses");
+  }
+
+  // Transit-buffer watchdog phases (output::wait_appsrc_drain). A connect
+  // attempt that has not published holds its first buffer through the RTMP
+  // handshake and publish exchange (6-7 s against a local sink), so the stall
+  // window must not be applied to it: judging a rebuild by that window tears the
+  // pipeline down before rtmp2sink can accept the publish.
+  {
+    using std::chrono::milliseconds;
+    constexpr bool establishing = false;
+    constexpr bool publishing = true;
+
+    expect(classify_drain_hold(milliseconds {6000}, establishing)
+               == drain_verdict::keep_waiting,
+           "an establishing output held for 6 s is not stalled");
+    expect(classify_drain_hold(output_timing::connect_timeout
+                                   - milliseconds {1000},
+                               establishing)
+               == drain_verdict::keep_waiting,
+           "an establishing output is not stalled anywhere inside the connect window");
+    expect(classify_drain_hold(output_timing::connect_timeout
+                                   + milliseconds {1000},
+                               establishing)
+               == drain_verdict::publish_not_established,
+           "a connect window that closes without a publish rebuilds the output");
+    expect(classify_drain_hold(output_timing::stall_timeout, establishing)
+               == drain_verdict::keep_waiting,
+           "the mid-stream stall window does not apply to an establishing output");
+    expect(output_timing::connect_timeout > output_timing::stall_timeout,
+           "the connect budget exceeds the stall budget");
+
+    // ... while a sink that was publishing is still judged on the stall window.
+    expect(classify_drain_hold(milliseconds {2000}, publishing)
+               == drain_verdict::keep_waiting,
+           "a publishing sink inside the stall window keeps waiting");
+    expect(classify_drain_hold(milliseconds {6000}, publishing)
+               == drain_verdict::stalled,
+           "a publishing sink pinned past the stall window is stalled");
+    expect(classify_drain_hold(output_timing::connect_timeout
+                                   + milliseconds {1000},
+                               publishing)
+               == drain_verdict::stalled,
+           "a publishing sink is judged by the stall window, not the connect one");
   }
 
   std::puts("pipeline_build_test: ALL OK");

@@ -22,6 +22,33 @@
 #include "fanout/ring.h"
 #include "lib/lib.h"
 
+// Timing of the transit-buffer watchdog (see wait_appsrc_drain). A publish
+// attempt has two phases with different failures: reaching publish, where a
+// held buffer is the RTMP handshake and publish exchange in flight, and
+// publishing, where a held buffer is a sink that stopped draining. The connect
+// window is longer than the mid-stream stall window because it has to cover a
+// handshake that a local sink completes in 6-7 s and a platform ingest can take
+// several seconds longer.
+namespace output_timing
+{
+inline constexpr auto connect_timeout = std::chrono::seconds(20);
+inline constexpr auto stall_timeout = std::chrono::seconds(5);
+}  // namespace output_timing
+
+// What a full transit buffer means at the moment the feed thread finds it.
+enum class drain_verdict : std::uint8_t
+{
+  keep_waiting,
+  stalled,                 // publishing, then the sink stopped draining
+  publish_not_established  // the connect window closed without a publish
+};
+
+// Classify a transit buffer that has been pinned at its limit for `held`.
+// `published` is true once this attempt has confirmed a publish, i.e. the sink
+// completed a transfer of media to the server.
+auto classify_drain_hold(std::chrono::milliseconds held, bool published)
+    -> drain_verdict;
+
 // output — one self-contained fan-out destination (TRANSPORT_PROFILE §3.2):
 // its own small GstPipeline, its own bus handling, its own state machine and
 // backoff, its own ring cursor feeding its own appsrc. Errors are local by
@@ -109,7 +136,9 @@ public:
   // copy-only output / before the first pipeline build.
   [[nodiscard]] auto encoder_name() const -> std::string;
   // Encoder target in kbps currently applied, or 0 while the encoder runs at
-  // its own default (copy-only outputs always report 0).
+  // its own default (copy-only outputs always report 0). While a connect
+  // attempt has not confirmed its publish this is the bootstrap rate; it moves
+  // to the measured-link target on confirmation.
   [[nodiscard]] auto bitrate_kbps() const -> int
   {
     return m_applied_bitrate_kbps.load(std::memory_order_relaxed);
@@ -186,9 +215,22 @@ private:
   // Sinks a demux src pad the output does not consume into the drop funnel, so
   // it cannot fail the pipeline with not-linked.
   auto sink_into_drop(GstPad* pad) -> void;
-  // Blocks until the video appsrc is below `cap`, bounded by k_stall_timeout.
-  // Returns false when the attempt should end (stopping or a stalled sink).
+  // Blocks until the video appsrc is below `cap`, bounded by the connect window
+  // before this attempt has published and by the stall window after. Returns
+  // false when the attempt should end (stopping, a stalled sink, or a connect
+  // that never reached publish).
   auto wait_appsrc_drain(guint64 cap) -> bool;
+  // The encoder target this attempt should run at right now: the bootstrap rate
+  // until publish is confirmed, the measured-link target afterwards.
+  [[nodiscard]] auto current_target_kbps() const -> int;
+  // Apply `target_kbps` to the running encoder when it differs materially from
+  // the applied rate. Runs on the worker or link-controller thread; the encoder
+  // is reached through a reference to the pipeline taken under m_pipe_mutex.
+  auto apply_encoder_bitrate(int target_kbps) -> void;
+  // First confirmation that this attempt is publishing: the sink has accepted
+  // media past the handshake. Retires the connect-window exemption and ramps
+  // the encoder from the bootstrap rate to the measured-link target.
+  auto confirm_publish() -> void;
   static auto appsrc_drained(GstPad* pad, GstPadProbeInfo* info, gpointer self)
       -> GstPadProbeReturn;
   static auto muxer_first_buffer(GstPad* pad, GstPadProbeInfo* info,
@@ -287,6 +329,12 @@ private:
   // encoder or to the muxer/sink.
   std::atomic<uint64_t> m_encoder_in {0};
   std::atomic<uint64_t> m_muxer_out {0};
+  // Buffers that arrived at the destination sink's sink pad. The first one is
+  // held for the RTMP handshake and publish exchange; the second one can only
+  // arrive once that exchange completed, so the count is the publish signal this
+  // attempt's watchdog and bitrate ramp key off.
+  std::atomic<uint64_t> m_sink_in {0};
+  std::atomic_bool m_publish_confirmed {false};
   // Wakes the feed thread when a buffer leaves the video appsrc (installed as a
   // probe on its src pad) so backpressure is the pipeline's own pace.
   std::mutex m_feed_mutex;

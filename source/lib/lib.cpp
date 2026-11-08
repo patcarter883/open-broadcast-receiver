@@ -1002,6 +1002,28 @@ auto derive_transcode_bitrate_kbps(int measured_link_kbps, int portal_kbps)
   return std::min(share, transcode_bitrate_policy::ceiling_kbps);
 }
 
+auto derive_transcode_bootstrap_kbps(int measured_link_kbps, int portal_kbps)
+    -> int
+{
+  if (measured_link_kbps <= 0) {
+    // No measurement: the declared rate is the only statement about rate, and
+    // it is what a first attempt has always run at.
+    return derive_transcode_bitrate_kbps(0, portal_kbps);
+  }
+  const int steady =
+      derive_transcode_bitrate_kbps(measured_link_kbps, portal_kbps);
+  if (steady <= 0) {
+    return 0;  // neither a measurement nor a declared rate to start from
+  }
+  const int declared = portal_kbps > 0
+      ? std::min(portal_kbps, transcode_bitrate_policy::bootstrap_ceiling_kbps)
+      : transcode_bitrate_policy::bootstrap_ceiling_kbps;
+  // Never above the steady target: the connect phase starts lower and is
+  // re-targeted upwards, so a link already measured below the bootstrap rate
+  // keeps its own (lower) target throughout.
+  return std::min(declared, steady);
+}
+
 auto bitrate_change_is_material(int current_kbps, int next_kbps) -> bool
 {
   if (current_kbps == next_kbps) {

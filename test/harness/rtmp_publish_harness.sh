@@ -10,6 +10,10 @@
 #   test/harness/rtmp_publish_harness.sh [--bin build/test/rtmp_publish_harness]
 #                                        [--modes "transcode-av copy-av"]
 #
+# The `reconnect` mode drops the publisher by restarting this container from
+# inside the harness, then requires the output to republish and ramp back to the
+# measured-link rate.
+#
 # Env overrides: HARNESS_BIN, MODES, RTMP_PORT, STAT_PORT, IMAGE, LOG_DIR,
 # FIXTURE (AV1-in-MPEG-TS clip required by the transcode-av1 mode; generate it
 # with `make fixture`).
@@ -21,7 +25,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HARNESS_BIN="${HARNESS_BIN:-${REPO_ROOT}/build/test/rtmp_publish_harness}"
-MODES="${MODES:-transcode-av transcode-video-only copy-av copy-audio-first copy-non-aac copy-video-only}"
+MODES="${MODES:-transcode-av transcode-video-only copy-av copy-audio-first copy-non-aac copy-video-only reconnect}"
 RTMP_PORT="${RTMP_PORT:-11935}"
 STAT_PORT="${STAT_PORT:-18080}"
 IMAGE="${IMAGE:-alfg/nginx-rtmp:latest}"
@@ -33,7 +37,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --bin) HARNESS_BIN="$2"; shift 2 ;;
     --modes) MODES="$2"; shift 2 ;;
-    -h|--help) sed -n '5,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '5,24p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -123,6 +127,11 @@ for mode in $MODES; do
     if [[ "${FIXTURE_AUDIO:-1}" != "0" ]]; then
       mode_args+=(--fixture-audio)
     fi
+  fi
+  # The reconnect mode has to drop the publisher itself, so the one thing it is
+  # told from here is how to restart the sink it is publishing to.
+  if [[ "$mode" == "reconnect" ]]; then
+    mode_args+=(--sink-restart-cmd "docker restart ${CONTAINER}")
   fi
   if "$HARNESS_BIN" --mode "$mode" \
       --host 127.0.0.1 --port "$RTMP_PORT" \
