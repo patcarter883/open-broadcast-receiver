@@ -12,14 +12,89 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include <gst/gst.h>
 
+#include "fanout/es_ring.h"
 #include "fanout/frame_ring.h"
 #include "fanout/ring.h"
 #include "lib/lib.h"
+
+// Timing of the transit-buffer watchdog (see wait_appsrc_drain). A publish
+// attempt has two phases with different failures: reaching publish, where a
+// held buffer is the RTMP handshake and publish exchange in flight, and
+// publishing, where a held buffer is a sink that stopped draining. The connect
+// window is longer than the mid-stream stall window because it has to cover a
+// handshake that a local sink completes in 6-7 s and a platform ingest can take
+// several seconds longer.
+namespace output_timing
+{
+inline constexpr auto connect_timeout = std::chrono::seconds(20);
+inline constexpr auto stall_timeout = std::chrono::seconds(5);
+}  // namespace output_timing
+
+// What a full transit buffer means at the moment the feed thread finds it.
+enum class drain_verdict : std::uint8_t
+{
+  keep_waiting,
+  stalled,                 // publishing, then the sink stopped draining
+  publish_not_established  // the connect window closed without a publish
+};
+
+// Classify a transit buffer that has been pinned at its limit for `held`.
+// `published` is true once this attempt has confirmed a publish, i.e. the sink
+// completed a transfer of media to the server.
+auto classify_drain_hold(std::chrono::milliseconds held, bool published)
+    -> drain_verdict;
+
+// Which compressed elementary streams an output consumes when the standby slate
+// is enabled (receiver_config.standby.enabled, schema_version 5).
+//
+// With the slate on, the shared standby stage parses the ingest ONCE and
+// publishes whole access units into an es_ring per stream (video, audio). Every
+// output then reads compressed AUs from those rings instead of being handed the
+// transport stream: a copy output remuxes the AUs into its own container, and
+// the shared decoder parses/decodes the video AUs directly. That is what lets
+// the slate keep every destination fed while no live media is arriving, without
+// each output running its own demux over a TS that may be the slate's.
+//
+// `enabled == false` is today's path, byte for byte: every output reads the
+// ts_ring and demuxes it exactly as before. Nothing in the ring path changes
+// because this struct exists.
+struct es_input_spec
+{
+  bool enabled = false;
+  // The DECLARED ingest codec (/start source.codec): it selects the parser in
+  // front of the muxer or decoder. It is not a guess about the AUs.
+  codec video_codec = codec::h264;
+  // True when an audio es_ring exists for this session, i.e. the ingest carried
+  // an audio stream and the stage published it. A video-only session leaves the
+  // muxer's audio pad unrequested, exactly as the ts path does.
+  bool audio = false;
+  auto operator==(const es_input_spec&) const -> bool = default;
+};
+
+// The rings a standby-enabled session hands one output. Both null is the
+// disabled path (a ts_ring consumer, no ES mode). main passes these only when
+// standby_config.enabled is set; the later stage wiring owns the rings.
+struct es_sources
+{
+  es_ring* video = nullptr;
+  es_ring* audio = nullptr;
+  codec video_codec = codec::h264;
+
+  [[nodiscard]] auto enabled() const noexcept -> bool
+  {
+    return video != nullptr;
+  }
+  [[nodiscard]] auto spec() const noexcept -> es_input_spec
+  {
+    return es_input_spec {enabled(), video_codec, audio != nullptr};
+  }
+};
 
 // output — one self-contained fan-out destination (TRANSPORT_PROFILE §3.2):
 // its own small GstPipeline, its own bus handling, its own state machine and
@@ -59,12 +134,14 @@ public:
   // cfg must already be validated + pinned (validate_config +
   // validate_and_pin_outputs). The rings must outlive this object. `frames`
   // is the shared decode stage's frame_ring, required for a transcode output
-  // and unused (may be nullptr) for a copy-only one.
+  // and unused (may be nullptr) for a copy-only one. `es` is the standby
+  // stage's rings; empty means the ts_ring path this class has always taken.
   output(output_config cfg,
          ts_ring& ring,
          frame_ring* frames,
          log_fn log,
-         repin_fn repin = {});
+         repin_fn repin = {},
+         es_sources es = {});
   ~output();
   output(const output&) = delete;
   auto operator=(const output&) -> output& = delete;
@@ -104,11 +181,19 @@ public:
   {
     return (m_consumer >= 0) ? m_ring.dropped_bytes(m_consumer) : 0;
   }
+  // Whole access units this output never saw because its es_ring cursor was
+  // lapped (standby-enabled path), video plus audio. The ts_ring path reports 0
+  // here and accounts its loss through dropped_bytes(); the two are separate
+  // units on purpose (a TS packet count is not an AU count), so /stats must
+  // render whichever one the session's mode produces rather than add them.
+  [[nodiscard]] auto dropped_aus() const -> uint64_t;
   // Chosen transcode encoder element name (e.g. "vah264enc"), or "" for a
   // copy-only output / before the first pipeline build.
   [[nodiscard]] auto encoder_name() const -> std::string;
   // Encoder target in kbps currently applied, or 0 while the encoder runs at
-  // its own default (copy-only outputs always report 0).
+  // its own default (copy-only outputs always report 0). While a connect
+  // attempt has not confirmed its publish this is the bootstrap rate; it moves
+  // to the measured-link target on confirmation.
   [[nodiscard]] auto bitrate_kbps() const -> int
   {
     return m_applied_bitrate_kbps.load(std::memory_order_relaxed);
@@ -129,6 +214,12 @@ public:
   [[nodiscard]] auto audio_dropped() const -> bool
   {
     return m_audio_dropped.load(std::memory_order_relaxed);
+  }
+  // Buffers the muxer's audio pad has received on this output. A linked pad
+  // with a zero count is an audio branch that is negotiated but silent.
+  [[nodiscard]] auto audio_frames() const -> uint64_t
+  {
+    return m_audio_frames.load(std::memory_order_relaxed);
   }
   // Seconds in state=running for the current connection, 0 otherwise.
   [[nodiscard]] auto connected_s() const -> int64_t;
@@ -157,9 +248,21 @@ private:
   // One connect attempt: build → play → feed until error/stop. Returns true
   // if the failure is retryable, false if terminal (state already set).
   auto run_once() -> bool;
-  // Transcode feed step (video from frame_ring, AAC audio from ts_ring).
-  // Returns false when the attempt should end (appsrc flushing / stopping).
+  // Transcode feed step (video from frame_ring, AAC audio from ts_ring or the
+  // audio es_ring). Returns false when the attempt should end (appsrc flushing
+  // / stopping).
   auto feed_transcode(bool& video_caps_set) -> bool;
+  // Copy feed step in ES mode: video AUs from the video es_ring into osrc and
+  // audio AUs from the audio es_ring into asrc. Returns false when the attempt
+  // should end (appsrc flushing).
+  auto feed_es_copy() -> bool;
+  // Push every audio AU the audio es_ring currently holds into `asrc`. Returns
+  // false when the appsrc rejected a buffer (pipeline flushing).
+  auto feed_es_audio() -> bool;
+  // ES mode: link acaps to the muxer's audio pad, without a demux pad to wait
+  // on. The audio es_ring is what says audio exists, so this runs at build time
+  // (the ts path defers it to tsdemux's pad-added, where the TS is the evidence).
+  auto attach_es_audio_branch() -> void;
   // Link `pad` to `element_name`'s static pad (or to a requested pad when the
   // pad name ends in %u). Returns true only when this call made the link.
   auto link_pad_to(GstPad* pad, const char* element_name, const char* pad_name)
@@ -179,9 +282,22 @@ private:
   // Sinks a demux src pad the output does not consume into the drop funnel, so
   // it cannot fail the pipeline with not-linked.
   auto sink_into_drop(GstPad* pad) -> void;
-  // Blocks until the video appsrc is below `cap`, bounded by k_stall_timeout.
-  // Returns false when the attempt should end (stopping or a stalled sink).
+  // Blocks until the video appsrc is below `cap`, bounded by the connect window
+  // before this attempt has published and by the stall window after. Returns
+  // false when the attempt should end (stopping, a stalled sink, or a connect
+  // that never reached publish).
   auto wait_appsrc_drain(guint64 cap) -> bool;
+  // The encoder target this attempt should run at right now: the bootstrap rate
+  // until publish is confirmed, the measured-link target afterwards.
+  [[nodiscard]] auto current_target_kbps() const -> int;
+  // Apply `target_kbps` to the running encoder when it differs materially from
+  // the applied rate. Runs on the worker or link-controller thread; the encoder
+  // is reached through a reference to the pipeline taken under m_pipe_mutex.
+  auto apply_encoder_bitrate(int target_kbps) -> void;
+  // First confirmation that this attempt is publishing: the sink has accepted
+  // media past the handshake. Retires the connect-window exemption and ramps
+  // the encoder from the bootstrap rate to the measured-link target.
+  auto confirm_publish() -> void;
   static auto appsrc_drained(GstPad* pad, GstPadProbeInfo* info, gpointer self)
       -> GstPadProbeReturn;
   static auto muxer_first_buffer(GstPad* pad, GstPadProbeInfo* info,
@@ -202,6 +318,11 @@ private:
   // rtmp_codec_unsupported class (caps/negotiation failure on an FLV path).
   auto is_codec_terminal(const GError* err, GstElement* src) const -> bool;
 
+  // Retires the audio branch of a live attempt: the demux pad is moved to the
+  // drop funnel and an untouched muxer audio pad is released. Video keeps
+  // flowing, because audio is optional and video is not.
+  auto degrade_audio_branch(std::string_view reason) -> void;
+
   static auto demux_pad_added(GstElement* demux, GstPad* pad, gpointer self)
       -> void;
 
@@ -209,9 +330,21 @@ private:
   ts_ring& m_ring;
   frame_ring* m_frames = nullptr;  // shared decode stage (transcode only)
   log_fn m_log;
+  // Standby-stage rings (empty on the ts_ring path, which is every session
+  // without standby_config.enabled).
+  es_sources m_es;
 
   int m_consumer = -1;        // ts_ring cursor (copy video / transcode audio)
   int m_frame_consumer = -1;  // frame_ring cursor (transcode video)
+  // es_ring cursors, ES mode only: video for every output, audio only when the
+  // output's muxer takes audio (copy rtmp/rtmps, transcode rtmp/rtmps).
+  int m_es_video_consumer = -1;
+  int m_es_audio_consumer = -1;
+  // One AU at a time, sized for the largest AU the ring can hold rather than
+  // the 32 KiB TS chunk: an IDR at 4K is megabytes, and es_ring::read skips an
+  // AU that does not fit its destination whole.
+  std::vector<std::uint8_t> m_es_video_buf;
+  std::vector<std::uint8_t> m_es_audio_buf;
   std::thread m_thread;
   std::atomic_bool m_stopping {false};
 
@@ -233,9 +366,6 @@ private:
   // exists, so a pipeline-start clock retires a perfectly good audio branch
   // before its first buffer can arrive.
   std::chrono::steady_clock::time_point m_first_video_push {};
-  // One audio-branch observation per attempt: a linked pad that never receives
-  // a buffer is how flvmux stalls with no error anywhere.
-  bool m_audio_probe_done {false};
   bool m_muxer_input_logged {false};
   // Set when the muxer's audio pad has been reported with the caps it received,
   // so the report names the negotiated format (raw + codec_data) once.
@@ -243,8 +373,15 @@ private:
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};
   // Buffers the muxer's audio pad actually received. Caps on that pad are not
-  // data; a linked pad with no buffers is how flvmux stalls without an error.
+  // data; a linked pad with no buffers is how flvmux stalls without an error,
+  // which is what decides whether a failed branch's muxer pad can still be
+  // released.
   std::atomic<uint64_t> m_audio_frames {0};
+  // Guards the audio branch's pads: attach runs on the demux streaming thread,
+  // degrade on the output's worker thread.
+  std::mutex m_audio_mutex;
+  GstPad* m_audio_demux_pad = nullptr;  // demux audio pad -> aq (owned ref)
+  GstPad* m_audio_mux_pad = nullptr;    // acaps src -> mux audio (owned ref)
   std::atomic<int64_t> m_running_since_ms {0};  // steady ms; 0 = not running
 
   // Transcode feed accounting, reported once every k_feed_stats_period. It
@@ -271,6 +408,12 @@ private:
   // encoder or to the muxer/sink.
   std::atomic<uint64_t> m_encoder_in {0};
   std::atomic<uint64_t> m_muxer_out {0};
+  // Buffers that arrived at the destination sink's sink pad. The first one is
+  // held for the RTMP handshake and publish exchange; the second one can only
+  // arrive once that exchange completed, so the count is the publish signal this
+  // attempt's watchdog and bitrate ramp key off.
+  std::atomic<uint64_t> m_sink_in {0};
+  std::atomic_bool m_publish_confirmed {false};
   // Wakes the feed thread when a buffer leaves the video appsrc (installed as a
   // probe on its src pad) so backpressure is the pipeline's own pace.
   std::mutex m_feed_mutex;
@@ -304,12 +447,28 @@ private:
 // Build the gst_parse_launch template for an output (TRANSPORT_PROFILE §3.5).
 // `encoder` is the concrete transcode encoder element name chosen from the
 // shared alternatives list; it is ignored (may be nullptr) for a copy-only
-// config. The template carries NO secrets and NO customer URLs: the sink is
+// config. `es` selects the standby-enabled shape: with `es.enabled` a copy
+// output is fed compressed AUs and remuxes them itself (no tsparse, no tsdemux),
+// and a transcode output's AAC audio comes from the audio es_ring instead of a
+// per-output tsdemux. With `es.enabled == false` (the default) the string is
+// exactly what it has always been.
+// The template carries NO secrets and NO customer URLs: the sink is
 // created unconfigured (name=osink) and its connect properties are set by the
 // caller, so the string is loggable by definition. Exposed so the full-lane
 // test can assert and parse-launch the exact strings used.
 auto output_template(output_proto proto,
                      const transcode_config& transcode,
-                     const char* encoder) -> std::string;
+                     const char* encoder,
+                     const es_input_spec& es = {}) -> std::string;
+
+// The elements that make up an RTMP output's audio branch. A bus error whose
+// source is one of these is retired with the branch rather than the attempt.
+auto is_audio_branch_element(std::string_view element_name) -> bool;
+
+// The RTMP audio branch (queue -> ... -> acaps) both RTMP templates use.
+// `transcode` selects the re-encoding branch (decode, resample to the declared
+// output format, encode) over the copy branch (aacparse passthrough). Exposed so
+// the branch can be run on real MPEG-TS sources without restating it in a test.
+auto rtmp_audio_branch(bool transcode) -> std::string;
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_FANOUT_OUTPUT_H

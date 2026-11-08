@@ -115,6 +115,15 @@ struct transcode_bitrate_policy
   // per-second measurement jitter does not thrash the rate control.
   static constexpr int reselect_min_kbps = 500;
   static constexpr int reselect_min_percent = 10;
+  // Rate a connect attempt starts at while the destination has not accepted a
+  // publish yet. rtmp2sink holds the first FLV tag for the length of the
+  // handshake, chunk-size and publish exchange (6-7 s against a local sink), and
+  // the transit buffer behind it fills at whatever rate the encoder is told to
+  // run at. At the measured-link target that buffer is full before the handshake
+  // returns; at this rate it takes several times longer, which is the margin the
+  // connect phase needs. The measured target is applied once publish is
+  // confirmed.
+  static constexpr int bootstrap_ceiling_kbps = 2000;
 };
 
 // The encoder target for one transcode output. `measured_link_kbps` is the
@@ -123,6 +132,15 @@ struct transcode_bitrate_policy
 // there is neither a measurement nor a portal value, meaning "leave the
 // encoder at its own default".
 auto derive_transcode_bitrate_kbps(int measured_link_kbps, int portal_kbps)
+    -> int;
+
+// The rate one connect attempt starts at, before the destination has confirmed
+// the publish. With no measurement this is the declared rate; with a measurement
+// it is capped at
+// transcode_bitrate_policy::bootstrap_ceiling_kbps (or the declared rate, when
+// that is lower) so the transit buffer outlasts the handshake. The steady
+// derive_transcode_bitrate_kbps target is applied once publish is confirmed.
+auto derive_transcode_bootstrap_kbps(int measured_link_kbps, int portal_kbps)
     -> int;
 
 // True when moving from `current_kbps` to `next_kbps` is worth re-targeting a
@@ -422,6 +440,9 @@ struct output_stat
   uint64_t bytes_sent = 0;
   uint64_t dropped_bytes = 0;
   bool audio_dropped = false;
+  // Buffers the muxer's audio pad received; 0 with audio_dropped=false is an
+  // audio branch that is linked but has published nothing yet.
+  uint64_t audio_frames = 0;
   std::string last_error;  // empty = none; never contains URLs/keys
 };
 

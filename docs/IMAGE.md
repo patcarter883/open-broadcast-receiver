@@ -40,6 +40,15 @@ container to a network that hands it a routable-looking IPv6 address, which is
 the shape that breaks:
 
 ```sh
+test/harness/image_resolver_proof.sh --image obr-receiver:proof
+```
+
+That script runs the image twice on an IPv6 network — as built, and with
+`/etc/gai.conf` emptied — and requires IPv4 first in the first run and IPv6
+first in the second, so a pass means the layer did the reordering rather than
+the network's shape. The manual equivalent:
+
+```sh
 docker network create --ipv6 --subnet 2001:db8:77::/64 obr-v6probe
 docker run --rm --network obr-v6probe --entrypoint bash obr-receiver:local -c '
   cat /etc/gai.conf; getent ahosts a.rtmp.youtube.com'

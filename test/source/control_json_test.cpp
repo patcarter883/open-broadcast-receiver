@@ -37,6 +37,7 @@ auto make_stat() -> output_stat
   stat.bytes_sent = 1234;
   stat.dropped_bytes = 5;
   stat.audio_dropped = false;
+  stat.audio_frames = 3392;
   return stat;
 }
 }  // namespace
@@ -74,6 +75,19 @@ auto main() -> int
     expect(!status.contains("transcode"), "copy-only status omits transcode");
     expect(!stats.contains("transcode"), "copy-only stats omits transcode");
     expect(status["audio_dropped"] == false, "status audio_dropped present");
+    expect(status["audio_frames"] == 3392,
+           "status audio_frames reports what the muxer's audio pad received");
+  }
+
+  // Every target names itself: an AV1 transcode must not surface as "none",
+  // which reads as copy-only to every consumer of /stats and /status.
+  {
+    output_stat stat = make_stat();
+    stat.transcode = transcode_target::av1;
+    const json status = json::parse(output_stat_json(stat, false));
+    const json stats = json::parse(output_stat_json(stat, true));
+    expect(status["transcode"]["codec"] == "av1", "status codec is av1");
+    expect(stats["transcode"]["codec"] == "av1", "stats codec is av1");
   }
 
   // An encoder not yet chosen serialises as an empty string (never a crash).

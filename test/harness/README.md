@@ -140,10 +140,24 @@ do not), and it is what the harness reads.
 | `copy-audio-first` | the same clip with the audio stream first in the PMT, so `tsdemux` announces the audio pad before the video pad | publishes, audio as AAC on the muxer's audio pad and H.264 as AVC on its video pad |
 | `copy-non-aac` | H.264 with AC-3 audio: an audio pad no branch can carry | publishes video-only; the AC-3 pad is sunk by the drop funnel, `audio_dropped: true` |
 | `copy-video-only` | H.264-only MPEG-TS | publishes video-only: no audio pad is ever requested, so nothing waits on one |
+| `reconnect` | NV12 frames, then the sink container is restarted under the running output (`--sink-restart-cmd`) | republishes: the rebuild opens at the connect bootstrap rate, reaches publish, and the encoder ramps back to the measured-link target |
 
 Every mode must publish; the server's counter decides. `copy-audio-first` is the
 one that would catch a pad-order regression: the branch a demuxer pad reaches is
 decided from that pad's caps, so arrival order cannot put audio into `h264parse`.
+
+`reconnect` is the only mode with a destination-side failure in it. It first
+proves a publish, then feeds a link measurement (`--measured-kbps`, default 6000)
+so the encoder runs at the derived target (5400 kbps at the default 2000 kbps
+declared rate), then restarts the sink, which severs the publish. It passes only
+if the rebuilt attempt applied the connect bootstrap rate rather than that
+measured target, republished within the connect window, needed at most four
+attempts, and ramped back to the measured target. A scenario where the bootstrap
+and the measured target coincide fails by design: it would prove nothing.
+
+The local sink publishes in well under a second, so this mode exercises the
+drop-and-recover path but not a slow platform handshake. The connect-window
+classification itself is covered by `pipeline_build_test`.
 
 ## PASS rule
 
@@ -187,6 +201,7 @@ Against `alfg/nginx-rtmp` on this box, with `vah264enc`:
 | `copy-audio-first` | PASS | `demux pad order audio_0_0041 (audio/mpeg), video_0_0042 (video/x-h264)` (audio announced first); 69 video + 91 audio buffers at the muxer, 90 emitted, server +283 032 B |
 | `copy-non-aac` | PASS | `demux pad order video_0_0041 (video/x-h264), audio_0_0042 (audio/x-ac3)`; the AC-3 pad is sunk, 69 video buffers at the muxer, 39 emitted, no audio buffer, server +264 020 B |
 | `copy-video-only` | PASS | `demux pad order video_0_0041 (video/x-h264)`; 68 video buffers at the muxer, 39 emitted, no audio pad requested at all, server +264 023 B |
+| `reconnect` | PASS | publish at 5400 kbps from a 6000 kbps measurement; sink restarted; rebuild applied the 2000 kbps connect bootstrap; republished, server +936 169 B after the drop; back at 5400 kbps after 2 attempts |
 
 The H.264 fixtures state `format=NV12` and nothing wider: an unpinned
 `videotestsrc ! x264enc` negotiates High 4:4:4 10-bit on this box, which is not
@@ -241,6 +256,21 @@ muxer, 907 emitted, ~2.4 Mbit/s against a 2 Mbit/s target.
 - The harness publishes. Run it only against a sink you started for it; the
   script removes its own container by name on exit and touches nothing else.
 - Ports are overridable: `RTMP_PORT=21935 STAT_PORT=28080 ...`.
+
+## `image_resolver_proof.sh` — the image's address-family policy
+
+    test/harness/image_resolver_proof.sh [--image obr-receiver:proof]
+
+Not a publishing harness: it proves the runtime image's `/etc/gai.conf`
+(`precedence ::ffff:0:0/96 100`) reorders a dual-stack name, with no
+`--add-host` pin anywhere. It runs the same image twice on an IPv6 network —
+once as built, once with `/etc/gai.conf` emptied — and requires IPv4 first in
+the first run and IPv6 first in the second. The second run is what makes the
+first one meaningful: on a single-stack container glibc has already demoted
+AAAA (rule 3), so the file looks inert and a one-sided check proves nothing
+(DECISIONS §20). The connect step opens a socket to the *first* address the
+resolver returned, as a literal, which is the shape `rtmp2sink` has — one
+address, no happy-eyeballs fallback.
 
 ## Whole-binary e2e: RIST in, RTMP out
 
