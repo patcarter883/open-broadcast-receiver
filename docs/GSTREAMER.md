@@ -109,3 +109,38 @@ download. A stalling disk makes this consumer take ring drops; it can never touc
    (this is what makes per-output errors local by construction).
 8. The producer (RIST thread) writes the ring even while outputs rebuild — a reconnecting output rejoins live
    at the current head, it does not replay backlog.
+
+---
+
+## 6. AV1-in-MPEG-TS fixture (decode acceptance)
+
+The decode stage is exercised without a rig by one committed command, which both
+builds the fixture and runs the stage over it:
+
+```
+make fixture-decode
+```
+
+`make fixture` alone writes `build/av1-fixture.ts`; `test/tools/make-av1-ts-fixture.sh`
+is the generator (see its header for the encoder settings it mirrors).
+
+**Why the fixture is generated and not hand-made.** MPEG-TS has no standardised
+stream type for AV1. `mpegtsmux` refuses AV1 by default — *"Failed to determine
+stream type or mapping is not supported ... you may have to set the
+enable-custom-mappings property to TRUE"* — so the only representative fixture
+is one muxed the way the product's encoder muxes it
+(`open-broadcast-encoder`, `pipeline_build_sink`):
+
+```
+mpegtsmux alignment=7 enable-custom-mappings=true
+```
+
+after `av1parse ! video/x-av1,stream-format=obu-stream,alignment=frame`. The
+resulting PMT carries a private stream (stream type `0x06`, registration `AV1G`),
+which `tsdemux` maps to `video/x-av1`. A TS muxed *without* the flag has no AV1
+mapping, `tsdemux` exposes no video pad, and the chain dies with *"This stream
+contains no valid or supported streams"* — a synthetic TS like that tests the
+fixture, not the decoder.
+
+`decode_file` feeds the fixture through a real `ts_ring` in 1316-byte RIST
+datagrams and prints the stage's own counters; `frames=` is the measurement.

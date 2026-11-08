@@ -224,6 +224,17 @@ using resolve_fn =
 
 auto default_resolver() -> resolve_fn;
 
+// Stable-partition `ips` so every IPv4 literal precedes every IPv6 literal,
+// preserving getaddrinfo's order within each family. `validate_and_pin_outputs`
+// pins `ips.front()` and the pipeline never re-resolves, so the order chosen
+// here IS the connect family for the output's whole lifetime. A destination
+// that has an A record must therefore connect over IPv4: glibc's RFC 6724 sort
+// returns AAAA first whenever the host holds a routable-looking IPv6 address
+// (e.g. a docker bridge with ULA/GUA), even when there is no IPv6 default
+// route — the container then has a name that "resolves" and cannot connect.
+// Exposed for unit testing; `default_resolver` calls it.
+auto order_addresses_prefer_ipv4(std::vector<std::string>& ips) -> void;
+
 // Classify an IP literal against the policy. Returns nullptr when the address
 // is an acceptable egress target, else a short reason ("loopback",
 // "link_local", "private", "multicast", "denylist", "unparsable", ...).

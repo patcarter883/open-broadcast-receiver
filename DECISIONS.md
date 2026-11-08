@@ -376,3 +376,26 @@ receiver retries once on `rist://@0.0.0.0` and logs the fallback.
 
 **Rationale.** v6-less hosts are common in container fleets; failing the whole session over an address-family
 gap is operator-hostile. **Rejected:** a CLI flag for address family (one more knob for something detectable).
+
+## 18. Destination resolution prefers IPv4 when the name has an A record
+
+**Choice.** `default_resolver()` stable-partitions its result so every IPv4 literal precedes every IPv6 one
+(`order_addresses_prefer_ipv4`), leaving all records in place, in `getaddrinfo` order within each family, for
+egress vetting. Because §15 pins `ips.front()` and the pipeline never re-resolves, the front of that list is the
+connect family for the output's lifetime.
+
+**Rationale.** glibc's RFC 6724 sort is not a statement about reachability: on a host or container with a
+routable-looking IPv6 address it can return AAAA first even when there is no IPv6 default route (docker bridges,
+v6-enabled nodes without upstream v6). `rtmp2sink` does not do happy-eyeballs: it takes the first address it is
+handed. A dual-stack name on a single-stack box then fails as "cannot connect" against a destination that is
+perfectly reachable over IPv4 — which is what a pinned `--add-host a.rtmp.youtube.com:<ip>` was papering over.
+Preferring A records is the smallest change that removes the pin: no new element, no second connect path, and an
+AAAA-only destination still resolves and pins an IPv6 address. Every record is still vetted, so the
+"any private record rejects the name" rebinding rule (§15) is untouched.
+
+**Rejected.** `/etc/gai.conf` `precedence ::ffff:0:0/96 100` in the image: measured on this glibc it does not
+reorder the answer at all — rule 5 (matching label) is evaluated before precedence, so Ubuntu/Debian's usual
+recipe is a no-op here, and it would only ever cover code inside this image (not the same binary run on a node).
+Also rejected: `AI_ADDRCONFIG` (silently drops AAAA records and only reflects the *local* address config, which
+is exactly the thing that is wrong in this failure); and a happy-eyeballs connect loop in the sink path (more
+moving parts than the bug).

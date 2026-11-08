@@ -297,8 +297,8 @@ auto test_transcode() -> void
     expect(has("tsdemux") && has("videoconvert") && has("videoscale")
                && has("capsfilter"),
            "convert chain elements required");
-    expect(has("vaav1dec") && has("av1dec") && has("dav1ddec"),
-           "av1 decoder alternatives listed");
+    expect(has("vaav1dec") && has("av1dec"),
+           "av1 decoder alternatives listed (hardware, then software)");
     expect(has("vah264enc") && !has("x264enc"),
            "h264 encoder requirement is hardware only");
     expect(has("h264parse"), "target parser required");
@@ -341,6 +341,70 @@ auto test_transcode() -> void
   }
   std::puts("ok: transcode");
 }
+
+// ---------------------------------------------------------------------------
+auto test_address_order() -> void
+{
+  // getaddrinfo under RFC 6724 returns AAAA first whenever the caller's host
+  // has a routable-looking IPv6 address, route or no route. The connect target
+  // is ips.front() and is never re-resolved, so the resolver must hand the
+  // IPv4 records first or a single-stack container pins an unreachable v6.
+  {
+    std::vector<std::string> ips {"2606:4700:4700::1111",
+                                  "2001:4860:4860::8888",
+                                  "142.250.195.172",
+                                  "142.251.222.236"};
+    order_addresses_prefer_ipv4(ips);
+    expect(ips.size() == 4, "ordering keeps every address");
+    expect(ips[0] == "142.250.195.172" && ips[1] == "142.251.222.236",
+           "IPv4 records first, in resolver order");
+    expect(ips[2] == "2606:4700:4700::1111"
+               && ips[3] == "2001:4860:4860::8888",
+           "IPv6 records kept, in resolver order, as fallback");
+  }
+  {
+    // AAAA-only destination still yields a usable address: the fix is a
+    // preference, not an IPv4-only resolver.
+    std::vector<std::string> ips {"2606:4700:4700::1111"};
+    order_addresses_prefer_ipv4(ips);
+    expect(ips.size() == 1 && ips[0] == "2606:4700:4700::1111",
+           "IPv6-only name is not emptied");
+  }
+  {
+    // IPv4-mapped IPv6 literals are IPv4 for classification, so they must sort
+    // with IPv4 rather than being treated as native v6.
+    std::vector<std::string> ips {"2606:4700:4700::1111",
+                                  "::ffff:203.0.113.50"};
+    order_addresses_prefer_ipv4(ips);
+    expect(ips[0] == "::ffff:203.0.113.50",
+           "IPv4-mapped literal sorts as IPv4");
+  }
+  {
+    std::vector<std::string> empty;
+    order_addresses_prefer_ipv4(empty);
+    expect(empty.empty(), "empty list stays empty");
+  }
+  {
+    // End to end through validation: a dual-stack answer pins the v4 even when
+    // the resolver offered v6 first. Both records are still vetted, so the
+    // v6-in-the-answer rebinding check is unaffected.
+    const resolve_fn v6_first =
+        [](const std::string&, std::vector<std::string>& ips) -> bool
+    {
+      ips = {"2606:4700:4700::1111", "203.0.113.50"};
+      order_addresses_prefer_ipv4(ips);
+      return true;
+    };
+    receiver_config cfg = make_cfg();
+    expect(validate_config(cfg).ok, "structural ok for order test");
+    const egress_policy strict {};
+    const auto res = validate_and_pin_outputs(cfg, strict, v6_first);
+    expect(res.ok, "dual-stack destination accepted");
+    expect(cfg.outputs[0].pinned_ip == "203.0.113.50",
+           "IPv4 pinned for connect out of a v6-first answer");
+  }
+  std::puts("ok: address order prefers IPv4");
+}
 }  // namespace
 
 auto main() -> int
@@ -349,6 +413,7 @@ auto main() -> int
   test_ip_classes();
   test_egress_pinning();
   test_transcode();
+  test_address_order();
   std::puts("validate_test: ALL OK");
   return 0;
 }

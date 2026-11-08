@@ -800,8 +800,22 @@ auto default_resolver() -> resolve_fn
       }
     }
     freeaddrinfo(results);
+    // Pin IPv4 whenever the name has an A record: the result is the connect
+    // target for the output's lifetime (never re-resolved), so a resolver-side
+    // v6 preference would pin an address this container cannot route.
+    order_addresses_prefer_ipv4(ips);
     return !ips.empty();
   };
+}
+
+auto order_addresses_prefer_ipv4(std::vector<std::string>& ips) -> void
+{
+  const auto is_v4 = [](const std::string& literal)
+  {
+    const parsed_ip ip = parse_ip(literal);
+    return ip.valid && !ip.is_v6;
+  };
+  std::stable_partition(ips.begin(), ips.end(), is_v4);
 }
 
 auto forbidden_reason(const std::string& ip_literal,
