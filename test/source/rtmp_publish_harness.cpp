@@ -17,12 +17,13 @@
 //
 // Modes (all use the production templates; nothing here rebuilds a pipeline by
 // hand):
-//   transcode-video-only  h264 transcode, frame ring only, no audio in the
-//                         ts_ring. flvmux holds the output until its audio pad
-//                         carries data or is unlinked, so this is the "missing
-//                         audio pad must not stall the muxer" case: the code's
-//                         4 s probe has to drop the pad and video must still
-//                         reach the server.
+//   transcode-video-only  h264 transcode, frame ring plus a video-only
+//                         H.264-in-MPEG-TS clip in the ts_ring -- the shape of a
+//                         real video-only ingest. The audio branch finds no AAC
+//                         pad in that TS, so tsdemux must have its video pad
+//                         sunk, and flvmux holds the output until its audio pad
+//                         carries data or is unlinked: the code's 4 s probe has
+//                         to drop the pad and video must still reach the server.
 //   transcode-av          h264 transcode, frame ring plus a real AAC-in-MPEG-TS
 //                         clip in the ts_ring (the audio copy branch).
 //   copy-av               copy-only tier (tsparse/tsdemux/flvmux) fed an
@@ -835,6 +836,18 @@ auto main(int argc, char** argv) -> int
       ts_clip = make_aac_ts(128000, fixture_seconds);
       if (ts_clip.empty()) {
         std::fprintf(stderr, "FAIL: could not generate the AAC-in-TS fixture\n");
+        return 1;
+      }
+    } else {
+      // A video-only ingest still delivers its TS on the ts_ring. The audio
+      // branch demuxes it, finds no AAC pad, and must sink the video pad rather
+      // than let tsdemux kill the pipeline with "streaming stopped,
+      // reason=not-linked".
+      ts_clip = make_h264_ts(opts.width, opts.height, opts.bitrate_kbps,
+                            fixture_seconds);
+      if (ts_clip.empty()) {
+        std::fprintf(stderr, "FAIL: could not generate the video-only TS "
+                             "fixture\n");
         return 1;
       }
     }

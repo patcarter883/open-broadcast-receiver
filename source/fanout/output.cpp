@@ -314,7 +314,8 @@ auto output_template(output_proto proto,
           "! audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
           "codec_data=(buffer)1190 ! mux. "
           "{} name=mux streamable=true "
-          "! rtmp2sink name=osink async-connect=true",
+          "! rtmp2sink name=osink async-connect=true "
+          "funnel name=adrop ! fakesink sync=false async=false",
           k_appsrc,
           scale,
           k_raw_nv12,
@@ -622,7 +623,7 @@ auto output::build_pipeline(std::string& err) -> bool
   return true;
 }
 
-auto output::demux_pad_added(GstElement* /*demux*/,
+auto output::demux_pad_added(GstElement* demux,
                              GstPad* pad,
                              gpointer self) -> void
 {
@@ -631,6 +632,34 @@ auto output::demux_pad_added(GstElement* /*demux*/,
   const bool is_audio = name != nullptr && g_str_has_prefix(name, "audio");
   g_free(name);
   if (!is_audio) {
+    // The transcode audio branch demuxes the source TS only to copy its AAC. A
+    // stream with no audio still exposes its video pad there, and a tsdemux
+    // whose src pad is left unlinked fails the whole pipeline with
+    // "streaming stopped, reason=not-linked" -- the output then reconnects
+    // forever and nothing publishes. Sink those pads into the drop funnel: the
+    // video is already carried by the frame ring, and the copy path links its
+    // own pads from the template.
+    const char* demux_name = GST_OBJECT_NAME(demux);
+    if (demux_name == nullptr || g_strcmp0(demux_name, "ad") != 0) {
+      return;
+    }
+    GstElement* adrop = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "adrop");
+    if (adrop == nullptr) {
+      return;
+    }
+    GstPad* sink = gst_element_request_pad_simple(adrop, "sink_%u");
+    if (sink != nullptr) {
+      if (!gst_pad_is_linked(sink)) {
+        const GstPadLinkReturn lr = gst_pad_link(pad, sink);
+        if (lr != GST_PAD_LINK_OK) {
+          out->log(std::format("non-audio pad from the audio branch could not "
+                               "be sunk ({}); output runs video-only\n",
+                               gst_pad_link_get_name(lr)));
+        }
+      }
+      gst_object_unref(sink);
+    }
+    gst_object_unref(adrop);
     return;
   }
 
