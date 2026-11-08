@@ -19,6 +19,8 @@ if(OBR_TESTS_ONLY)
         PRIVATE
             es_looper.h
             es_looper.cpp
+            stream_switch.h
+            stream_switch.cpp
     )
 
     target_include_directories(standby_lib PUBLIC
@@ -37,6 +39,8 @@ target_sources(standby_lib ${warning_guard}
         render.cpp
         es_looper.h
         es_looper.cpp
+        stream_switch.h
+        stream_switch.cpp
 )
 
 target_include_directories(standby_lib PUBLIC

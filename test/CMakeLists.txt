@@ -213,3 +213,20 @@ if(NOT OBR_TESTS_ONLY)
   add_test(NAME slate_pipeline_test COMMAND slate_pipeline_test)
   set_tests_properties(slate_pipeline_test PROPERTIES TIMEOUT 120)
 endif()
+
+# stream_switch_test (plan C2). The keyframe predicate is pure and runs in
+# both lanes; the selector/pipeline half is GStreamer-only and is compiled in
+# only when the media stack is (it drives a real input-selector from two appsrc
+# branches of generated h264 AUs). In the full lane it exits 77 when no h264
+# encoder/parser is installed.
+add_executable(stream_switch_test source/stream_switch_test.cpp)
+target_link_libraries(stream_switch_test PRIVATE standby_lib Threads::Threads)
+target_compile_features(stream_switch_test PRIVATE cxx_std_20)
+add_test(NAME stream_switch_test COMMAND stream_switch_test)
+set_tests_properties(stream_switch_test PROPERTIES TIMEOUT 180)
+if(NOT OBR_TESTS_ONLY)
+  target_link_libraries(stream_switch_test PRIVATE
+    PkgConfig::gstreamer
+    PkgConfig::gstreamer-app)
+  set_tests_properties(stream_switch_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()

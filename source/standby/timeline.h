@@ -35,12 +35,16 @@
 //    Both streams take the state's offset, and anchor() is called once at a
 //    source switch so the incoming source's first stamp lands one frame after
 //    the last published one — for both streams at once.
-//  - Consequence of sharing: apply() advances last_out, the single published
-//    floor. The stream whose timestamps drive the timeline calls apply(); the
-//    other stream's buffers are rewritten with offset_ns() (they must not move
-//    the floor, or an audio buffer a few milliseconds behind the video would
-//    clamp and lift the offset under the video). Both are still shifted by the
-//    same offset, which is what A/V sync needs.
+//  - Consequence of sharing: ONE stream DRIVES the timeline. It is the stream
+//    the switch decisions are made on (video), and each of its buffers passes
+//    through apply_driver(), which anchors the timeline, clamps a backwards or
+//    absurdly forward stamp and advances last_out. Every other stream (audio)
+//    calls apply_follower(), which only shifts the buffer by the offset the
+//    driver has already chosen. A follower must never move the floor: an audio
+//    buffer a few milliseconds behind the video would otherwise clamp and lift
+//    the offset out from under the video. The two entry points make that
+//    mistake unrepresentable -- there is no single apply() that can be called
+//    from the wrong side.
 //
 // Pure arithmetic and state: no GStreamer types, so it is unit-testable and the
 // pad-probe that calls it (a later task) stays a two-line adapter.
@@ -60,10 +64,17 @@ public:
   // offset stays 0: the timeline starts on the source's own clock.
   auto anchor(std::int64_t first_in_pts_ns) -> void;
 
-  // Rewrite one buffer's stamps in place. Returns false if the buffer must be
-  // dropped: a malformed stamp (dts after pts, or a rewrite that cannot be made
-  // strictly monotonic). A refused buffer changes no state.
-  auto apply(std::int64_t& pts_ns, std::int64_t& dts_ns) -> bool;
+  // Rewrite one buffer of the DRIVING stream in place, and advance the shared
+  // timeline. Returns false if the buffer must be dropped: a malformed stamp
+  // (dts after pts, or a rewrite that cannot be made strictly monotonic). A
+  // refused buffer changes no state.
+  auto apply_driver(std::int64_t& pts_ns, std::int64_t& dts_ns) -> bool;
+
+  // Rewrite one buffer of a FOLLOWING stream in place. Adds the current offset
+  // only: it never clamps and never moves last_out or the offset, so a follower
+  // that runs ahead of or behind the driver cannot drag the shared timeline.
+  // Returns false only for a malformed stamp or an overflowing rewrite.
+  auto apply_follower(std::int64_t& pts_ns, std::int64_t& dts_ns) -> bool;
 
   // The last published output PTS (0 before anything is published).
   [[nodiscard]] auto last_out_ns() const noexcept -> std::int64_t

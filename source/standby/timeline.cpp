@@ -66,7 +66,8 @@ auto timeline_state::anchor(std::int64_t first_in_pts_ns) -> void
   m_offset = offset;
 }
 
-auto timeline_state::apply(std::int64_t& pts_ns, std::int64_t& dts_ns) -> bool
+auto timeline_state::apply_driver(std::int64_t& pts_ns, std::int64_t& dts_ns)
+    -> bool
 {
   // A buffer whose DTS is after its PTS is not a reorder delay, it is a broken
   // stamp; no offset makes it legal.
@@ -124,6 +125,33 @@ auto timeline_state::apply(std::int64_t& pts_ns, std::int64_t& dts_ns) -> bool
   m_last_out = last_out;
   m_have_last = true;
   pts_ns = last_out;
+  dts_ns = dts_out;
+  return true;
+}
+
+auto timeline_state::apply_follower(std::int64_t& pts_ns, std::int64_t& dts_ns)
+    -> bool
+{
+  // Same legality test as the driver: a reorder distance is a pts-dts delta,
+  // never a negative one.
+  if (dts_ns > pts_ns) {
+    return false;
+  }
+  const std::int64_t reorder = pts_ns - dts_ns;
+
+  std::int64_t out = 0;
+  if (!checked_add(pts_ns, m_offset, out)) {
+    return false;
+  }
+  // The follower takes exactly the offset the driver chose. It reads no other
+  // state and writes none: last_out and the offset stay where the driver left
+  // them, so a follower buffer that is early, late or duplicated cannot clamp
+  // the published timeline or shift the other stream's audio.
+  std::int64_t dts_out = 0;
+  if (!checked_sub(out, reorder, dts_out)) {
+    return false;
+  }
+  pts_ns = out;
   dts_ns = dts_out;
   return true;
 }
