@@ -143,14 +143,34 @@ auto timeline_state::apply_follower(std::int64_t& pts_ns, std::int64_t& dts_ns)
   if (!checked_add(pts_ns, m_offset, out)) {
     return false;
   }
-  // The follower takes exactly the offset the driver chose. It reads no other
-  // state and writes none: last_out and the offset stay where the driver left
-  // them, so a follower buffer that is early, late or duplicated cannot clamp
-  // the published timeline or shift the other stream's audio.
+
+  // The follower takes exactly the offset the driver chose, and then checks its
+  // OWN floor: the last stamp it emitted. A source switch can move the shared
+  // offset backwards (a forward-gap compression, or a re-anchor onto a source
+  // whose clock is behind), which would make an audio buffer already stamped on
+  // the old clock land before audio it has already published -- a muxer error,
+  // not a tolerance. Bump it one nanosecond past the follower's last output.
+  // The cost is at most one audio frame of A/V skew at a switch (inaudible);
+  // the alternative is a backwards DTS the muxer cannot encode.
+  //
+  // This is the ONLY thing the follower clamps: it never touches m_last_out or
+  // m_offset. Those belong to the driver, and a late audio buffer must not be
+  // able to lift the video's floor out from under it.
+  if (m_have_follower && out <= m_last_follower) {
+    std::int64_t bumped = 0;
+    if (!checked_add(m_last_follower, 1, bumped)) {
+      return false;
+    }
+    out = bumped;
+  }
+
   std::int64_t dts_out = 0;
   if (!checked_sub(out, reorder, dts_out)) {
     return false;
   }
+
+  m_last_follower = out;
+  m_have_follower = true;
   pts_ns = out;
   dts_ns = dts_out;
   return true;

@@ -330,20 +330,28 @@ auto check_monotonic(const std::vector<collected>& aus, const char* what)
   return ok;
 }
 
-// The follower contract, tested honestly: audio only ADDS the driver's offset
-// (it never moves the floor), so at a source switch an audio AU can step back by
-// less than one audio frame while the driver re-anchors. Everything larger is a
-// broken timeline; everything monotonic-within-a-frame is the design.
+// The follower contract, tested strictly: audio only ADDS the driver's offset
+// and then clamps forward against its own last stamp, so every audio stream a
+// muxer ever sees is STRICTLY monotonic across any number of source switches.
+// A switch may cost one audio frame of A/V skew (inaudible); a backwards PTS
+// is a muxer error, so it is never tolerated.
 auto check_audio_timeline(const std::vector<collected>& aus) -> bool
 {
-  constexpr std::int64_t k_tolerance = 40'000'000;  // one AAC frame + slack
+  // A switch may leave audio a real hole (the stream was starved while the
+  // other branch published); that hole can never exceed the stage's own
+  // max_gap, which is what the driver compresses to. A hole is fine. A
+  // BACKWARDS stamp is not: it is the defect this check exists to catch.
+  constexpr std::int64_t k_audio_max_step_ns = 4'000'000'000;  // max_gap_ms
+
   for (std::size_t i = 1; i < aus.size(); ++i) {
     const std::int64_t step = aus[i].meta.pts_ns - aus[i - 1].meta.pts_ns;
-    if (step < -k_tolerance || step > 500'000'000) {
-      return expect(false, std::format("audio: PTS step out of bounds at AU {} "
-                                       "({} -> {})",
-                                       i, aus[i - 1].meta.pts_ns / 1'000'000,
-                                       aus[i].meta.pts_ns / 1'000'000));
+    if (step <= 0 || step > k_audio_max_step_ns) {
+      return expect(false, std::format("audio: PTS not strictly monotonic at "
+                                       "AU {} ({} -> {} ms, step {} us)",
+                                       i,
+                                       aus[i - 1].meta.pts_ns / 1'000'000,
+                                       aus[i].meta.pts_ns / 1'000'000,
+                                       step / 1'000));
     }
   }
   return true;
@@ -599,6 +607,14 @@ auto main() -> int
          "stats() counts AUs in and out");
   expect(final_stats.aus_out <= final_stats.aus_in,
          "no more AUs published than passed the switches");
+
+  // ---- 2b. every audio AU of the whole run, across both set_slate round
+  // trips, is strictly monotonic: no tolerance for a backwards stamp ---------
+  {
+    const auto all_audio = sink.audio();
+    expect(all_audio.size() > 12, "audio spans every switch");
+    check_audio_timeline(all_audio);
+  }
 
   st.stop();
   st.stop();  // idempotent

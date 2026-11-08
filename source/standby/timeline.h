@@ -39,12 +39,23 @@
 //    the switch decisions are made on (video), and each of its buffers passes
 //    through apply_driver(), which anchors the timeline, clamps a backwards or
 //    absurdly forward stamp and advances last_out. Every other stream (audio)
-//    calls apply_follower(), which only shifts the buffer by the offset the
-//    driver has already chosen. A follower must never move the floor: an audio
-//    buffer a few milliseconds behind the video would otherwise clamp and lift
-//    the offset out from under the video. The two entry points make that
-//    mistake unrepresentable -- there is no single apply() that can be called
-//    from the wrong side.
+//    calls apply_follower(), which shifts the buffer by the offset the driver
+//    has already chosen AND clamps it against the follower's own last stamp. A
+//    follower must never move the shared floor: an audio buffer a few
+//    milliseconds behind the video would otherwise clamp and lift the offset
+//    out of the driver's hands. The two entry points make that mistake
+//    unrepresentable -- there is no single apply() that can be called from the
+//    wrong side.
+//  - Why the follower needs a floor of its own: at a switch the shared offset
+//    can move BACKWARDS (a forward-gap compression, or a re-anchor onto a
+//    source whose clock is behind), so an audio buffer already stamped on the
+//    outgoing source's clock would land before audio the stage has already
+//    published. A muxer requires monotonic timestamps on every stream; it
+//    cannot encode a backwards stamp at all. So apply_follower() bumps such a
+//    buffer one nanosecond past the follower's own last output.
+//    THE COST OF THAT CLAMP IS AT MOST ONE AUDIO FRAME OF A/V SKEW AT A
+//    SWITCH, which is inaudible; the alternative is a stream the muxer
+//    rejects. This is a deliberate trade, not a tolerance to be widened later.
 //
 // Pure arithmetic and state: no GStreamer types, so it is unit-testable and the
 // pad-probe that calls it (a later task) stays a two-line adapter.
@@ -71,10 +82,20 @@ public:
   auto apply_driver(std::int64_t& pts_ns, std::int64_t& dts_ns) -> bool;
 
   // Rewrite one buffer of a FOLLOWING stream in place. Adds the current offset
-  // only: it never clamps and never moves last_out or the offset, so a follower
+  // and then clamps forward against the follower's own last output: a stamp at
+  // or before it becomes last_follower + 1 ns. That is the follower's whole
+  // monotonic guarantee -- it never moves last_out or the offset, so a follower
   // that runs ahead of or behind the driver cannot drag the shared timeline.
-  // Returns false only for a malformed stamp or an overflowing rewrite.
+  // Returns false only for a malformed stamp or an overflowing rewrite, in
+  // which case no state changes.
   auto apply_follower(std::int64_t& pts_ns, std::int64_t& dts_ns) -> bool;
+
+  // The last output PTS of the FOLLOWING stream (0 before it emits anything).
+  // It is the follower's own monotonic floor and is never the driver's.
+  [[nodiscard]] auto last_follower_ns() const noexcept -> std::int64_t
+  {
+    return m_last_follower;
+  }
 
   // The last published output PTS (0 before anything is published).
   [[nodiscard]] auto last_out_ns() const noexcept -> std::int64_t
@@ -104,6 +125,10 @@ private:
   std::int64_t m_offset = 0;
   std::int64_t m_last_out = 0;
   bool m_have_last = false;
+  // The follower's own floor: the last stamp IT emitted. Kept separate from
+  // m_last_out because the driver owns that one.
+  std::int64_t m_last_follower = 0;
+  bool m_have_follower = false;
 };
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_STANDBY_TIMELINE_H
