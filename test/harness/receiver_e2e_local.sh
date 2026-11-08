@@ -304,17 +304,19 @@ sample() {  # $1 = elapsed seconds
   ready_str=$(jq -r '.items[0].ready // false' <<<"${sink}" 2>/dev/null)
   bytes_sent=$(jq -r '.items[0].bytesReceived // 0' <<<"${sink}" 2>/dev/null)
   state=$(jq -r '.outputs[0].state // "?"' <<<"${stats}" 2>/dev/null)
-  local rist_recv ts_in out_bytes dropped
+  local rist_recv ts_in out_bytes dropped reconnects
   rist_recv=$(jq -r '.rist.received // 0' <<<"${stats}" 2>/dev/null)
   ts_in=$(jq -r '.ts_in.bytes_total // 0' <<<"${stats}" 2>/dev/null)
   out_bytes=$(jq -r '.outputs[0].bytes_sent // 0' <<<"${stats}" 2>/dev/null)
   dropped=$(jq -r '.outputs[0].transcode.frames_dropped // 0' <<<"${stats}" 2>/dev/null)
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  reconnects=$(jq -r '.outputs[0].reconnects // 0' <<<"${stats}" 2>/dev/null)
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$1" "${rist_recv}" "${ts_in}" "${state}" "${out_bytes}" "${dropped}" \
-    "${path}:${ready_str}" "${bytes_sent}" | tee -a "${SAMPLE_LOG}"
+    "${reconnects}" "${path}:${ready_str}" "${bytes_sent}" \
+    | tee -a "${SAMPLE_LOG}"
 }
 
-echo "t	rist_recv	ts_in	out_state	out_bytes_sent	frames_dropped	sink_path:ready	sink_bytes_received"
+echo "t	rist_recv	ts_in	out_state	out_bytes_sent	frames_dropped	reconnects	sink_path:ready	sink_bytes_received"
 pull_pid=""
 PULL_FILE="${LOG_DIR}/pulled-from-sink.flv"
 rm -f "${PULL_FILE}"
@@ -339,12 +341,13 @@ echo
 echo "=== counter trace ==="
 column -t -s $'\t' "${SAMPLE_LOG}"
 
-first_sink_bytes=$(awk -F'\t' 'NR>1 && $8+0>0 {print $8; exit}' "${SAMPLE_LOG}")
-last_sink_bytes=$(awk -F'\t' 'END{print $8+0}' "${SAMPLE_LOG}")
+first_sink_bytes=$(awk -F'\t' 'NR>1 && $9+0>0 {print $9; exit}' "${SAMPLE_LOG}")
+last_sink_bytes=$(awk -F'\t' 'END{print $9+0}' "${SAMPLE_LOG}")
 sink_growth=$(( last_sink_bytes - ${first_sink_bytes:-0} ))
 max_ts_in=$(awk -F'\t' 'NR>1 && $3+0>m {m=$3+0} END{print m+0}' "${SAMPLE_LOG}")
 max_rist=$(awk -F'\t' 'NR>1 && $2+0>m {m=$2+0} END{print m+0}' "${SAMPLE_LOG}")
 out_running=$(awk -F'\t' 'NR>1 && $4=="running" {c++} END{print c+0}' "${SAMPLE_LOG}")
+max_reconnects=$(awk -F'\t' 'NR>1 && $7+0>m {m=$7+0} END{print m+0}' "${SAMPLE_LOG}")
 
 decoder_line=$(grep -a "\[decoder\] in=" "${RECEIVER_LOG}" | tail -1)
 decoded=$(sed -n 's/.*decoded=\([0-9]*\).*/\1/p' <<<"${decoder_line}")
@@ -358,9 +361,9 @@ echo "=== decode stage (last [decoder] line) ==="
 echo "${decoder_line:-<no decoder log line>}"
 echo
 echo "=== publish ==="
-echo "sink path            $(tail -1 "${SAMPLE_LOG}" | cut -f7)"
+echo "sink path            $(tail -1 "${SAMPLE_LOG}" | cut -f8)"
 echo "sink bytesReceived   ${first_sink_bytes:-0} -> ${last_sink_bytes} (growth ${sink_growth})"
-echo "output state         running in ${out_running} sample(s)"
+echo "output state         running in ${out_running} sample(s), reconnects ${max_reconnects}"
 
 pull_ok=0
 if [[ -s "${PULL_FILE}" ]]; then
@@ -391,6 +394,10 @@ elif [[ "${demux:-0}" -eq 0 ]]; then
   verdict=1
 elif [[ "${decoded:-0}" -eq 0 ]]; then
   echo "VERDICT: STALLED at ${decoder_elem:-the decoder} (${demux} demuxed buffers, 0 decoded)"
+  verdict=1
+elif [[ "${max_reconnects}" -ne 0 ]]; then
+  echo "VERDICT: RECONNECTED — the sink received ${sink_growth} B, but the output rebuilt"
+  echo "         its attempt ${max_reconnects} time(s); the run never held one connection."
   verdict=1
 elif [[ "${sink_growth}" -lt 32768 ]]; then
   echo "VERDICT: decode OK (${decoded} frames, ${decoder_elem}), but STALLED before RTMP:"
