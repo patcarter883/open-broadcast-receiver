@@ -44,7 +44,7 @@ do not), and it is what the harness reads.
 | --- | --- | --- |
 | `transcode-av` | NV12 frames + AAC-in-MPEG-TS | publishes |
 | `transcode-av1` | AV1-in-MPEG-TS on the ts_ring, decoded by the receiver's own decode stage into the frame ring (`--fixture`, `FIXTURE=`) | publishes, with `vaav1dec` having produced frames |
-| `transcode-video-only` | NV12 frames, no audio at all | publishes once the 4 s probe retires the capless audio pad (unlink + EOS) |
+| `transcode-video-only` | NV12 frames, no audio at all | publishes once the audio-pad probe retires the capless pad (unlink + EOS) |
 | `copy-av` | H.264+AAC MPEG-TS | publishes |
 | `copy-video-only` | H.264-only MPEG-TS | does **not** publish (the copy template has no timeout unlink, so flvmux waits for audio forever) |
 
@@ -98,15 +98,18 @@ what the encoder sends (4:2:0 8-bit) and not what any destination decodes.
 flvmux keeps a linked request pad in its collect-pad aggregate even after its
 peer is unlinked. With no caps on that pad the muxer never completes
 negotiation and emits nothing, so video backs up through the queue into
-`vah264enc` and then into the 4 MB appsrc, and the stall watchdog rebuilds the
-attempt every 4 s. Isolated on the same flvmux/vah264enc chain with a starved
-audio appsrc: doing nothing yields 0 muxer buffers over the next 4 s, unlinking
-the peer also yields 0, and unlinking then pushing EOS on the muxer's audio sink
-pad yields 273.
+`vah264enc` and then into the video appsrc, and the stall watchdog rebuilds the
+attempt after `k_stall_timeout`. Isolated on the same flvmux/vah264enc chain
+with a starved audio appsrc: doing nothing yields 0 muxer buffers over the next
+4 s, unlinking the peer also yields 0, and unlinking then pushing EOS on the
+muxer's audio sink pad yields 273.
 
-`output::feed_transcode`'s 4 s probe therefore sends `gst_event_new_eos()` on
-the muxer's audio sink pad after the unlink, logs whether the EOS was accepted,
-and only then reports the pad dropped.
+`output::retire_empty_audio_pad` therefore sends `gst_event_new_eos()` on the
+muxer's audio sink pad after the unlink, logs whether the EOS was accepted, and
+only then reports the pad dropped. It runs from the feed loop and from the
+backpressure wait (a muxer that is not collecting is what backfills the
+appsrc), and its deadline is 500 ms after the first video frame reaches the
+encoder.
 
 ## Notes
 
@@ -118,3 +121,100 @@ and only then reports the pad dropped.
 - The harness publishes. Run it only against a sink you started for it; the
   script removes its own container by name on exit and touches nothing else.
 - Ports are overridable: `RTMP_PORT=21935 STAT_PORT=28080 ...`.
+
+## Whole-binary e2e: RIST in, RTMP out
+
+    test/harness/receiver_e2e_local.sh
+
+`rtmp_publish_harness` drives `output` directly with synthetic ring contents.
+This harness instead runs the **shipped binary, unmodified, from its own control
+API**: a real AV1-in-MPEG-TS fixture goes over real RIST (`rist_feed`,
+ADVANCED/SOURCE) into `--rist-port`, `POST /start` configures one transcode
+output, and `/stats` is sampled once a second while the RTMP server's own
+counters are read from MediaMTX's `/v3/paths/list`.
+
+Nothing leaves the machine, and nothing needs the capture box.
+
+### The fixture is checked before anything else runs
+
+`test/tools/make-av1-ts-fixture.sh` muxes it with the encoder's exact settings
+(`mpegtsmux alignment=7 enable-custom-mappings=true`, `av1parse` pinned to
+`obu-stream,alignment=frame`). The harness then prints, and gates on:
+
+- the PMT actually present in the file — `stream_type=0x06` with the `AV1G`
+  registration descriptor and the `0x80` av1C record;
+- `filesrc ! tsparse ! tsdemux` exposing a **`video/x-av1`** pad.
+
+`ffprobe` is printed too, but it reports `codec_name=bin_data` for this
+fixture: FFmpeg's MPEG-TS demuxer has no mapping for AV1 in a private
+(0x06/AV1G) stream, so it *cannot* be the validity gate. A fixture that is
+genuinely bin_data+AAC fails the PMT and tsdemux checks above, which is what
+makes those two the real gate — the earlier, invalid `test_av1.ts` would have
+failed them.
+
+### Why the sink is not on 127.0.0.1
+
+The receiver's egress policy refuses loopback unconditionally (`classify()` in
+`source/lib/lib.cpp` returns `"loopback"` for 127.0.0.0/8 even with
+`--egress-allow-private`). The harness therefore points at the box's own first
+global IPv4 (`SINK_HOST=` to override) — still on this machine, still no
+network — and runs MediaMTX bound to that address.
+
+### PASS rule
+
+All three, from data the receiver does not produce:
+
+1. the decoder's staged counters show `decoded>0` and `state=PLAYING`;
+2. the RTMP server's `bytesReceived` for the path grows by ≥ 32 KiB;
+3. 3 s of the published stream are pulled **back out** of the RTMP server with
+   `ffmpeg -c copy` and probe as H.264 video with frames in it.
+
+`bytes_sent` is printed but never trusted: for a transcode output it counts the
+NV12 frames pushed into the video `appsrc` (≈230 MB for 10 s of 720p), so it
+grows healthily even when nothing reaches RTMP.
+
+On failure the verdict names the first stage that stopped — RIST ingest, TS
+ring, decode appsrc, tsdemux, decoder, or the output — with the counters that
+prove it.
+
+### Current results (this box, RX 9070, vaav1dec + vah264enc)
+
+| fixture | decode | frames dropped | sink growth | pulled back |
+| --- | --- | --- | --- | --- |
+| 1280x720, 300 frames | 298/298, `vaav1dec`, PLAYING | 0 | +2.38 MB | H.264 1280x720, 92 frames / 2.99 s (30.8 fps) |
+| 640x360, 300 frames | 296/296, `vaav1dec`, PLAYING | 0 | +2.10 MB | H.264 640x360, 90 frames / 3.01 s (30.0 fps) |
+
+Both run twice, exit 0 both times. The first published frame leaves the muxer
+~0.5 s after the first decoded frame reaches the encoder (logged as
+`first published frame: N ms ...`); before that, the audio-pad probe is the
+only thing the output waits on.
+
+`FIXTURE_WIDTH` / `FIXTURE_HEIGHT` (default 1280x720) size the generated
+fixture, so the same run can be repeated at another resolution with
+`FIXTURE=… FIXTURE_WIDTH=640 FIXTURE_HEIGHT=360`.
+
+### Transcode throughput
+
+The feed reports its own accounting every 2 s while a transcode attempt runs:
+
+    transcode feed: iters=75 consumed=71 pushed=71 blocked=0 (0 ms/iter,
+    0 ms total) level=1350/10800 KiB peak=1350 KiB read=28.69 ms push=0.00 ms
+    enc_in=70 mux_out=75 ring_drops=0 in 2.0 s
+
+`level/cap` is the video `appsrc`'s current level against its cap, `blocked`
+counts passes that found it full, `enc_in`/`mux_out` are what reached the
+encoder and what the muxer emitted, and `ring_drops` is the frame ring's
+cumulative drop count. A pinned level with `blocked` ≈ 100 % of the passes and
+`ring_drops` climbing is the output starving the encoder, not the encoder
+starving the output.
+
+Two things keep 720p at ingest rate:
+
+- The appsrc cap is a frame count (`k_appsrc_frame_span = 8`), not a fixed byte
+  count, and a full appsrc is waited on through a probe on its src pad instead
+  of a fixed per-pass sleep.
+- The transcode `rtmp2sink` runs `sync=false`. Its input is a live
+  drop-oldest ring, so pacing the encoder from the output clock turns every
+  transient downstream delay into a permanent deficit: the frames needed to
+  catch up are the ones the ring already dropped. The published timeline keeps
+  the source PTS; only the sink's own clock sync is gone.

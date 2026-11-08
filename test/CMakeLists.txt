@@ -83,6 +83,13 @@ if(NOT OBR_TESTS_ONLY)
     SKIP_RETURN_CODE 77
     TIMEOUT 180)
 
+  # rist_feed reads an MPEG-TS byte stream on stdin and sends it to a RIST
+  # listener in 7x188-byte datagrams, so the local e2e harness can drive the
+  # receiver over its real ingest instead of a stub. Not a CTest by itself.
+  add_executable(rist_feed tools/rist_feed.cpp)
+  target_link_libraries(rist_feed PRIVATE ristnet)
+  target_compile_features(rist_feed PRIVATE cxx_std_20)
+
   # Local RTMP publish harness: drives the real output pipeline against a local
   # nginx-rtmp sink and judges it by the server's own byte count. It publishes,
   # so it is built with the full lane but only registered with CTest when a sink

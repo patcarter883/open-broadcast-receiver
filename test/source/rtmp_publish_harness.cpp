@@ -22,8 +22,9 @@
 //                         real video-only ingest. The audio branch finds no AAC
 //                         pad in that TS, so tsdemux must have its video pad
 //                         sunk, and flvmux holds the output until its audio pad
-//                         carries data or is unlinked: the code's 4 s probe has
-//                         to drop the pad and video must still reach the server.
+//                         carries data or is unlinked: the code's audio-pad
+//                         probe has to drop the pad and video must still reach
+//                         the server.
 //   transcode-av          h264 transcode, frame ring plus a real AAC-in-MPEG-TS
 //                         clip in the ts_ring (the audio copy branch).
 //   copy-av               copy-only tier (tsparse/tsdemux/flvmux) fed an
@@ -129,8 +130,8 @@ struct options
 }
 
 // transcode-av1 is fed an AV1 MPEG-TS that carries no audio, so it takes the
-// same video-only path as transcode-video-only (the 4 s probe must retire the
-// capless audio pad).
+// same video-only path as transcode-video-only (the audio-pad probe must
+// retire the capless pad).
 [[nodiscard]] auto has_audio(mode m) -> bool
 {
   return m == mode::transcode_av || m == mode::copy_av;
@@ -1269,7 +1270,7 @@ auto main(int argc, char** argv) -> int
   }
   if (opts.run_mode == mode::transcode_video_only && server_grew
       && audio_dropped) {
-    std::printf("audio unlink         the 4 s probe dropped the capless pad "
+    std::printf("audio unlink         the audio-pad probe dropped the capless pad "
                 "and video still published\n");
   }
 

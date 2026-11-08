@@ -25,10 +25,25 @@ constexpr std::chrono::seconds k_backoff_cap {30};
 // A connection that survives this long resets the backoff to initial — a
 // mid-event platform blip after hours of streaming restarts fast again.
 constexpr std::chrono::seconds k_stable_after {30};
-constexpr guint64 k_appsrc_max_bytes = 4 * 1024 * 1024;
+// The transcode video appsrc is capped in FRAMES, not bytes: a fixed byte cap
+// is a different amount of slack at every resolution (4 MB is 2.9 frames of
+// 720p NV12 and 7.7 of 360p), so one number cannot mean "a few frames ahead of
+// the encoder" for both. Eight frames holds ~0.27 s of 720p, enough for the
+// feed to stay ahead of an encoder running at ingest rate without adding
+// meaningful latency; the floor keeps small frames from being capped tighter
+// than the element's own default.
+constexpr guint64 k_appsrc_frame_span = 8;
+constexpr guint64 k_appsrc_default_bytes = 4 * 1024 * 1024;
+constexpr guint64 k_appsrc_ceiling_bytes = 64 * 1024 * 1024;
 // How long the transit buffer may stay pinned at its limit before the sink is
 // treated as stalled and the attempt is rebuilt.
 constexpr auto k_stall_timeout = std::chrono::seconds(5);
+// How long after the first video frame a silent audio branch may stay linked to
+// the muxer. flvmux emits nothing while its audio pad has no data, so this is
+// the window the output spends unable to publish at all.
+constexpr auto k_audio_probe_delay = std::chrono::milliseconds(500);
+// Period of the transcode feed's accounting line.
+constexpr auto k_feed_stats_period = std::chrono::seconds(2);
 
 auto now_ms() -> int64_t
 {
@@ -84,6 +99,7 @@ auto count_buffer_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer dat
       1, std::memory_order_relaxed);
   return GST_PAD_PROBE_PASS;
 }
+
 }  // namespace
 
 output::output(output_config cfg, ts_ring& ring, frame_ring* frames, log_fn log)
@@ -314,7 +330,12 @@ auto output_template(output_proto proto,
           "! audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
           "codec_data=(buffer)1190 ! mux. "
           "{} name=mux streamable=true "
-          "! rtmp2sink name=osink async-connect=true "
+          // The transcode sink does not sync to the pipeline clock. Its input is
+          // a live drop-oldest ring: pacing the encoder by the output clock
+          // makes every transient downstream delay a permanent deficit, because
+          // the frames needed to catch up have already been dropped by the
+          // ring. The media is live, so its pacing comes from ingest.
+          "! rtmp2sink name=osink async-connect=true sync=false "
           "funnel name=adrop ! fakesink sync=false async=false",
           k_appsrc,
           scale,
@@ -419,13 +440,22 @@ auto output::build_pipeline(std::string& err) -> bool
     return false;
   }
 
-  gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), k_appsrc_max_bytes);
+  gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), k_appsrc_default_bytes);
 
   if (is_transcode) {
+    // The feed thread waits on this mutex when the video appsrc is at its cap;
+    // a buffer leaving the appsrc is the event that frees room, so the wait is
+    // the pipeline's own pace rather than a timer.
+    GstPad* osrc_pad = gst_element_get_static_pad(m_appsrc, "src");
+    if (osrc_pad != nullptr) {
+      gst_pad_add_probe(osrc_pad, GST_PAD_PROBE_TYPE_BUFFER,
+                        &output::appsrc_drained, this, nullptr);
+      gst_object_unref(osrc_pad);
+    }
     m_audio_appsrc = gst_bin_get_by_name(GST_BIN(m_pipeline), "asrc");
     if (m_audio_appsrc != nullptr) {
       gst_app_src_set_max_bytes(GST_APP_SRC(m_audio_appsrc),
-                                k_appsrc_max_bytes);
+                                k_appsrc_default_bytes);
     }
     // ---- Encoder tuning: the relay's own mechanics -------------------------
     // This is the RELAY's business, not policy: it is about making the hardware
@@ -613,6 +643,32 @@ auto output::build_pipeline(std::string& err) -> bool
         g_value_unset(&item);
         gst_iterator_free(it);
         gst_object_unref(mux);
+      }
+      // Where the feed's frames go after the appsrc: buffers arriving at the
+      // encoder and buffers the muxer emits. A pinned appsrc with a low encoder
+      // input count is the encoder, a high input count with a low output count
+      // is the muxer or the sink.
+      if (GstElement* enc = gst_bin_get_by_name(GST_BIN(m_pipeline), "venc");
+          enc != nullptr) {
+        if (GstPad* pad = gst_element_get_static_pad(enc, "sink");
+            pad != nullptr) {
+          gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
+                            &count_buffer_probe, &m_encoder_in, nullptr);
+          gst_object_unref(pad);
+        }
+        gst_object_unref(enc);
+      }
+      if (GstElement* muxer = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
+          muxer != nullptr) {
+        if (GstPad* pad = gst_element_get_static_pad(muxer, "src");
+            pad != nullptr) {
+          gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
+                            &count_buffer_probe, &m_muxer_out, nullptr);
+          gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
+                            &output::muxer_first_buffer, this, nullptr);
+          gst_object_unref(pad);
+        }
+        gst_object_unref(muxer);
       }
       break;
     }
@@ -831,6 +887,9 @@ auto output::start() -> bool
 auto output::stop() -> void
 {
   m_stopping.store(true, std::memory_order_release);
+  // A feed thread waiting for the appsrc to drain returns on this rather than
+  // on its next poll interval.
+  m_feed_cv.notify_all();
   // The pipeline goes to NULL BEFORE the join. A worker blocked inside a
   // GStreamer call (a sink connecting, an appsrc push) never observes m_stopping,
   // and the NULL transition is what releases it -- so the join must not be
@@ -916,6 +975,10 @@ auto output::run_once() -> bool
 
   m_run_started = std::chrono::steady_clock::now();
   m_audio_probe_done = false;
+  m_first_video_push = std::chrono::steady_clock::time_point {};
+  m_first_output_logged.store(false);
+  m_feed = feed_stats {};
+  m_feed.since = m_run_started;
 
   std::vector<uint8_t> buf(k_read_chunk);
   bool announced_running = false;
@@ -1017,19 +1080,18 @@ auto output::run_once() -> bool
   return true;  // stopping
 }
 
-// Transcode feed: encoded VIDEO comes from the shared decode frame ring; AAC
-// AUDIO (rtmp/rtmps only) is copied from the ts_ring, exactly as the copy-only
-// path does, so RTMP audio passthrough is unchanged. Returns true when the
-// caller should stop the attempt (appsrc gone).
-auto output::feed_transcode(bool& video_caps_set) -> bool
+// flvmux emits nothing until its audio pad carries data, so a linked-but-silent
+// audio branch holds the sink in PAUSED with no error anywhere. Once a video
+// frame has been pushed and that pad has still received nothing for
+// k_audio_probe_delay, the branch is retired with unlink + EOS. Called from the
+// feed loop and again from the backpressure wait: a muxer that is not
+// collecting is what backs the appsrc up, and the feed loop is blocked there.
+auto output::retire_empty_audio_pad() -> void
 {
-  // Audio-branch observation, once, 4 s in: flvmux emits nothing until its audio
-  // pad carries data, so a linked-but-silent audio branch holds the sink in
-  // PAUSED with no error anywhere. Probed from the feed thread because this
-  // binary runs no GLib main loop, so a g_timeout would never fire.
   if (!m_audio_probe_done && m_audio_appsrc != nullptr
-      && std::chrono::steady_clock::now() - m_run_started
-          > std::chrono::seconds(4))
+      && m_first_video_push != std::chrono::steady_clock::time_point {}
+      && std::chrono::steady_clock::now() - m_first_video_push
+          > k_audio_probe_delay)
   {
     m_audio_probe_done = true;
     GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
@@ -1084,28 +1146,49 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
       gst_object_unref(mux);
     }
   }
+}
 
-  if (gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc))
-      >= static_cast<guint64>(k_appsrc_max_bytes))
+// Transcode feed: encoded VIDEO comes from the shared decode frame ring; AAC
+// AUDIO (rtmp/rtmps only) is copied from the ts_ring, exactly as the copy-only
+// path does, so RTMP audio passthrough is unchanged. Returns true when the
+// caller should stop the attempt (appsrc gone).
+auto output::feed_transcode(bool& video_caps_set) -> bool
+{
+  retire_empty_audio_pad();
+
+  const guint64 cap = gst_app_src_get_max_bytes(GST_APP_SRC(m_appsrc));
+  const guint64 level =
+      gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc));
+  ++m_feed.iters;
+  m_feed.level_peak = std::max(m_feed.level_peak, static_cast<uint64_t>(level));
+  if (m_feed.since == std::chrono::steady_clock::time_point {}) {
+    m_feed.since = std::chrono::steady_clock::now();
+  }
+
+  if (level >= cap)
   {
-    const auto now = std::chrono::steady_clock::now();
-    if (m_stall_since == std::chrono::steady_clock::time_point {}) {
-      m_stall_since = now;
-    } else if (now - m_stall_since > k_stall_timeout) {
-      m_stall_since = std::chrono::steady_clock::time_point {};
-      set_last_error("output sink stalled");
-      log("sink stalled with a full appsrc; rebuilding the output\n");
+    // Backpressure, not a fixed pause: wait for a buffer to leave the appsrc
+    // and then push the frame that is next in line. Sleeping for a fixed slice
+    // per pass capped the feed at one frame per slice and, with a cap only
+    // ~3 frames deep, held it well below the ingest rate while the ring threw
+    // the difference away.
+    ++m_feed.blocked;
+    const auto blocked_started = std::chrono::steady_clock::now();
+    const bool room = wait_appsrc_drain(cap);
+    m_feed.blocked_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - blocked_started)
+                             .count();
+    if (!room) {
+      report_feed();
       return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    return true;
   }
-  m_stall_since = std::chrono::steady_clock::time_point {};
 
   // Audio first: the branch is pre-linked, so the earliest audio buffer is what
   // keeps the muxer's audio pad from being the thing video waits on. Audio that
-  // is absent or unparsable is handled by the 4 s probe above, which unlinks the
-  // pad rather than letting flvmux hold the output in PAUSED forever.
+  // is absent or unparsable is handled by retire_empty_audio_pad(), which
+  // unlinks the pad rather than letting flvmux hold the output in PAUSED
+  // forever.
   if (m_audio_appsrc != nullptr) {
     std::vector<uint8_t> abuf(k_read_chunk);
     for (;;) {
@@ -1126,10 +1209,15 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   }
 
   frame_ring::frame_meta vmeta;
+  const auto read_started = std::chrono::steady_clock::now();
   const std::size_t vgot =
       m_frames->read(m_frame_consumer, vmeta, m_frame_buf.data(),
                      m_frame_buf.size(), k_read_timeout);
+  m_feed.read_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - read_started)
+                        .count();
   if (vgot > 0) {
+    ++m_feed.consumed;
     if (!video_caps_set) {
       set_video_caps(vgot, vmeta);
       video_caps_set = true;
@@ -1142,14 +1230,115 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
     if ((vmeta.flags & frame_ring::k_flag_keyframe) == 0U) {
       GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_DELTA_UNIT);
     }
-    if (gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf) != GST_FLOW_OK) {
+    const auto push_started = std::chrono::steady_clock::now();
+    const GstFlowReturn pushed =
+        gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf);
+    m_feed.push_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - push_started)
+                          .count();
+    if (pushed != GST_FLOW_OK) {
       set_last_error("appsrc rejected buffer (pipeline flushing)");
       return false;
     }
+    ++m_feed.pushed;
     m_bytes_sent.fetch_add(vgot, std::memory_order_relaxed);
+    if (m_first_video_push == std::chrono::steady_clock::time_point {}) {
+      m_first_video_push = std::chrono::steady_clock::now();
+    }
   }
 
+  report_feed();
   return !m_stopping.load(std::memory_order_acquire);
+}
+
+auto output::muxer_first_buffer(GstPad* /*pad*/, GstPadProbeInfo* /*info*/,
+                                gpointer self) -> GstPadProbeReturn
+{
+  auto* out = static_cast<output*>(self);
+  if (!out->m_first_output_logged.exchange(true)
+      && out->m_first_video_push != std::chrono::steady_clock::time_point {}) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now()
+                          - out->m_first_video_push)
+                          .count();
+    out->log(std::format("first published frame: {:.0f} ms after the first "
+                         "decoded frame reached the encoder\n",
+                         ms));
+  }
+  return GST_PAD_PROBE_PASS;
+}
+
+auto output::appsrc_drained(GstPad* /*pad*/, GstPadProbeInfo* /*info*/,
+                            gpointer self) -> GstPadProbeReturn
+{
+  // Runs on the appsrc's streaming thread, which also holds the appsrc's own
+  // object lock; taking m_feed_mutex here would invert against the feed
+  // thread's level query. The wait is timed instead, so a wakeup that races
+  // the feed thread's level check costs one poll interval, not a frame.
+  static_cast<output*>(self)->m_feed_cv.notify_all();
+  return GST_PAD_PROBE_PASS;
+}
+
+auto output::wait_appsrc_drain(guint64 cap) -> bool
+{
+  std::unique_lock<std::mutex> lock(m_feed_mutex);
+  const auto started = std::chrono::steady_clock::now();
+  while (!m_stopping.load(std::memory_order_acquire)
+         && gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc)) >= cap)
+  {
+    if (std::chrono::steady_clock::now() - started > k_stall_timeout) {
+      lock.unlock();
+      set_last_error("output sink stalled");
+      log("sink stalled with a full appsrc; rebuilding the output\n");
+      return false;
+    }
+    // The usual reason nothing is leaving the appsrc is a muxer waiting on an
+    // audio pad that never fills; that check has to run here too.
+    lock.unlock();
+    retire_empty_audio_pad();
+    lock.lock();
+    // Timed so stop() and a dead sink are still observed; the appsrc probe
+    // wakes this immediately on the normal path.
+    m_feed_cv.wait_for(lock, std::chrono::milliseconds(50));
+  }
+  return !m_stopping.load(std::memory_order_acquire);
+}
+
+auto output::report_feed() -> void
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (m_feed.since == std::chrono::steady_clock::time_point {}) {
+    m_feed.since = now;
+    return;
+  }
+  const double elapsed = std::chrono::duration<double>(now - m_feed.since).count();
+  if (now - m_feed.since < k_feed_stats_period) {
+    return;
+  }
+  const double read_ms = m_feed.consumed > 0
+      ? m_feed.read_ms / static_cast<double>(m_feed.consumed) : 0.0;
+  const double push_ms = m_feed.pushed > 0
+      ? m_feed.push_ms / static_cast<double>(m_feed.pushed) : 0.0;
+  const double blocked_ms = m_feed.iters > 0
+      ? m_feed.blocked_ms / static_cast<double>(m_feed.iters) : 0.0;
+  log(std::format(
+      "transcode feed: iters={} consumed={} pushed={} blocked={} ({} ms/iter, "
+      "{} ms total) level={}/{} KiB peak={} KiB read={:.2f} ms push={:.2f} ms "
+      "enc_in={} mux_out={} ring_drops={} in {:.1f} s\n",
+      m_feed.iters, m_feed.consumed, m_feed.pushed, m_feed.blocked,
+      blocked_ms, m_feed.blocked_ms,
+      gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc)) / 1024,
+      gst_app_src_get_max_bytes(GST_APP_SRC(m_appsrc)) / 1024,
+      m_feed.level_peak / 1024, read_ms, push_ms,
+      m_encoder_in.load(std::memory_order_relaxed) - m_feed.encoder_in,
+      m_muxer_out.load(std::memory_order_relaxed) - m_feed.muxer_out,
+      m_frames->dropped_frames(m_frame_consumer), elapsed));
+  const uint64_t enc_in = m_encoder_in.load(std::memory_order_relaxed);
+  const uint64_t mux_out = m_muxer_out.load(std::memory_order_relaxed);
+  m_feed = feed_stats {};
+  m_feed.encoder_in = enc_in;
+  m_feed.muxer_out = mux_out;
+  m_feed.since = now;
 }
 
 auto output::log_muxer_input() -> void
@@ -1226,4 +1415,13 @@ auto output::set_video_caps(std::size_t frame_bytes,
                                       nullptr);
   gst_app_src_set_caps(GST_APP_SRC(m_appsrc), caps);
   gst_caps_unref(caps);
+
+  // The cap is now known in frames, so it can be expressed in frames: the
+  // buffer holds k_appsrc_frame_span of them whatever the resolution.
+  const guint64 cap = std::clamp<guint64>(
+      static_cast<guint64>(frame_bytes) * k_appsrc_frame_span,
+      k_appsrc_default_bytes, k_appsrc_ceiling_bytes);
+  gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), cap);
+  log(std::format("video appsrc capped at {} KiB ({} frames of {} B)\n",
+                  cap / 1024, k_appsrc_frame_span, frame_bytes));
 }
