@@ -120,6 +120,7 @@ auto is_audio_branch_element(std::string_view element_name) -> bool
   return std::ranges::any_of(
       k_names, [element_name](std::string_view name)
       { return name == element_name; });
+}
 
 auto classify_drain_hold(std::chrono::milliseconds held, bool published)
     -> drain_verdict
@@ -133,7 +134,6 @@ auto classify_drain_hold(std::chrono::milliseconds held, bool published)
   return held > output_timing::connect_timeout
       ? drain_verdict::publish_not_established
       : drain_verdict::keep_waiting;
-
 }
 
 output::output(output_config cfg,
