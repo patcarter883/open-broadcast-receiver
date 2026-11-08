@@ -18,6 +18,7 @@
 
 #include <gst/gst.h>
 
+#include "fanout/es_ring.h"
 #include "fanout/frame_ring.h"
 #include "fanout/ring.h"
 #include "lib/lib.h"
@@ -48,6 +49,52 @@ enum class drain_verdict : std::uint8_t
 // completed a transfer of media to the server.
 auto classify_drain_hold(std::chrono::milliseconds held, bool published)
     -> drain_verdict;
+
+// Which compressed elementary streams an output consumes when the standby slate
+// is enabled (receiver_config.standby.enabled, schema_version 5).
+//
+// With the slate on, the shared standby stage parses the ingest ONCE and
+// publishes whole access units into an es_ring per stream (video, audio). Every
+// output then reads compressed AUs from those rings instead of being handed the
+// transport stream: a copy output remuxes the AUs into its own container, and
+// the shared decoder parses/decodes the video AUs directly. That is what lets
+// the slate keep every destination fed while no live media is arriving, without
+// each output running its own demux over a TS that may be the slate's.
+//
+// `enabled == false` is today's path, byte for byte: every output reads the
+// ts_ring and demuxes it exactly as before. Nothing in the ring path changes
+// because this struct exists.
+struct es_input_spec
+{
+  bool enabled = false;
+  // The DECLARED ingest codec (/start source.codec): it selects the parser in
+  // front of the muxer or decoder. It is not a guess about the AUs.
+  codec video_codec = codec::h264;
+  // True when an audio es_ring exists for this session, i.e. the ingest carried
+  // an audio stream and the stage published it. A video-only session leaves the
+  // muxer's audio pad unrequested, exactly as the ts path does.
+  bool audio = false;
+  auto operator==(const es_input_spec&) const -> bool = default;
+};
+
+// The rings a standby-enabled session hands one output. Both null is the
+// disabled path (a ts_ring consumer, no ES mode). main passes these only when
+// standby_config.enabled is set; the later stage wiring owns the rings.
+struct es_sources
+{
+  es_ring* video = nullptr;
+  es_ring* audio = nullptr;
+  codec video_codec = codec::h264;
+
+  [[nodiscard]] auto enabled() const noexcept -> bool
+  {
+    return video != nullptr;
+  }
+  [[nodiscard]] auto spec() const noexcept -> es_input_spec
+  {
+    return es_input_spec {enabled(), video_codec, audio != nullptr};
+  }
+};
 
 // output — one self-contained fan-out destination (TRANSPORT_PROFILE §3.2):
 // its own small GstPipeline, its own bus handling, its own state machine and
@@ -87,12 +134,14 @@ public:
   // cfg must already be validated + pinned (validate_config +
   // validate_and_pin_outputs). The rings must outlive this object. `frames`
   // is the shared decode stage's frame_ring, required for a transcode output
-  // and unused (may be nullptr) for a copy-only one.
+  // and unused (may be nullptr) for a copy-only one. `es` is the standby
+  // stage's rings; empty means the ts_ring path this class has always taken.
   output(output_config cfg,
          ts_ring& ring,
          frame_ring* frames,
          log_fn log,
-         repin_fn repin = {});
+         repin_fn repin = {},
+         es_sources es = {});
   ~output();
   output(const output&) = delete;
   auto operator=(const output&) -> output& = delete;
@@ -132,6 +181,12 @@ public:
   {
     return (m_consumer >= 0) ? m_ring.dropped_bytes(m_consumer) : 0;
   }
+  // Whole access units this output never saw because its es_ring cursor was
+  // lapped (standby-enabled path), video plus audio. The ts_ring path reports 0
+  // here and accounts its loss through dropped_bytes(); the two are separate
+  // units on purpose (a TS packet count is not an AU count), so /stats must
+  // render whichever one the session's mode produces rather than add them.
+  [[nodiscard]] auto dropped_aus() const -> uint64_t;
   // Chosen transcode encoder element name (e.g. "vah264enc"), or "" for a
   // copy-only output / before the first pipeline build.
   [[nodiscard]] auto encoder_name() const -> std::string;
@@ -193,9 +248,21 @@ private:
   // One connect attempt: build → play → feed until error/stop. Returns true
   // if the failure is retryable, false if terminal (state already set).
   auto run_once() -> bool;
-  // Transcode feed step (video from frame_ring, AAC audio from ts_ring).
-  // Returns false when the attempt should end (appsrc flushing / stopping).
+  // Transcode feed step (video from frame_ring, AAC audio from ts_ring or the
+  // audio es_ring). Returns false when the attempt should end (appsrc flushing
+  // / stopping).
   auto feed_transcode(bool& video_caps_set) -> bool;
+  // Copy feed step in ES mode: video AUs from the video es_ring into osrc and
+  // audio AUs from the audio es_ring into asrc. Returns false when the attempt
+  // should end (appsrc flushing).
+  auto feed_es_copy() -> bool;
+  // Push every audio AU the audio es_ring currently holds into `asrc`. Returns
+  // false when the appsrc rejected a buffer (pipeline flushing).
+  auto feed_es_audio() -> bool;
+  // ES mode: link acaps to the muxer's audio pad, without a demux pad to wait
+  // on. The audio es_ring is what says audio exists, so this runs at build time
+  // (the ts path defers it to tsdemux's pad-added, where the TS is the evidence).
+  auto attach_es_audio_branch() -> void;
   // Link `pad` to `element_name`'s static pad (or to a requested pad when the
   // pad name ends in %u). Returns true only when this call made the link.
   auto link_pad_to(GstPad* pad, const char* element_name, const char* pad_name)
@@ -263,9 +330,21 @@ private:
   ts_ring& m_ring;
   frame_ring* m_frames = nullptr;  // shared decode stage (transcode only)
   log_fn m_log;
+  // Standby-stage rings (empty on the ts_ring path, which is every session
+  // without standby_config.enabled).
+  es_sources m_es;
 
   int m_consumer = -1;        // ts_ring cursor (copy video / transcode audio)
   int m_frame_consumer = -1;  // frame_ring cursor (transcode video)
+  // es_ring cursors, ES mode only: video for every output, audio only when the
+  // output's muxer takes audio (copy rtmp/rtmps, transcode rtmp/rtmps).
+  int m_es_video_consumer = -1;
+  int m_es_audio_consumer = -1;
+  // One AU at a time, sized for the largest AU the ring can hold rather than
+  // the 32 KiB TS chunk: an IDR at 4K is megabytes, and es_ring::read skips an
+  // AU that does not fit its destination whole.
+  std::vector<std::uint8_t> m_es_video_buf;
+  std::vector<std::uint8_t> m_es_audio_buf;
   std::thread m_thread;
   std::atomic_bool m_stopping {false};
 
@@ -368,13 +447,19 @@ private:
 // Build the gst_parse_launch template for an output (TRANSPORT_PROFILE §3.5).
 // `encoder` is the concrete transcode encoder element name chosen from the
 // shared alternatives list; it is ignored (may be nullptr) for a copy-only
-// config. The template carries NO secrets and NO customer URLs: the sink is
+// config. `es` selects the standby-enabled shape: with `es.enabled` a copy
+// output is fed compressed AUs and remuxes them itself (no tsparse, no tsdemux),
+// and a transcode output's AAC audio comes from the audio es_ring instead of a
+// per-output tsdemux. With `es.enabled == false` (the default) the string is
+// exactly what it has always been.
+// The template carries NO secrets and NO customer URLs: the sink is
 // created unconfigured (name=osink) and its connect properties are set by the
 // caller, so the string is loggable by definition. Exposed so the full-lane
 // test can assert and parse-launch the exact strings used.
 auto output_template(output_proto proto,
                      const transcode_config& transcode,
-                     const char* encoder) -> std::string;
+                     const char* encoder,
+                     const es_input_spec& es = {}) -> std::string;
 
 // The elements that make up an RTMP output's audio branch. A bus error whose
 // source is one of these is retired with the branch rather than the attempt.

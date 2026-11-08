@@ -107,6 +107,7 @@ enum class mode
   copy_audio_first,
   copy_non_aac,
   copy_video_only,
+  copy_es,
   reconnect
 };
 
@@ -149,6 +150,8 @@ struct options
       return "copy-non-aac";
     case mode::copy_video_only:
       return "copy-video-only";
+    case mode::copy_es:
+      return "copy-es";
     case mode::reconnect:
       return "reconnect";
   }
@@ -158,7 +161,16 @@ struct options
 [[nodiscard]] auto is_copy_mode(mode m) -> bool
 {
   return m == mode::copy_av || m == mode::copy_audio_first
-      || m == mode::copy_non_aac || m == mode::copy_video_only;
+      || m == mode::copy_non_aac || m == mode::copy_video_only
+      || m == mode::copy_es;
+}
+
+// copy-es is a copy output fed from the standby stage's es_rings: compressed
+// access units instead of a transport stream, so it has no TS fixture and no
+// demux pad order to measure.
+[[nodiscard]] auto is_es_mode(mode m) -> bool
+{
+  return m == mode::copy_es;
 }
 
 // transcode-av1 is fed an AV1 MPEG-TS that carries no audio, so it takes the
@@ -167,7 +179,7 @@ struct options
 [[nodiscard]] auto has_audio(mode m) -> bool
 {
   return m == mode::transcode_av || m == mode::copy_av
-      || m == mode::copy_audio_first;
+      || m == mode::copy_audio_first || m == mode::copy_es;
 }
 
 // The copy template dispatches tsdemux's pads by caps, so pad order cannot
@@ -191,7 +203,8 @@ auto usage(const char* argv0) -> void
   std::fprintf(stderr,
                "usage: %s [--mode transcode-av|transcode-video-only|"
                "transcode-av1|copy-av|"
-               "copy-audio-first|copy-non-aac|copy-video-only|reconnect]\n"
+               "copy-audio-first|copy-non-aac|copy-video-only|copy-es|"
+               "reconnect]\n"
                "          [--host 127.0.0.1] [--port 11935] [--app live] "
                "[--stream test]\n"
                "          [--stat-url http://127.0.0.1:18080/stat] "
@@ -224,6 +237,9 @@ auto usage(const char* argv0) -> void
   }
   if (text == "copy-video-only") {
     return mode::copy_video_only;
+  }
+  if (text == "copy-es") {
+    return mode::copy_es;
   }
   if (text == "reconnect") {
     return mode::reconnect;
@@ -541,6 +557,114 @@ auto make_ts(const std::string& description) -> std::vector<std::uint8_t>
       "h264parse config-interval=-1 ! mpegtsmux alignment=7 ! "
       "appsink name=sink sync=false",
       seconds * 30, width, height, bitrate_kbps));
+}
+
+// The order tsdemux announces its src pads for a TS clip. Pad order is the
+// property the copy template must not depend on, so the harness measures it and
+// names it in the report instead of trusting the fixture's intent.
+
+// ---------------------------------------------------------------------------
+// ES fixture (copy-es mode): compressed access units, not a transport stream.
+// The standby stage publishes exactly this shape — one whole AU per ring entry
+// with its own PTS/DTS and keyframe flag — so the fixture is generated the same
+// way the real stage would: encode, parse to AU alignment, and keep each buffer
+// as one AU. Generated at run time with the same elements the other modes use,
+// so there is no binary fixture to keep in sync with the encoders.
+// ---------------------------------------------------------------------------
+struct es_au
+{
+  std::vector<std::uint8_t> bytes;
+  std::int64_t pts_ns = 0;
+  bool keyframe = false;
+};
+
+struct es_clip
+{
+  std::vector<es_au> video;
+  std::vector<es_au> audio;
+  std::int64_t duration_ns = 0;       // one pass through the clip (video)
+  std::int64_t audio_duration_ns = 0; // one pass through the clip (audio)
+};
+
+auto make_es_clip(int width, int height, int bitrate_kbps, int fps, int seconds)
+    -> es_clip
+{
+  es_clip clip;
+  pull_samples(
+      std::format(
+          "videotestsrc is-live=false num-buffers={} ! "
+          "video/x-raw,format=I420,width={},height={},framerate={}/1 ! "
+          "x264enc tune=zerolatency bitrate={} key-int-max={} ! "
+          "h264parse config-interval=-1 ! "
+          "video/x-h264,stream-format=byte-stream,alignment=au ! "
+          "appsink name=sink",
+          seconds * fps, width, height, fps, bitrate_kbps, fps),
+      [&clip](GstBuffer* buffer, GstCaps*) -> bool
+      {
+        GstMapInfo map;
+        if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+          return true;
+        }
+        es_au au;
+        au.bytes.assign(map.data, map.data + map.size);
+        au.pts_ns = GST_BUFFER_PTS_IS_VALID(buffer)
+            ? static_cast<std::int64_t>(GST_BUFFER_PTS(buffer))
+            : (clip.video.empty()
+                   ? 0
+                   : clip.video.back().pts_ns + 1'000'000'000LL / 30);
+        // An absent DELTA_UNIT flag is a keyframe (IDR) — the same rule the
+        // decode stage applies to decoded buffers.
+        au.keyframe =
+            !GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+        gst_buffer_unmap(buffer, &map);
+        clip.video.push_back(std::move(au));
+        return true;
+      });
+
+  // ADTS, because that is what a demuxer hands a muxer for AAC and what the
+  // stage publishes: self-describing, so au_meta carries no codec_data.
+  pull_samples(
+      std::format(
+          "audiotestsrc is-live=false num-buffers={} ! "
+          "audio/x-raw,rate=48000,channels=2 ! avenc_aac bitrate=128000 ! "
+          "aacparse ! audio/mpeg,stream-format=adts ! appsink name=sink",
+          seconds * 47),
+      [&clip](GstBuffer* buffer, GstCaps*) -> bool
+      {
+        GstMapInfo map;
+        if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+          return true;
+        }
+        es_au au;
+        au.bytes.assign(map.data, map.data + map.size);
+        au.pts_ns = GST_BUFFER_PTS_IS_VALID(buffer)
+            ? static_cast<std::int64_t>(GST_BUFFER_PTS(buffer))
+            : (clip.audio.empty()
+                   ? 0
+                   : clip.audio.back().pts_ns + 1'000'000'000LL / 47);
+        gst_buffer_unmap(buffer, &map);
+        clip.audio.push_back(std::move(au));
+        return true;
+      });
+
+  // Normalise to a zero origin so the feed's clock is the run's clock.
+  if (!clip.video.empty()) {
+    const std::int64_t base = clip.video.front().pts_ns;
+    for (es_au& au : clip.video) {
+      au.pts_ns -= base;
+    }
+    clip.duration_ns =
+        clip.video.back().pts_ns + 1'000'000'000LL / std::max(fps, 1);
+  }
+  if (!clip.audio.empty()) {
+    const std::int64_t base = clip.audio.front().pts_ns;
+    for (es_au& au : clip.audio) {
+      au.pts_ns -= base;
+    }
+    clip.audio_duration_ns =
+        clip.audio.back().pts_ns + 1'000'000'000LL * 1024 / 48000;
+  }
+  return clip;
 }
 
 // The order tsdemux announces its src pads for a TS clip. Pad order is the
@@ -1123,8 +1247,23 @@ auto main(int argc, char** argv) -> int
   // ---- fixtures ----
   std::vector<std::uint8_t> ts_clip;
   nv12_clip clip;
+  es_clip es_media;
   const int fixture_seconds = std::max(opts.duration_s, 6);
-  if (is_decode_mode(opts.run_mode)) {
+  if (is_es_mode(opts.run_mode)) {
+    // Standby enabled: the stage has already demuxed and parsed, so what the
+    // output consumes is a stream of access units with their own timestamps.
+    // Generated here with the same elements the TS fixtures use.
+    es_media = make_es_clip(opts.width, opts.height, opts.bitrate_kbps,
+                            opts.fps, fixture_seconds);
+    if (es_media.video.empty() || es_media.duration_ns <= 0) {
+      std::fprintf(stderr, "FAIL: could not generate the ES fixture\n");
+      return 1;
+    }
+    if (es_media.audio.empty()) {
+      std::fprintf(stderr, "FAIL: could not generate the audio ES fixture\n");
+      return 1;
+    }
+  } else if (is_decode_mode(opts.run_mode)) {
     // Real ingest shape: an AV1-in-MPEG-TS clip read from disk and fed into a
     // real ts_ring, exactly as the RIST callback would. The frames that reach
     // the frame ring are decoded by the receiver's own decode stage.
@@ -1190,7 +1329,7 @@ auto main(int argc, char** argv) -> int
   // itself: an "audio-first" mode is only that if the audio pad really comes
   // first, and the copy template must publish either way.
   std::vector<std::string> pad_order;
-  if (is_copy_mode(opts.run_mode)) {
+  if (is_copy_mode(opts.run_mode) && !is_es_mode(opts.run_mode)) {
     pad_order = probe_demux_pad_order(ts_clip);
     if (pad_order.empty()) {
       std::fprintf(stderr, "FAIL: tsdemux announced no pads for the fixture\n");
@@ -1201,6 +1340,20 @@ auto main(int argc, char** argv) -> int
   // ---- the real output, configured the way /start configures it ----
   ts_ring ts_ring_instance {ts_ring::size_for_bandwidth(20000)};
   frame_ring frame_ring_instance {frame_ring::k_min_bytes};
+  // copy-es: the two rings the standby stage publishes into. They exist only for
+  // that mode; every other mode leaves es_sources empty, which is the ts_ring
+  // path the output has always taken.
+  std::unique_ptr<es_ring> es_video;
+  std::unique_ptr<es_ring> es_audio;
+  es_sources es_rings;
+  if (is_es_mode(opts.run_mode)) {
+    es_video = std::make_unique<es_ring>(
+        es_ring::size_for_bps(opts.bitrate_kbps));
+    es_audio = std::make_unique<es_ring>(es_ring::size_for_bps(128));
+    es_rings.video = es_video.get();
+    es_rings.audio = es_audio.get();
+    es_rings.video_codec = codec::h264;
+  }
   if (!is_decode_mode(opts.run_mode)
       && frame_ring_instance.capacity()
           < static_cast<std::size_t>(opts.width) * opts.height * 3U / 2U) {
@@ -1247,7 +1400,9 @@ auto main(int argc, char** argv) -> int
                   inst.output_log.push_back(line);
                 }
                 std::fputs(line.c_str(), stderr);
-              }};
+              },
+              {},
+              es_rings};
 
   std::printf("=== RTMP publish harness: mode=%s ===\n", mode_name(opts.run_mode));
   std::printf("build commit   %s\n", OBR_SOURCE_COMMIT);
@@ -1273,6 +1428,11 @@ auto main(int argc, char** argv) -> int
 
   std::uint64_t frames_pushed = 0;
   std::size_t ts_cursor = 0;
+  std::size_t es_video_cursor = 0;
+  std::size_t es_audio_cursor = 0;
+  std::int64_t es_epoch_ns = 0;
+  std::int64_t es_audio_epoch_ns = 0;
+  std::uint64_t es_aus_pushed = 0;
   bool instrumented = false;
   bool server_grew = false;
   std::optional<long long> last_server = baseline.bytes_in;
@@ -1282,8 +1442,53 @@ auto main(int argc, char** argv) -> int
   // that keeps the output alive calls this: a copy output takes TS bytes, a
   // transcode output takes whole NV12 frames plus (for the RTMP audio branch)
   // AAC-in-TS on the same ts_ring, and transcode-av1 only feeds TS because its
-  // frame ring is filled by the real decode stage.
+  // frame ring is filled by the real decode stage. copy-es feeds AU rings.
   const auto pump = [&](double elapsed) -> void {
+    if (is_es_mode(opts.run_mode)) {
+      // Publish AUs paced by their own PTS, exactly as the standby stage does:
+      // an AU becomes visible when its timestamp is due, and the clip repeats by
+      // advancing the epoch so PTS stays monotonic for the whole run.
+      const std::int64_t now_ns = static_cast<std::int64_t>(elapsed * 1e9);
+      for (;;) {
+        if (es_video_cursor >= es_media.video.size()) {
+          es_video_cursor = 0;
+          es_epoch_ns += es_media.duration_ns;
+        }
+        const es_au& au = es_media.video[es_video_cursor];
+        if (au.pts_ns + es_epoch_ns > now_ns) {
+          break;
+        }
+        es_ring::au_meta meta;
+        meta.pts_ns = au.pts_ns + es_epoch_ns;
+        meta.dts_ns = meta.pts_ns;
+        meta.keyframe = au.keyframe;
+        if (!es_video->write(meta, au.bytes.data(), au.bytes.size())) {
+          break;
+        }
+        ++es_video_cursor;
+        ++es_aus_pushed;
+      }
+      for (;;) {
+        if (es_audio_cursor >= es_media.audio.size()) {
+          es_audio_cursor = 0;
+          es_audio_epoch_ns += es_media.audio_duration_ns;
+        }
+        const es_au& au = es_media.audio[es_audio_cursor];
+        if (au.pts_ns + es_audio_epoch_ns > now_ns) {
+          break;
+        }
+        es_ring::au_meta meta;
+        meta.pts_ns = au.pts_ns + es_audio_epoch_ns;
+        meta.dts_ns = meta.pts_ns;
+        meta.keyframe = false;
+        if (!es_audio->write(meta, au.bytes.data(), au.bytes.size())) {
+          break;
+        }
+        ++es_audio_cursor;
+        ++es_aus_pushed;
+      }
+      return;
+    }
     if (is_copy_mode(opts.run_mode) || is_decode_mode(opts.run_mode)) {
       const auto want = static_cast<std::size_t>(
           elapsed / static_cast<double>(fixture_seconds)
@@ -1587,6 +1792,22 @@ auto main(int argc, char** argv) -> int
     }
   }
 
+  // copy-es exists to prove the ES-fed copy template publishes: AUs in, muxer
+  // buffers out, server bytes on top. A publish with no buffer through the
+  // muxer would mean something other than the template produced those bytes.
+  if (ok && server_grew && is_es_mode(opts.run_mode)) {
+    if (es_aus_pushed == 0) {
+      ok = false;
+      mode_failure = "no access unit was ever published into the es_ring";
+    } else if (inst.mux_src_buffers.load() == 0) {
+      ok = false;
+      mode_failure = "the muxer emitted no buffer";
+    } else if (inst.mux_video_buffers.load() == 0) {
+      ok = false;
+      mode_failure = "no video AU reached the muxer";
+    }
+  }
+
   // The destinations are 4:2:0 8-bit, so that is what has to reach the muxer. An
   // encoder whose input is left unpinned negotiates whatever its widest sink
   // caps allow (4:4:4, or a 10-bit layout) and the muxer then publishes a stream
@@ -1626,7 +1847,8 @@ auto main(int argc, char** argv) -> int
     }
     // The clip must have the pad order the mode name states, so a "video-first"
     // mode cannot silently run an audio-first clip and pass on either routing.
-    if (ok && is_copy_mode(opts.run_mode)) {
+    // copy-es has no demuxer, so it has no pad order to check.
+    if (ok && is_copy_mode(opts.run_mode) && !is_es_mode(opts.run_mode)) {
       const bool audio_first = pad_order.front().rfind("audio", 0) == 0;
       const bool want_audio_first = opts.run_mode == mode::copy_audio_first;
       if (audio_first != want_audio_first) {
@@ -1704,6 +1926,11 @@ auto main(int argc, char** argv) -> int
               static_cast<long long>(reconnects));
   std::printf("frames pushed        %llu\n",
               static_cast<unsigned long long>(frames_pushed));
+  if (is_es_mode(opts.run_mode)) {
+    std::printf("es aus pushed        %llu (au drops %llu)\n",
+                static_cast<unsigned long long>(es_aus_pushed),
+                static_cast<unsigned long long>(out.dropped_aus()));
+  }
   if (is_decode_mode(opts.run_mode)) {
     std::printf("decode frames        %llu (ring head, from %s)\n",
                 static_cast<unsigned long long>(decoded_frames),

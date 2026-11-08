@@ -51,6 +51,28 @@ constexpr int k_audio_rate = 48000;
 constexpr int k_audio_channels = 2;
 constexpr int k_audio_bitrate_bps = 128000;
 
+// The appsrcs of a standby-enabled output (see es_input_spec). block=false for
+// the same reason the ts path's are: a stalled sink must not park the feed
+// thread inside push_buffer, where no stall/audio check can run.
+constexpr std::string_view k_es_video_appsrc =
+    "appsrc name=osrc is-live=true do-timestamp=true format=time "
+    "block=false max-bytes=4194304 ";
+// Audio AUs are AAC — the ingest's audio ES as the stage parsed it — so media
+// type and mpegversion are all that can be declared. aacparse settles ADTS vs
+// raw from the bytes themselves and emits the raw frames the muxers need.
+constexpr std::string_view k_es_audio_appsrc =
+    "appsrc name=asrc is-live=true do-timestamp=true format=time "
+    "block=false max-bytes=4194304 caps=audio/mpeg,mpegversion=4 ";
+constexpr std::string_view k_es_audio_tail =
+    "queue name=aq ! aacparse name=aparse ! capsfilter name=acaps "
+    "caps=audio/mpeg,mpegversion=4,stream-format=raw ";
+// The largest access unit an es_ring read will accept. An IDR at 4K in a
+// high-bitrate ingest is megabytes, and es_ring::read skips an AU that does not
+// fit whole — so this is sized for the worst case rather than the average, and
+// it is only ever one buffer per stream per output.
+constexpr std::size_t k_es_video_au_max = 8U * 1024U * 1024U;
+constexpr std::size_t k_es_audio_au_max = 256U * 1024U;
+
 auto now_ms() -> int64_t
 {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -140,18 +162,41 @@ output::output(output_config cfg,
                ts_ring& ring,
                frame_ring* frames,
                log_fn log,
-               repin_fn repin)
+               repin_fn repin,
+               es_sources es)
     : m_cfg {std::move(cfg)}
     , m_ring {ring}
     , m_frames {frames}
     , m_log {std::move(log)}
+    , m_es {es}
     , m_repin {std::move(repin)}
 {
+  if (m_es.enabled()) {
+    m_es_video_buf.resize(k_es_video_au_max);
+    if (m_es.audio != nullptr) {
+      m_es_audio_buf.resize(k_es_audio_au_max);
+    }
+  }
 }
 
 output::~output()
 {
   stop();
+}
+
+auto output::dropped_aus() const -> uint64_t
+{
+  // Read through the ring's own per-consumer accessors: an output that was
+  // lapped reports ITS slip, not the session's, and the number is the same one
+  // the ring's producer-side accounting kept while it was dropping.
+  uint64_t dropped = 0;
+  if (m_es.video != nullptr && m_es_video_consumer >= 0) {
+    dropped += m_es.video->dropped_aus(m_es_video_consumer);
+  }
+  if (m_es.audio != nullptr && m_es_audio_consumer >= 0) {
+    dropped += m_es.audio->dropped_aus(m_es_audio_consumer);
+  }
+  return dropped;
 }
 
 auto output::log(const std::string& msg) const -> void
@@ -352,9 +397,42 @@ auto rtmp_audio_branch(bool transcode) -> std::string
       k_audio_rate, k_audio_channels, k_audio_bitrate_bps);
 }
 
+// The compressed-stream shape of a copy output once the standby slate is on.
+// Which parser sits in front of the muxer follows the DECLARED ingest codec
+// (/start source.codec) — the same codec the ts path's own h264parse assumes.
+struct es_video_chain
+{
+  const char* parser;
+  const char* appsrc_caps;  // what the video AU appsrc declares
+  const char* mux_caps;     // what the carrier muxer must receive
+  const char* flv_mux;      // rtmp/rtmps muxer for this codec
+  bool config_interval;     // parser accepts config-interval=-1
+};
+
+constexpr auto es_chain_for(codec c) -> es_video_chain
+{
+  switch (c) {
+    case codec::h265:
+      // Enhanced FLV (eflvmux) is the only FLV muxer that carries HEVC, and it
+      // wants the hvc1 sample entry the existing transcode tier already states.
+      return {"h265parse", "video/x-h265",
+              "video/x-h265,stream-format=hvc1,alignment=au", "eflvmux", true};
+    case codec::av1:
+      // av1parse has no config-interval property. AV1 over flv is refused at
+      // /start (validate_transcode_targets), so the rtmp/rtmps entry below is
+      // unreachable and only the TS carriers use this row.
+      return {"av1parse", "video/av1", "video/av1", "flvmux", false};
+    case codec::h264:
+    default:
+      return {"h264parse", "video/x-h264",
+              "video/x-h264,stream-format=avc,alignment=au", "flvmux", true};
+  }
+}
+
 auto output_template(output_proto proto,
                      const transcode_config& transcode,
-                     const char* encoder) -> std::string
+                     const char* encoder,
+                     const es_input_spec& es) -> std::string
 {
   // block=false on purpose: with block=true a sink that stops draining parks
   // the feed thread INSIDE push_buffer forever, so the stall/audio checks below
@@ -370,6 +448,60 @@ auto output_template(output_proto proto,
   constexpr std::string_view k_audio_appsrc =
       "appsrc name=asrc is-live=true do-timestamp=true format=time "
       "block=false max-bytes=4194304 caps=video/mpegts,systemstream=true ";
+
+  if (transcode.target == transcode_target::none && es.enabled) {
+    // Standby enabled. The stage has already parsed the ingest once and
+    // published whole access units, so a copy output remuxes them itself: there
+    // is no tsparse and no tsdemux anywhere below. Timestamps and the keyframe
+    // flag travel with each AU (au_meta) and are set on the buffer by the feed
+    // thread, so the parser is only asked to convert the framing
+    // (byte-stream/AU -> the sample-entry form the muxer writes) and to repeat
+    // the sequence header (config-interval=-1) as the original demux path did.
+    const es_video_chain chain = es_chain_for(es.video_codec);
+    const std::string vci =
+        chain.config_interval ? " config-interval=-1" : "";
+    switch (proto) {
+      case output_proto::srt:
+      case output_proto::rist: {
+        // REMUX, not byte passthrough — the deliberate difference from the
+        // disabled path above. The ES ring holds access units, not a transport
+        // stream: the ingest TS the disabled path forwards is what the standby
+        // stage consumed to produce these AUs, and while the slate is on air
+        // there is no live TS behind it at all. Re-muxing gives the carrier a
+        // well-formed TS either way, and is what lets the same pipeline carry
+        // live and slate media without knowing which it is.
+        const std::string audio = es.audio
+            ? std::format("{}! {}! mux. ", k_es_audio_appsrc, k_es_audio_tail)
+            : std::string {};
+        const std::string sink = proto == output_proto::srt
+            ? "! srtsink name=osink wait-for-connection=false"
+            : "! ristsink name=osink";
+        return std::format(
+            "{}caps={} ! {}{} ! mux. {}mpegtsmux name=mux alignment=7 {}",
+            k_es_video_appsrc, chain.appsrc_caps, chain.parser, vci, audio,
+            sink);
+      }
+      case output_proto::rtmp:
+      case output_proto::rtmps: {
+        // The audio branch ends at `acaps` and is linked to the muxer at build
+        // time — the audio es_ring existing IS the evidence the session carries
+        // audio. Keeping the pad unrequested until then is what lets flvmux
+        // publish video on its first frame (a requested, capless audio pad
+        // holds it in PAUSED with no error anywhere).
+        const std::string audio = es.audio
+            ? std::format("{}! {}", k_es_audio_appsrc, k_es_audio_tail)
+            : std::string {};
+        return std::format(
+            "{}caps={} ! {}{} ! {} ! mux. {}"
+            "{} name=mux streamable=true latency=1000000000 "
+            "! rtmp2sink name=osink async-connect=true "
+            "funnel name=ddrop ! fakesink sync=false async=false",
+            k_es_video_appsrc, chain.appsrc_caps, chain.parser, vci,
+            chain.mux_caps, audio, chain.flv_mux);
+      }
+    }
+    return {};
+  }
 
   if (transcode.target == transcode_target::none) {
     // Copy-only templates — byte-identical to the pre-transcode tier. An rtmp
@@ -470,6 +602,22 @@ auto output_template(output_proto proto,
       const std::string vcaps = hevc
           ? "video/x-h265,stream-format=hvc1,alignment=au,profile=main"
           : "video/x-h264,stream-format=avc,alignment=au,profile=high";
+      // Standby enabled: the encode chain is identical; only the audio source
+      // changes. The per-output tsdemux is gone because the stage already
+      // parsed the audio AUs and publishes them into the audio es_ring, and
+      // `acaps` is linked to the muxer at build time. Video still comes from
+      // the shared frame ring, so nothing about the encoder changes.
+      if (es.enabled) {
+        const std::string audio = es.audio
+            ? std::format("{}! {}", k_es_audio_appsrc, rtmp_audio_branch(true))
+            : std::string {};
+        return std::format(
+            "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
+            "{}{} name=mux streamable=true "
+            "! rtmp2sink name=osink async-connect=true sync=false "
+            "funnel name=ddrop ! fakesink sync=false async=false",
+            k_appsrc, scale, k_raw_nv12, enc, parse, vcaps, audio, mux);
+      }
       // Encoded video is driven from the shared frame ring; audio is read from
       // the ts_ring and re-encoded into the declared output format by the
       // branch (see rtmp_audio_branch). h265 uses the Enhanced FLV muxer
@@ -566,7 +714,8 @@ auto output::build_pipeline(std::string& err) -> bool
   const std::string tmpl = output_template(
       m_cfg.type,
       m_cfg.transcode,
-      is_transcode ? chosen_encoder.c_str() : nullptr);
+      is_transcode ? chosen_encoder.c_str() : nullptr,
+      m_es.spec());
 
   GError* gerr = nullptr;
   GstElement* parsed = gst_parse_launch(tmpl.c_str(), &gerr);
@@ -598,6 +747,18 @@ auto output::build_pipeline(std::string& err) -> bool
 
   gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), k_appsrc_default_bytes);
 
+  // Every muxer that takes audio gets its AUs from `asrc`: a transcode output
+  // re-encodes them, a copy output in ES mode remuxes them. The cut appsrc only
+  // exists when the session has audio, so a video-only session looks exactly
+  // like the ts path's video-only case to the muxer.
+  if (is_transcode || (m_es.enabled() && m_es.audio != nullptr)) {
+    m_audio_appsrc = gst_bin_get_by_name(GST_BIN(m_pipeline), "asrc");
+    if (m_audio_appsrc != nullptr) {
+      gst_app_src_set_max_bytes(GST_APP_SRC(m_audio_appsrc),
+                                k_appsrc_default_bytes);
+    }
+  }
+
   if (is_transcode) {
     // The feed thread waits on this mutex when the video appsrc is at its cap;
     // a buffer leaving the appsrc is the event that frees room, so the wait is
@@ -607,11 +768,6 @@ auto output::build_pipeline(std::string& err) -> bool
       gst_pad_add_probe(osrc_pad, GST_PAD_PROBE_TYPE_BUFFER,
                         &output::appsrc_drained, this, nullptr);
       gst_object_unref(osrc_pad);
-    }
-    m_audio_appsrc = gst_bin_get_by_name(GST_BIN(m_pipeline), "asrc");
-    if (m_audio_appsrc != nullptr) {
-      gst_app_src_set_max_bytes(GST_APP_SRC(m_audio_appsrc),
-                                k_appsrc_default_bytes);
     }
     // ---- Encoder tuning: the relay's own mechanics -------------------------
     // This is the RELAY's business, not policy: it is about making the hardware
@@ -1041,11 +1197,35 @@ auto output::start() -> bool
 {
   const bool is_transcode =
       m_cfg.transcode.target != transcode_target::none;
+  const bool takes_audio_output = m_cfg.type == output_proto::rtmp
+      || m_cfg.type == output_proto::rtmps;
+  // Standby enabled: the output reads compressed access units, so it registers
+  // an es_ring cursor per stream it needs instead of a ts_ring cursor. There is
+  // no TS to read at all on that path.
+  const bool es = m_es.enabled();
   // An RTMP/RTMPS transcode output still needs a ts_ring cursor for its AAC
   // audio branch; a video-only srt/rist transcode output does not, so it
-  // takes no ts_ring drops.
-  const bool needs_ts = !is_transcode || m_cfg.type == output_proto::rtmp
-      || m_cfg.type == output_proto::rtmps;
+  // takes no ts_ring drops. In ES mode the audio comes from the audio es_ring
+  // instead, and a srt/rist transcode output is video-only either way.
+  const bool needs_ts = !es && (!is_transcode || takes_audio_output);
+  const bool needs_es_audio = es && m_es.audio != nullptr
+      && (!is_transcode || takes_audio_output);
+
+  const auto unwind = [this]() -> void
+  {
+    if (m_consumer >= 0) {
+      m_ring.remove_consumer(m_consumer);
+      m_consumer = -1;
+    }
+    if (m_es_video_consumer >= 0) {
+      m_es.video->remove_consumer(m_es_video_consumer);
+      m_es_video_consumer = -1;
+    }
+    if (m_es_audio_consumer >= 0) {
+      m_es.audio->remove_consumer(m_es_audio_consumer);
+      m_es_audio_consumer = -1;
+    }
+  };
 
   if (needs_ts) {
     m_consumer = m_ring.add_consumer();
@@ -1055,22 +1235,34 @@ auto output::start() -> bool
       return false;
     }
   }
+  if (es) {
+    m_es_video_consumer = m_es.video->add_consumer();
+    if (m_es_video_consumer < 0) {
+      unwind();
+      set_last_error("no video es_ring consumer slot");
+      set_state(run_state::error);
+      return false;
+    }
+    if (needs_es_audio) {
+      m_es_audio_consumer = m_es.audio->add_consumer();
+      if (m_es_audio_consumer < 0) {
+        unwind();
+        set_last_error("no audio es_ring consumer slot");
+        set_state(run_state::error);
+        return false;
+      }
+    }
+  }
   if (is_transcode) {
     if (m_frames == nullptr) {
-      if (m_consumer >= 0) {
-        m_ring.remove_consumer(m_consumer);
-        m_consumer = -1;
-      }
+      unwind();
       set_last_error("transcode output has no frame ring");
       set_state(run_state::error);
       return false;
     }
     m_frame_consumer = m_frames->add_consumer();
     if (m_frame_consumer < 0) {
-      if (m_consumer >= 0) {
-        m_ring.remove_consumer(m_consumer);
-        m_consumer = -1;
-      }
+      unwind();
       set_last_error("no frame ring consumer slot");
       set_state(run_state::error);
       return false;
@@ -1105,6 +1297,14 @@ auto output::stop() -> void
   if (m_consumer >= 0) {
     m_ring.remove_consumer(m_consumer);
     m_consumer = -1;
+  }
+  if (m_es_video_consumer >= 0 && m_es.video != nullptr) {
+    m_es.video->remove_consumer(m_es_video_consumer);
+    m_es_video_consumer = -1;
+  }
+  if (m_es_audio_consumer >= 0 && m_es.audio != nullptr) {
+    m_es.audio->remove_consumer(m_es_audio_consumer);
+    m_es_audio_consumer = -1;
   }
   if (m_frame_consumer >= 0 && m_frames != nullptr) {
     m_frames->remove_consumer(m_frame_consumer);
@@ -1201,6 +1401,12 @@ auto output::run_once() -> bool
 
   m_run_started = std::chrono::steady_clock::now();
   m_audio_linked.store(false, std::memory_order_relaxed);
+  if (m_es.enabled() && m_es.audio != nullptr
+      && (m_cfg.type == output_proto::rtmp || m_cfg.type == output_proto::rtmps)) {
+    // ES mode: there is no demux pad-added to wait for, so the muxer's audio
+    // pad is linked here, once per attempt, before the first AU is pushed.
+    attach_es_audio_branch();
+  }
   m_first_video_push = std::chrono::steady_clock::time_point {};
   m_muxer_audio_logged.store(false);
   m_first_output_logged.store(false);
@@ -1321,6 +1527,12 @@ auto output::run_once() -> bool
       }
       continue;
     }
+    if (m_es.enabled()) {
+      if (!feed_es_copy()) {
+        return true;  // attempt over: flushing appsrc or stopping
+      }
+      continue;
+    }
     const std::size_t got =
         m_ring.read(m_consumer, buf.data(), buf.size(), k_read_timeout);
     if (got == 0) {
@@ -1430,6 +1642,67 @@ auto output::attach_audio_branch(GstPad* demux_pad) -> void
     gst_object_unref(mux_audio);
   }
   gst_object_unref(aq);
+  gst_object_unref(acaps);
+  gst_object_unref(mux);
+}
+
+// ES mode's counterpart of attach_audio_branch: the same muxer-pad link, with
+// no demux pad to attach and no pad-added signal to wait for. It runs once per
+// attempt at build time, because the audio es_ring's existence is the evidence
+// that the session carries audio — on this path there is no TS to ask.
+auto output::attach_es_audio_branch() -> void
+{
+  std::lock_guard<std::mutex> guard(m_audio_mutex);
+  if (m_audio_dropped.load(std::memory_order_acquire)
+      || m_audio_linked.exchange(true)) {
+    return;
+  }
+  GstElement* acaps =
+      m_pipeline != nullptr ? gst_bin_get_by_name(GST_BIN(m_pipeline), "acaps")
+                            : nullptr;
+  GstElement* mux =
+      m_pipeline != nullptr ? gst_bin_get_by_name(GST_BIN(m_pipeline), "mux")
+                            : nullptr;
+  if (acaps == nullptr || mux == nullptr) {
+    if (acaps != nullptr) { gst_object_unref(acaps); }
+    if (mux != nullptr) { gst_object_unref(mux); }
+    m_audio_dropped.store(true, std::memory_order_relaxed);
+    log("ES audio branch has no acaps/mux; output runs video-only\n");
+    return;
+  }
+
+  GstPad* caps_src = gst_element_get_static_pad(acaps, "src");
+  GstPad* mux_audio = gst_element_request_pad_simple(mux, "audio");
+  if (mux_audio == nullptr) {
+    mux_audio = gst_element_request_pad_simple(mux, "audio_%u");
+  }
+  bool linked = false;
+  if (caps_src != nullptr && mux_audio != nullptr) {
+    gst_pad_add_probe(mux_audio, GST_PAD_PROBE_TYPE_BUFFER, &count_buffer_probe,
+                      &m_audio_frames, nullptr);
+    gst_pad_add_probe(mux_audio, GST_PAD_PROBE_TYPE_BUFFER,
+                      &output::muxer_audio_first_buffer, this, nullptr);
+    linked = gst_pad_link(caps_src, mux_audio) == GST_PAD_LINK_OK;
+  }
+  if (linked) {
+    m_audio_mux_pad = GST_PAD(gst_object_ref(mux_audio));
+    log("audio es_ring present; muxer audio pad linked\n");
+  } else {
+    // Same failure rule as the ts path: a requested-but-unlinked audio pad
+    // stalls flvmux, so it is released and the output publishes video alone.
+    if (mux_audio != nullptr) {
+      gst_element_release_request_pad(mux, mux_audio);
+    }
+    m_audio_dropped.store(true, std::memory_order_relaxed);
+    log("ES audio branch could not be attached to the muxer; output runs "
+        "video-only\n");
+  }
+  if (caps_src != nullptr) {
+    gst_object_unref(caps_src);
+  }
+  if (mux_audio != nullptr) {
+    gst_object_unref(mux_audio);
+  }
   gst_object_unref(acaps);
   gst_object_unref(mux);
 }
@@ -1562,25 +1835,33 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
     }
   }
 
-  // Audio first: the TS is what proves an audio stream exists, so the demux's
-  // audio pad is seen (and the muxer's audio pad requested) as early as
-  // possible. A source with no audio simply never links one.
-  if (m_audio_appsrc != nullptr) {
-    std::vector<uint8_t> abuf(k_read_chunk);
-    for (;;) {
-      const std::size_t agot = m_ring.read(
-          m_consumer, abuf.data(), abuf.size(), std::chrono::milliseconds(0));
-      if (agot == 0) {
-        break;
+  // Audio first: the audio source is what proves an audio stream exists, so the
+  // muxer's audio pad is linked as early as possible. A source with no audio
+  // simply never links one. In ES mode the AUs come from the audio es_ring
+  // rather than from the ts_ring this output would otherwise demux itself.
+  if (m_audio_appsrc != nullptr
+      && !m_audio_dropped.load(std::memory_order_acquire)) {
+    if (m_es_audio_consumer >= 0) {
+      if (!feed_es_audio()) {
+        return false;
       }
-      GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, agot, nullptr);
-      gst_buffer_fill(gbuf, 0, abuf.data(), agot);
-      if (gst_app_src_push_buffer(GST_APP_SRC(m_audio_appsrc), gbuf)
-          != GST_FLOW_OK)
-      {
-        break;
+    } else {
+      std::vector<uint8_t> abuf(k_read_chunk);
+      for (;;) {
+        const std::size_t agot = m_ring.read(
+            m_consumer, abuf.data(), abuf.size(), std::chrono::milliseconds(0));
+        if (agot == 0) {
+          break;
+        }
+        GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, agot, nullptr);
+        gst_buffer_fill(gbuf, 0, abuf.data(), agot);
+        if (gst_app_src_push_buffer(GST_APP_SRC(m_audio_appsrc), gbuf)
+            != GST_FLOW_OK)
+        {
+          break;
+        }
+        m_bytes_sent.fetch_add(agot, std::memory_order_relaxed);
       }
-      m_bytes_sent.fetch_add(agot, std::memory_order_relaxed);
     }
   }
 
@@ -1624,6 +1905,112 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   }
 
   report_feed();
+  return !m_stopping.load(std::memory_order_acquire);
+}
+
+// Push every audio AU the audio es_ring currently holds. Audio has no keyframe
+// notion, so no DELTA_UNIT is set: a muxer treats AAC samples as independent
+// frames by format definition. Timestamps come from the stage's au_meta, which
+// is where the ingest's audio clock now lives.
+auto output::feed_es_audio() -> bool
+{
+  if (m_es.audio == nullptr || m_es_audio_consumer < 0
+      || m_audio_appsrc == nullptr || m_es_audio_buf.empty()) {
+    return true;
+  }
+  for (;;) {
+    es_ring::au_meta meta;
+    const std::size_t got = m_es.audio->read(
+        m_es_audio_consumer, meta, m_es_audio_buf.data(),
+        m_es_audio_buf.size(), std::chrono::milliseconds(0));
+    if (got == 0) {
+      return true;
+    }
+    GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
+    gst_buffer_fill(gbuf, 0, m_es_audio_buf.data(), got);
+    // A negative timestamp is the stage saying "unknown"; do-timestamp=true on
+    // the appsrc then stamps the buffer from the pipeline clock, which is the
+    // same fallback the frame-ring path relies on.
+    if (meta.pts_ns >= 0) {
+      GST_BUFFER_PTS(gbuf) = static_cast<GstClockTime>(meta.pts_ns);
+    }
+    if (meta.dts_ns >= 0) {
+      GST_BUFFER_DTS(gbuf) = static_cast<GstClockTime>(meta.dts_ns);
+    }
+    if (gst_app_src_push_buffer(GST_APP_SRC(m_audio_appsrc), gbuf)
+        != GST_FLOW_OK) {
+      set_last_error("audio appsrc rejected buffer (pipeline flushing)");
+      return false;
+    }
+    m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
+  }
+}
+
+// Copy feed in ES mode: one video AU per pass from the video es_ring, plus
+// whatever audio the audio es_ring holds. The push never blocks, so a stalled
+// sink leaves this cursor behind and the ring's drop-oldest takes over — the
+// same invariant as the ts path, at AU granularity instead of packet granularity.
+auto output::feed_es_copy() -> bool
+{
+  if (!feed_es_audio()) {
+    return false;
+  }
+  if (m_appsrc == nullptr || m_es.video == nullptr || m_es_video_consumer < 0) {
+    return !m_stopping.load(std::memory_order_acquire);
+  }
+  ++m_feed.iters;
+  es_ring::au_meta meta;
+  const auto read_started = std::chrono::steady_clock::now();
+  const std::size_t got = m_es.video->read(
+      m_es_video_consumer, meta, m_es_video_buf.data(), m_es_video_buf.size(),
+      k_read_timeout);
+  m_feed.read_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - read_started)
+                        .count();
+  if (got == 0) {
+    return !m_stopping.load(std::memory_order_acquire);
+  }
+  ++m_feed.consumed;
+  GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
+  gst_buffer_fill(gbuf, 0, m_es_video_buf.data(), got);
+  // PTS/DTS and the keyframe flag travel with the AU: the parser cannot recover
+  // either from the bytes alone once B-frames are in play, and a muxer that is
+  // not told which frames are keyframes cannot write a seekable index.
+  if (meta.pts_ns >= 0) {
+    GST_BUFFER_PTS(gbuf) = static_cast<GstClockTime>(meta.pts_ns);
+  }
+  if (meta.dts_ns >= 0) {
+    GST_BUFFER_DTS(gbuf) = static_cast<GstClockTime>(meta.dts_ns);
+  }
+  if (!meta.keyframe) {
+    GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_DELTA_UNIT);
+  }
+  const GstFlowReturn pushed =
+      gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf);
+  if (pushed != GST_FLOW_OK) {
+    set_last_error("appsrc rejected buffer (pipeline flushing)");
+    return false;
+  }
+  ++m_feed.pushed;
+  m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
+  if (m_first_video_push == std::chrono::steady_clock::time_point {}) {
+    m_first_video_push = std::chrono::steady_clock::now();
+  }
+  // /stats reports dropped_bytes for the ts path; on this path loss is counted
+  // in whole AUs, so it is reported here rather than left at a silent zero.
+  const auto now = std::chrono::steady_clock::now();
+  if (m_feed.since != std::chrono::steady_clock::time_point {}
+      && now - m_feed.since >= k_feed_stats_period) {
+    const double elapsed =
+        std::chrono::duration<double>(now - m_feed.since).count();
+    log(std::format(
+        "ES copy feed: consumed={} pushed={} au_drops={} level={} KiB in {:.1f} s\n",
+        m_feed.consumed, m_feed.pushed, dropped_aus(),
+        gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc)) / 1024,
+        elapsed));
+    m_feed = feed_stats {};
+    m_feed.since = now;
+  }
   return !m_stopping.load(std::memory_order_acquire);
 }
 

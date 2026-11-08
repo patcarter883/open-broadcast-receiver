@@ -15,6 +15,7 @@
 
 #include <gst/gst.h>
 
+#include "fanout/es_ring.h"
 #include "fanout/frame_ring.h"
 #include "fanout/pts_synth.h"
 #include "fanout/ring.h"
@@ -72,7 +73,15 @@ public:
   using fail_fn = std::function<void(const std::string&)>;
 
   // `ring` must outlive this object (owned by main alongside the session).
-  decoder(ts_ring& ring, codec in_codec, log_fn log, fail_fn on_fail = {});
+  // `es_video`, when non-null, is the standby stage's video access-unit ring:
+  // the stage then feeds the SAME parse/decode chain from compressed AUs and
+  // the ts_ring is never read (no tsdemux, no tsparse — the demux has already
+  // happened, once, in the stage). Null is the ts_ring path, unchanged.
+  decoder(ts_ring& ring,
+          codec in_codec,
+          log_fn log,
+          fail_fn on_fail = {},
+          es_ring* es_video = nullptr);
   ~decoder();
   decoder(const decoder&) = delete;
   auto operator=(const decoder&) -> decoder& = delete;
@@ -173,6 +182,13 @@ private:
   codec m_in_codec;
   log_fn m_log;
   fail_fn m_on_fail;
+  // Standby stage's video AU ring (null = ts_ring path). When set, the feed
+  // step reads whole AUs from it and hands them straight to the parser.
+  es_ring* m_es = nullptr;
+  int m_es_consumer = -1;
+  // One AU, sized for the worst case rather than the 32 KiB TS chunk: an IDR at
+  // 4K is megabytes, and es_ring::read skips an AU that does not fit whole.
+  std::vector<std::uint8_t> m_es_buf;
 
   // Set once when the demuxer exposes a video pad the declared codec does not
   // describe. The attempt is not rebuilt: no decoder in the chain can parse
@@ -262,6 +278,16 @@ private:
 auto decoder_template(codec in_codec,
                       const char* source_parser,
                       const char* decoder) -> std::string;
+
+// The ES-input counterpart of decoder_template (standby enabled): appsrc ->
+// queue -> parser -> decoder -> NV12 appsink, with no tsparse and no tsdemux.
+// The demux already happened once in the standby stage, so this stage is handed
+// compressed access units and only parses/decodes them. Exposed so the
+// full-lane test can assert the absence of the demux elements and
+// parse-launch the exact string.
+auto decoder_es_template(codec in_codec,
+                         const char* source_parser,
+                         const char* decoder) -> std::string;
 
 // The caps `decoder` declares on its sink pad, reduced to the fields it fixes
 // to a single value (vaav1dec: profile=main, alignment=frame; av1dec:
