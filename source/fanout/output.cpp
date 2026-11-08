@@ -29,6 +29,8 @@ constexpr guint64 k_appsrc_max_bytes = 4 * 1024 * 1024;
 // How long the transit buffer may stay pinned at its limit before the sink is
 // treated as stalled and the attempt is rebuilt.
 constexpr auto k_stall_timeout = std::chrono::seconds(5);
+// Period of the transcode feed's accounting line.
+constexpr auto k_feed_stats_period = std::chrono::seconds(2);
 
 auto now_ms() -> int64_t
 {
@@ -916,6 +918,8 @@ auto output::run_once() -> bool
 
   m_run_started = std::chrono::steady_clock::now();
   m_audio_probe_done = false;
+  m_feed = feed_stats {};
+  m_feed.since = m_run_started;
 
   std::vector<uint8_t> buf(k_read_chunk);
   bool announced_running = false;
@@ -1085,10 +1089,18 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
     }
   }
 
-  if (gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc))
-      >= static_cast<guint64>(k_appsrc_max_bytes))
+  const guint64 level =
+      gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc));
+  ++m_feed.iters;
+  m_feed.level_peak = std::max(m_feed.level_peak, static_cast<uint64_t>(level));
+  if (m_feed.since == std::chrono::steady_clock::time_point {}) {
+    m_feed.since = std::chrono::steady_clock::now();
+  }
+
+  if (level >= static_cast<guint64>(k_appsrc_max_bytes))
   {
     const auto now = std::chrono::steady_clock::now();
+    ++m_feed.blocked;
     if (m_stall_since == std::chrono::steady_clock::time_point {}) {
       m_stall_since = now;
     } else if (now - m_stall_since > k_stall_timeout) {
@@ -1098,6 +1110,8 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    m_feed.blocked_ms += 20.0;
+    report_feed();
     return true;
   }
   m_stall_since = std::chrono::steady_clock::time_point {};
@@ -1126,10 +1140,15 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   }
 
   frame_ring::frame_meta vmeta;
+  const auto read_started = std::chrono::steady_clock::now();
   const std::size_t vgot =
       m_frames->read(m_frame_consumer, vmeta, m_frame_buf.data(),
                      m_frame_buf.size(), k_read_timeout);
+  m_feed.read_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - read_started)
+                        .count();
   if (vgot > 0) {
+    ++m_feed.consumed;
     if (!video_caps_set) {
       set_video_caps(vgot, vmeta);
       video_caps_set = true;
@@ -1142,14 +1161,52 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
     if ((vmeta.flags & frame_ring::k_flag_keyframe) == 0U) {
       GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_DELTA_UNIT);
     }
-    if (gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf) != GST_FLOW_OK) {
+    const auto push_started = std::chrono::steady_clock::now();
+    const GstFlowReturn pushed =
+        gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf);
+    m_feed.push_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - push_started)
+                          .count();
+    if (pushed != GST_FLOW_OK) {
       set_last_error("appsrc rejected buffer (pipeline flushing)");
       return false;
     }
+    ++m_feed.pushed;
     m_bytes_sent.fetch_add(vgot, std::memory_order_relaxed);
   }
 
+  report_feed();
   return !m_stopping.load(std::memory_order_acquire);
+}
+
+auto output::report_feed() -> void
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (m_feed.since == std::chrono::steady_clock::time_point {}) {
+    m_feed.since = now;
+    return;
+  }
+  const double elapsed = std::chrono::duration<double>(now - m_feed.since).count();
+  if (now - m_feed.since < k_feed_stats_period) {
+    return;
+  }
+  const double read_ms = m_feed.consumed > 0
+      ? m_feed.read_ms / static_cast<double>(m_feed.consumed) : 0.0;
+  const double push_ms = m_feed.pushed > 0
+      ? m_feed.push_ms / static_cast<double>(m_feed.pushed) : 0.0;
+  const double blocked_ms = m_feed.iters > 0
+      ? m_feed.blocked_ms / static_cast<double>(m_feed.iters) : 0.0;
+  log(std::format(
+      "transcode feed: iters={} consumed={} pushed={} blocked={} ({} ms/iter, "
+      "{} ms total) level={}/{} KiB peak={} KiB read={:.2f} ms push={:.2f} ms "
+      "ring_drops={} in {:.1f} s\n",
+      m_feed.iters, m_feed.consumed, m_feed.pushed, m_feed.blocked,
+      blocked_ms, m_feed.blocked_ms,
+      gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc)) / 1024,
+      k_appsrc_max_bytes / 1024, m_feed.level_peak / 1024, read_ms, push_ms,
+      m_frames->dropped_frames(m_frame_consumer), elapsed));
+  m_feed = feed_stats {};
+  m_feed.since = now;
 }
 
 auto output::log_muxer_input() -> void

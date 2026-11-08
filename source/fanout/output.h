@@ -143,6 +143,8 @@ private:
   // Report the caps arriving at the muxer's video pad, once per attempt:
   // profile, chroma format and bit depth are what a destination refuses first.
   auto log_muxer_input() -> void;
+  // Transcode feed accounting: one line every k_feed_stats_period.
+  auto report_feed() -> void;
   auto build_pipeline(std::string& err) -> bool;
   auto destroy_pipeline() -> void;
   auto set_state(run_state next) -> void;
@@ -185,6 +187,25 @@ private:
   // data; a linked pad with no buffers is how flvmux stalls without an error.
   std::atomic<uint64_t> m_audio_frames {0};
   std::atomic<int64_t> m_running_since_ms {0};  // steady ms; 0 = not running
+
+  // Transcode feed accounting, reported once every k_feed_stats_period. It
+  // separates the two ways the feed loses frames: it never read them from the
+  // ring (the appsrc cap held it back) or it read and pushed them and the
+  // encoder could not keep up.
+  struct feed_stats
+  {
+    uint64_t iters = 0;      // passes through feed_transcode
+    uint64_t consumed = 0;   // frames read out of the frame ring
+    uint64_t pushed = 0;     // buffers accepted by the video appsrc
+    uint64_t blocked = 0;    // passes that found the appsrc at/over its cap
+    double blocked_ms = 0;   // time spent sleeping for that cap
+    double read_ms = 0;      // time inside frame_ring::read
+    double push_ms = 0;      // time inside gst_app_src_push_buffer
+    uint64_t level_peak = 0; // high-water mark of the appsrc level, bytes
+    std::chrono::steady_clock::time_point since {};
+  };
+  feed_stats m_feed;
+  uint64_t m_push_backoff {};  // consecutive blocked passes (stall watchdog)
 
   // Raw-frame read buffer for the frame_ring cursor (capacity()-sized; the
   // ring insists a read destination hold a whole frame). Sized once in start().
