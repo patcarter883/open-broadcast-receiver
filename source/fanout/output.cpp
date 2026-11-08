@@ -1099,6 +1099,7 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
       set_video_caps(vgot, vmeta);
       video_caps_set = true;
     }
+    log_muxer_input();
     GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, vgot, nullptr);
     gst_buffer_fill(gbuf, 0, m_frame_buf.data(), vgot);
     GST_BUFFER_PTS(gbuf) = static_cast<GstClockTime>(vmeta.pts);
@@ -1114,6 +1115,60 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   }
 
   return !m_stopping.load(std::memory_order_acquire);
+}
+
+auto output::log_muxer_input() -> void
+{
+  if (m_muxer_input_logged || m_pipeline == nullptr) {
+    return;
+  }
+  GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
+  if (mux == nullptr) {
+    return;
+  }
+  std::string rendered;
+  GstIterator* it = gst_element_iterate_sink_pads(mux);
+  GValue item = G_VALUE_INIT;
+  bool done = false;
+  while (!done && rendered.empty()) {
+    switch (gst_iterator_next(it, &item)) {
+      case GST_ITERATOR_OK: {
+        auto* pad = GST_PAD(g_value_get_object(&item));
+        const char* name = GST_PAD_NAME(pad);
+        const bool audio = name != nullptr && g_str_has_prefix(name, "audio");
+        if (!audio) {
+          GstCaps* caps = gst_pad_get_current_caps(pad);
+          if (caps != nullptr) {
+            gchar* text = gst_caps_to_string(caps);
+            if (text != nullptr) {
+              rendered = text;
+              g_free(text);
+            }
+            gst_caps_unref(caps);
+          }
+        }
+        g_value_reset(&item);
+        break;
+      }
+      case GST_ITERATOR_RESYNC:
+        gst_iterator_resync(it);
+        break;
+      case GST_ITERATOR_ERROR:
+      case GST_ITERATOR_DONE:
+        done = true;
+        break;
+    }
+  }
+  g_value_unset(&item);
+  gst_iterator_free(it);
+  gst_object_unref(mux);
+  if (rendered.empty()) {
+    return;
+  }
+  // Profile, chroma format and bit depth are what a destination refuses first,
+  // so they are reported from the pad the muxer actually receives.
+  m_muxer_input_logged = true;
+  log(std::format("output {}: muxer video in: {}\n", m_cfg.id, rendered));
 }
 
 auto output::set_video_caps(std::size_t frame_bytes,
