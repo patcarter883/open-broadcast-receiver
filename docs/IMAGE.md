@@ -15,26 +15,40 @@ deliberately absent.
 
 ## Address family
 
-The image ships `/etc/gai.conf` with:
+Two layers, both in the image, neither depending on a specific address
+(DECISIONS §18/§20):
 
-```
-precedence ::ffff:0:0/96 100
-```
+- the receiver itself resolves each output host, keeps every record for egress
+  vetting and pins the first IPv4 record, so the rtmp publish connects to a
+  vetted literal;
+- the runtime stage ships `/etc/gai.conf` with
 
-Node networks carry no IPv6 route, so every `getaddrinfo()` caller in the image
-must rank IPv4 above IPv6 for a name that answers both families. Without the
-policy, `GResolver` (what `rtmp2sink`'s `GSocketClient` uses) returns the IPv6
-answer first whenever the container has any IPv6 address configured, and the
-publish attempts an unroutable address. The file is a normal image layer, so it
-survives container start; no per-run DNS flags or `--add-host` pins are needed,
-and no destination address is hardcoded.
+  ```
+  precedence ::ffff:0:0/96 100
+  ```
 
-Verify from a container built from this image:
+  so any code in this image that dials a **name** — `rtmps`, which keeps the
+  hostname for TLS validation — gets the same family preference out of
+  `getaddrinfo`. It is a normal image layer, so it survives container start and
+  is visible in the image, not in a run-time flag. No destination address is
+  hardcoded.
+
+Verify from a container built from this image. `getent ahosts` alone is not a
+sufficient check: on a single-stack container glibc has already demoted the
+AAAA records for its own reasons, and the file looks inert. Attach the
+container to a network that hands it a routable-looking IPv6 address, which is
+the shape that breaks:
 
 ```sh
-docker run --rm --entrypoint bash obr-receiver:local -c \
-  'getent ahosts a.rtmp.youtube.com'
+docker network create --ipv6 --subnet 2001:db8:77::/64 obr-v6probe
+docker run --rm --network obr-v6probe --entrypoint bash obr-receiver:local -c '
+  cat /etc/gai.conf; getent ahosts a.rtmp.youtube.com'
 ```
+
+The answers must start with IPv4. Then confirm the publish path end to end —
+no `--add-host`, an RTMP destination of any `a.rtmp.youtube.com` URL, and the
+connection must reach YouTube's RTMP server (an RTMP-level refusal for a bad
+stream key is the success condition; "cannot connect" is not).
 
 ## Build
 

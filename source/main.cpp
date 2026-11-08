@@ -474,12 +474,28 @@ auto main(int argc, char** argv) -> int
       sess.dec->start();
     }
 
+    // Re-resolve hook for reconnects (DECISIONS §18/§20): the same validation
+    // and egress policy as /start, applied to the live config copy so a refused
+    // answer leaves the previous pin in place. A literal-IP host re-pins to
+    // itself without a query.
+    const auto repin = [egress](output_config& out) -> bool
+    {
+      receiver_config probe;
+      probe.outputs.push_back(out);
+      if (!validate_and_pin_outputs(probe, egress, default_resolver()).ok) {
+        return false;
+      }
+      out.pinned_ip = probe.outputs.front().pinned_ip;
+      return true;
+    };
+
     for (const output_config& out_cfg : cfg.outputs) {
       auto out = std::make_unique<output>(
           out_cfg,
           *sess.ring,
           sess.dec ? &sess.dec->frames() : nullptr,
-          &stderr_log);
+          &stderr_log,
+          repin);
       out->start();
       sess.outputs.push_back(std::move(out));
     }
@@ -643,12 +659,49 @@ auto main(int argc, char** argv) -> int
         }
       });
 
+  // --- transcode rate from the measured link (§4.3) -------------------------
+  // One sample a second of the RIST payload counter is the rate the link is
+  // actually delivering. Every transcode output re-derives its encoder target
+  // from it (transcode_bitrate_policy), so the portal's metadata-derived figure
+  // stops being the running rate as soon as there is a measurement. The counter
+  // is cumulative and atomically bumped per payload, so no pipeline or receive
+  // lock is taken here; `lifecycle` only guards the outputs vector.
+  std::thread link_controller(
+      [&]() -> void
+      {
+        uint64_t prev_bytes = 0;
+        auto prev_time = std::chrono::steady_clock::now();
+        while (!shutting_down.load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(k_watchdog_tick);
+          const auto now = std::chrono::steady_clock::now();
+          const uint64_t bytes =
+              ctx.state.rist_bytes.load(std::memory_order_relaxed);
+          const std::chrono::duration<double> elapsed = now - prev_time;
+          const uint64_t delta = bytes >= prev_bytes ? bytes - prev_bytes : 0;
+          prev_bytes = bytes;
+          prev_time = now;
+          if (!ctx.state.is_running.load(std::memory_order_acquire)) {
+            continue;
+          }
+          if (delta == 0 || elapsed.count() <= 0.0) {
+            continue;  // no payload this window: keep the last measurement
+          }
+          const auto kbps = static_cast<int>(
+              static_cast<double>(delta) * 8.0 / elapsed.count() / 1000.0);
+          std::lock_guard<std::mutex> life(lifecycle);
+          for (std::unique_ptr<output>& out : sess.outputs) {
+            out->retarget_bitrate(kbps);
+          }
+        }
+      });
+
   int sig = 0;
   sigwait(&sigset, &sig);
   std::cout << "\nSignal " << sig << " received; shutting down...\n";
 
   shutting_down.store(true, std::memory_order_release);
   watchdog.join();
+  link_controller.join();
 
   control.stop_listening();
   {

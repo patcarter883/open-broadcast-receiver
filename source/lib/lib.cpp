@@ -965,3 +965,44 @@ auto validate_and_pin_outputs(receiver_config& cfg,
   }
   return {};
 }
+
+// ---------------------------------------------------------------------------
+// Transcode rate policy (public API)
+// ---------------------------------------------------------------------------
+
+auto derive_transcode_bitrate_kbps(int measured_link_kbps, int portal_kbps)
+    -> int
+{
+  if (measured_link_kbps <= 0) {
+    // No measurement: the portal's figure is the only statement about rate,
+    // and 0 there means "leave the encoder at its own default".
+    return portal_kbps > 0 ? portal_kbps : 0;
+  }
+  const int share =
+      measured_link_kbps * transcode_bitrate_policy::link_share_percent / 100;
+  if (share <= 0) {
+    return portal_kbps > 0 ? portal_kbps : 0;
+  }
+  if (share < transcode_bitrate_policy::floor_kbps) {
+    // The link itself is the limit: a floor above it would be a target the path
+    // has never carried.
+    return share;
+  }
+  return std::min(share, transcode_bitrate_policy::ceiling_kbps);
+}
+
+auto bitrate_change_is_material(int current_kbps, int next_kbps) -> bool
+{
+  if (current_kbps == next_kbps) {
+    return false;
+  }
+  if (current_kbps <= 0 || next_kbps <= 0) {
+    return true;  // entering or leaving "encoder default" is always worth it
+  }
+  const int delta = next_kbps > current_kbps ? next_kbps - current_kbps
+                                             : current_kbps - next_kbps;
+  const int percent =
+      current_kbps * transcode_bitrate_policy::reselect_min_percent / 100;
+  return delta >= transcode_bitrate_policy::reselect_min_kbps
+      && delta >= percent;
+}

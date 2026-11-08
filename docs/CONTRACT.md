@@ -131,7 +131,7 @@ URL ⇒ 400 `bad_url` naming `outputs[i].url`.
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `codec` | enum transcode_target | — | **required inside the object**; `"h264"`, `"h265"`, or `"av1"`. `"av1"` is refused on rtmp/rtmps (⇒ 400 `bad_enum`) because flvmux/eflvmux carry no `video/x-av1`; it is valid on srt/rist, whose MPEG-TS does |
-| `bitrate_kbps` | int (kbps) | 0 | encoder target bitrate; `0` = encoder default |
+| `bitrate_kbps` | int (kbps) | 0 | requested encoder target; `0` = encoder default. From the first full second of ingest the receiver re-derives the target from the rate it measures arriving (`transcode_bitrate_policy`: 90% of the measured rate, floor 1000 kbps, ceiling 24000 kbps) and this value is used only until that measurement exists — see §4.3 |
 | `gop` | int (frames) | 0 | encoder GOP length; `0` = encoder default |
 
 A `transcode` object is the **only** way an output opts out of copy-only; `codec` selects the re-encode target and
@@ -181,8 +181,11 @@ The PSK travels via the librist settings struct — never inside any URL.
 - **Egress validation (SSRF/rebinding resistance):** every output host is resolved and vetted — loopback,
   link-local (incl. the cloud metadata range), RFC1918/ULA/CGNAT, multicast and the configured
   `--egress-deny` CIDRs are rejected with **400 `forbidden_destination`** naming the output **id** (never the
-  resolved IP). The vetted resolved IP is **pinned**: the output pipeline connects to it and never re-resolves.
-  Self-host opt-out: `--egress-allow-private` permits RFC1918/ULA (LAN restreaming); loopback/link-local/
+  resolved IP). The vetted resolved IP is **pinned**: the output pipeline connects to it and never re-resolves
+  **within a connect attempt**. Every reconnect attempt re-resolves and re-vets the name first, so an address a
+  platform retires costs one backoff interval rather than the session; an answer the policy refuses is discarded
+  and the previous pin is kept. Self-host opt-out: `--egress-allow-private` permits RFC1918/ULA (LAN
+  restreaming); loopback/link-local/
   multicast stay blocked. (rtmps connects by hostname — TLS certificate validation is the rebinding defence
   there; see DECISIONS.md.)
 - Required mux/sink element absent from the GStreamer registry (`flvmux`, `rtmp2sink`, `srtsink`, `ristsink`,
@@ -229,6 +232,30 @@ The echo carries **id and type only** — URLs and keys are never echoed.
   ```json
   { "ok": false, "schema_version": 3, "error_code": "pipeline_launch_failed", "message": "<error>" }
   ```
+
+---
+
+### Transcode target follows the measured link
+
+`outputs[].transcode.bitrate_kbps` is a *requested* target, not the rate the encoder is held at for the session.
+A portal computes it from destination metadata (codec, resolution, frame rate) and therefore emits the same
+number — e.g. ~29860 kbps for a 1440p h265 destination — whatever the originating uplink is carrying.
+
+The receiver measures the one first-hand figure in the path: payload bytes arriving over RIST, sampled once a
+second. Once a sample exists, each transcode output's target becomes
+
+```
+target = min(90% of the measured rate, 24000 kbps)   -- 1000 kbps floor applies
+                                                        only when the link is
+                                                        measured above it
+```
+
+with the floor yielding to the link when the measured rate is itself below it (asking for more than the link
+carries is the failure the policy exists to prevent). A re-target is pushed to the running encoder only when the
+new value differs from the applied one by at least 500 kbps **and** 10%, so measurement jitter does not thrash
+rate control. No measurement (first second of the session, or a silent window) leaves the requested value in
+place; `0` still means the encoder's own default. The wire contract is unchanged: nothing about this appears in
+`/status` or `/stats`, and `POST /start` accepts exactly the same body.
 
 ---
 
