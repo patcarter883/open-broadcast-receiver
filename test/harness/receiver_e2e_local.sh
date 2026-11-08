@@ -48,14 +48,27 @@
 #
 # Env overrides: BIN FEED FIXTURE FIXTURE_FRAMES FIXTURE_AUDIO CTRL_PORT
 #                RIST_PORT RTMP_PORT MTX_API_PORT SINK_HOST LOG_DIR
-#                KEEP=1 (leave processes up)
+#                KEEP=1 (leave this run's processes up and print their pids;
+#                        without it every started process is stopped on exit)
 #
 # Exit status: 0 = decode + publish both proven, 1 = a stage stopped (the log
 # says which), 2 = the harness could not run (missing binary/element/port).
 
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# A process started through sudo belongs to root, and this user cannot signal it
+# afterwards -- which is how a previous run left mediamtx holding its port.
+# Re-exec as the invoking user so every pid the trap records is signalable.
+if [[ "${EUID}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  invoking_home=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+  exec setpriv --reuid="$(id -u "${SUDO_USER}")" \
+    --regid="$(id -g "${SUDO_USER}")" --init-groups \
+    env HOME="${invoking_home}" "${SCRIPT_PATH}" "$@"
+fi
+
+REPO_ROOT="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 BIN="${BIN:-${REPO_ROOT}/build/open-broadcast-receiver}"
 FEED="${FEED:-${REPO_ROOT}/build/test/rist_feed}"
 BUILD_DIR="${REPO_ROOT}/build"
@@ -95,43 +108,100 @@ receiver_pid=""
 sink_pid=""
 feed_pid=""
 
-cleanup() {
-  local rc=$?
-  for pid in "${feed_pid}" "${receiver_pid}" "${sink_pid}"; do
-    [[ -n "${pid}" ]] || continue
+started_pids=()
+started_pgids=()
+started_names=()
+
+# Starts NAME CMD... in its own process group and records the group, so the
+# trap can stop a pipeline's children too (`pv | rist_feed` is one job with two
+# processes). setsid does not fork here: the background child is not a process
+# group leader, so $! is both the pid and the pgid.
+start_bg() {
+  local name=$1 pid pgid
+  shift
+  setsid "$@" &
+  pid=$!
+  pgid=$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')
+  started_pids+=("${pid}")
+  started_pgids+=("${pgid:-${pid}}")
+  started_names+=("${name}")
+  LAST_STARTED_PID=${pid}
+}
+
+stop_started() {
+  local i pid pgid own_pgid waited survivors=""
+  own_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+  for i in "${!started_pids[@]}"; do
+    pid=${started_pids[$i]}
+    pgid=${started_pgids[$i]}
+    kill -0 "${pid}" 2>/dev/null || continue
+    if [[ -n "${pgid}" && "${pgid}" != "${own_pgid}" ]]; then
+      kill -TERM -- "-${pgid}" 2>/dev/null || true
+    fi
     kill -TERM "${pid}" 2>/dev/null || true
   done
-  sleep 0.5
-  for pid in "${feed_pid}" "${receiver_pid}" "${sink_pid}"; do
-    [[ -n "${pid}" ]] || continue
+  # mediamtx closes its RTMP connections on the way out, so poll rather than
+  # sample once and report a process that is still shutting down.
+  for waited in $(seq 1 30); do
+    survivors=""
+    for pid in "${started_pids[@]}"; do
+      kill -0 "${pid}" 2>/dev/null && survivors+=" ${pid}"
+    done
+    [[ -z "${survivors}" ]] && return 0
+    sleep 0.1
+  done
+  for i in "${!started_pids[@]}"; do
+    pid=${started_pids[$i]}
+    pgid=${started_pgids[$i]}
+    kill -0 "${pid}" 2>/dev/null || continue
+    if [[ -n "${pgid}" && "${pgid}" != "${own_pgid}" ]]; then
+      kill -KILL -- "-${pgid}" 2>/dev/null || true
+    fi
     kill -KILL "${pid}" 2>/dev/null || true
   done
-  if [[ "${KEEP}" == "1" ]]; then
-    echo
-    echo "KEEP=1: leaving pid(s) ${feed_pid:-} ${receiver_pid:-} ${sink_pid:-} running"
-    return ${rc}
-  fi
-  # Confirm nothing this script started survives. A signalled process can take a
-  # moment to leave (mediamtx closes its RTMP connections on the way out), so the
-  # check polls instead of sampling once and reporting a process that is still
-  # shutting down.
-  local survivors="" pid waited
-  for pid in "${feed_pid}" "${receiver_pid}" "${sink_pid}"; do
-    [[ -n "${pid}" ]] || continue
-    for waited in $(seq 1 20); do
-      kill -0 "${pid}" 2>/dev/null || break
-      sleep 0.1
-    done
-    if kill -0 "${pid}" 2>/dev/null; then survivors+=" ${pid}"; fi
+  sleep 0.2
+  survivors=""
+  for pid in "${started_pids[@]}"; do
+    kill -0 "${pid}" 2>/dev/null && survivors+=" ${pid}"
   done
   if [[ -n "${survivors}" ]]; then
     echo "WARNING: survived cleanup:${survivors}" >&2
   fi
-  return ${rc}
 }
-trap cleanup EXIT INT TERM
+
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [[ "${KEEP}" == "1" ]]; then
+    echo
+    local i
+    for i in "${!started_pids[@]}"; do
+      kill -0 "${started_pids[$i]}" 2>/dev/null || continue
+      echo "KEEP=1: leaving ${started_names[$i]} pid ${started_pids[$i]} (pgid ${started_pgids[$i]}) running"
+    done
+  else
+    stop_started
+  fi
+  exit "${rc}"
+}
+
+# The EXIT trap does the stopping for every path, including `die` partway
+# through; the signal traps turn INT/TERM into an exit so it runs once.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 die() { echo "$*" >&2; exit 2; }
+
+# The pid listening on a TCP port, when this user can see it.
+port_pid() {
+  ss -ltnpH "sport = :$1" 2>/dev/null \
+    | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+port_busy() {
+  [[ -n "$(ss -ltnH "sport = :$1" 2>/dev/null)" ]]
+}
 
 # ---- preflight -------------------------------------------------------------
 [[ -x "${BIN}" ]]  || die "receiver binary not built: ${BIN}  (cmake --build build)"
@@ -140,9 +210,12 @@ for bin in mediamtx gst-launch-1.0 ffprobe pv jq curl; do
   command -v "${bin}" >/dev/null 2>&1 || die "missing tool: ${bin}"
 done
 for port in "${CTRL_PORT}" "${RIST_PORT}" "${RTMP_PORT}" "${MTX_API_PORT}"; do
-  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"; then
-    die "port ${port} already in use (another run?)"
+  port_busy "${port}" || continue
+  holder=$(port_pid "${port}")
+  if [[ -n "${holder}" ]]; then
+    die "port ${port} is held by pid ${holder} ($(ps -o comm= -p "${holder}" 2>/dev/null || echo unknown)), which this run did not start; stop it or override the port"
   fi
+  die "port ${port} is held by a process this user cannot inspect (another user or a container); stop it or override the port"
 done
 
 echo "=== fixture ==="
@@ -294,8 +367,9 @@ apiAddress: 127.0.0.1:${MTX_API_PORT}
 paths:
   all_others:
 EOF
-( cd "${LOG_DIR}" && exec mediamtx "${MTX_CONF}" ) >> "${SINK_LOG}" 2>&1 &
-sink_pid=$!
+start_bg mediamtx bash -c 'cd "$1" && exec mediamtx "$2"' _ \
+  "${LOG_DIR}" "${MTX_CONF}" >> "${SINK_LOG}" 2>&1
+sink_pid=${LAST_STARTED_PID}
 echo "mediamtx pid ${sink_pid} rtmp=${SINK_HOST}:${RTMP_PORT} api=127.0.0.1:${MTX_API_PORT}"
 ready=0
 for _ in $(seq 1 50); do
@@ -305,13 +379,16 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 [[ "${ready}" -eq 1 ]] || { tail -20 "${SINK_LOG}" >&2; die "mediamtx API did not come up"; }
+holder=$(port_pid "${MTX_API_PORT}")
+[[ "${holder}" == "${sink_pid}" ]] \
+  || die "mediamtx API port ${MTX_API_PORT} is held by pid ${holder:-unknown}, not this run's ${sink_pid}"
 
 # ---- receiver --------------------------------------------------------------
 echo
 echo "=== receiver ==="
-"${BIN}" --control-port "${CTRL_PORT}" --rist-port "${RIST_PORT}" \
-  --token "${TOKEN}" --egress-allow-private >> "${RECEIVER_LOG}" 2>&1 &
-receiver_pid=$!
+start_bg receiver "${BIN}" --control-port "${CTRL_PORT}" --rist-port "${RIST_PORT}" \
+  --token "${TOKEN}" --egress-allow-private >> "${RECEIVER_LOG}" 2>&1
+receiver_pid=${LAST_STARTED_PID}
 echo "receiver pid ${receiver_pid} control=127.0.0.1:${CTRL_PORT} rist=${RIST_PORT}"
 ready=0
 for _ in $(seq 1 50); do
@@ -350,8 +427,9 @@ rate=$(( fixture_bytes / feed_seconds ))
 [[ "${rate}" -gt 0 ]] || rate=1
 echo
 echo "=== feeding ${fixture_bytes} bytes over RIST at ~${rate} B/s (${feed_seconds}s at 1x) ==="
-( pv -q -L "${rate}" "${FIXTURE}" | "${FEED}" 127.0.0.1 "${RIST_PORT}" ) &
-feed_pid=$!
+start_bg feed env FIXTURE="${FIXTURE}" FEED="${FEED}" RATE="${rate}" RIST_PORT="${RIST_PORT}" \
+  bash -c 'pv -q -L "${RATE}" "${FIXTURE}" | "${FEED}" 127.0.0.1 "${RIST_PORT}"'
+feed_pid=${LAST_STARTED_PID}
 
 sample() {  # $1 = elapsed seconds
   local stats sink path ready_str bytes_sent state
@@ -384,9 +462,9 @@ for t in $(seq 1 $(( feed_seconds + 4 ))); do
   # While the publisher is still live, read the stream back OUT of the RTMP
   # server: bytes alone do not prove a decodable stream.
   if [[ "${t}" -eq $(( feed_seconds - 3 )) && "${SKIP_PULL:-0}" != "1" ]]; then
-    ( timeout 25 ffmpeg -v error -i "rtmp://${SINK_HOST}:${RTMP_PORT}/live/e2e" \
-        -t 3 -c copy -y "${PULL_FILE}" >"${LOG_DIR}/pull.log" 2>&1 ) &
-    pull_pid=$!
+    start_bg pull timeout 25 ffmpeg -v error -i "rtmp://${SINK_HOST}:${RTMP_PORT}/live/e2e" \
+      -t 3 -c copy -y "${PULL_FILE}" >>"${LOG_DIR}/pull.log" 2>&1
+    pull_pid=${LAST_STARTED_PID}
   fi
 done
 [[ -n "${pull_pid}" ]] && wait "${pull_pid}" 2>/dev/null
