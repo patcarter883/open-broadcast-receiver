@@ -230,3 +230,20 @@ if(NOT OBR_TESTS_ONLY)
     PkgConfig::gstreamer-app)
   set_tests_properties(stream_switch_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# stage_test (plan C4). The shared restartable stage is GStreamer-only (one
+# demux, two selectors, one re-stamped timeline into the ES rings), so the test
+# lives in the full lane only; the tests-only lane is unaffected. It generates
+# its own TS fixture and slate, feeds them at real time and exits 77 when no h264
+# encoder is installed.
+if(NOT OBR_TESTS_ONLY)
+  add_executable(stage_test source/stage_test.cpp)
+  target_link_libraries(stage_test PRIVATE
+    standby_lib
+    PkgConfig::gstreamer
+    PkgConfig::gstreamer-app
+    Threads::Threads)
+  target_compile_features(stage_test PRIVATE cxx_std_20)
+  add_test(NAME stage_test COMMAND stage_test)
+  set_tests_properties(stage_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
