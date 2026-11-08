@@ -26,6 +26,9 @@ constexpr std::chrono::seconds k_backoff_cap {30};
 // mid-event platform blip after hours of streaming restarts fast again.
 constexpr std::chrono::seconds k_stable_after {30};
 constexpr guint64 k_appsrc_max_bytes = 4 * 1024 * 1024;
+// How long the transit buffer may stay pinned at its limit before the sink is
+// treated as stalled and the attempt is rebuilt.
+constexpr auto k_stall_timeout = std::chrono::seconds(5);
 
 auto now_ms() -> int64_t
 {
@@ -170,12 +173,20 @@ auto output_template(output_proto proto,
                      const transcode_config& transcode,
                      const char* encoder) -> std::string
 {
+  // block=false on purpose: with block=true a sink that stops draining parks
+  // the feed thread INSIDE push_buffer forever, so the stall/audio checks below
+  // never run and nothing ever reconnects. Dropping under pressure is the
+  // correct behaviour for a live output.
   constexpr std::string_view k_appsrc =
       "appsrc name=osrc is-live=true do-timestamp=true format=time "
-      "block=true max-bytes=4194304 ";
+      "block=false max-bytes=4194304 ";
+  // caps=video/mpegts,systemstream=true is MANDATORY here: this appsrc feeds a
+  // tsparse, and tsparse will not link to an uncaps'd source. Without it the
+  // audio branch dies silently, the muxer stays capless on its audio pad and
+  // never emits, so the sink never prerolls and the publish looks frozen.
   constexpr std::string_view k_audio_appsrc =
       "appsrc name=asrc is-live=true do-timestamp=true format=time "
-      "block=true max-bytes=4194304 ";
+      "block=false max-bytes=4194304 caps=video/mpegts,systemstream=true ";
 
   if (transcode.target == transcode_target::none) {
     // Copy-only templates — byte-identical to the pre-transcode tier. An rtmp
@@ -763,6 +774,9 @@ auto output::run_once() -> bool
     return true;
   }
 
+  m_run_started = std::chrono::steady_clock::now();
+  m_audio_probe_done = false;
+
   std::vector<uint8_t> buf(k_read_chunk);
   bool announced_running = false;
   bool video_caps_set = false;
@@ -863,6 +877,67 @@ auto output::run_once() -> bool
 // caller should stop the attempt (appsrc gone).
 auto output::feed_transcode(bool& video_caps_set) -> bool
 {
+  // appsrc is block=true, so a sink that stops draining would block the push
+  // forever: run_once never returns, the worker never reconnects, and no bus
+  // error is raised. Watch the buffer level instead and end the attempt once
+  // it has been pinned at the limit, so the sink is rebuilt and reconnected.
+  if (gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc))
+      >= static_cast<guint64>(k_appsrc_max_bytes))
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (m_stall_since == std::chrono::steady_clock::time_point {}) {
+      m_stall_since = now;
+    } else if (now - m_stall_since > k_stall_timeout) {
+      m_stall_since = std::chrono::steady_clock::time_point {};
+      set_last_error("output sink stalled");
+      log("sink stalled with a full appsrc; rebuilding the output\n");
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    return true;
+  }
+  m_stall_since = std::chrono::steady_clock::time_point {};
+
+  // flvmux emits nothing until every linked pad has caps, so an audio branch
+  // that never receives data pins the output in PAUSED: the sink never
+  // prerolls and the publish looks frozen with no error. Probed from the feed
+  // thread (this binary runs no GLib main loop, so a g_timeout never fires).
+  if (!m_audio_probe_done && m_audio_appsrc != nullptr
+      && std::chrono::steady_clock::now() - m_run_started
+          > std::chrono::seconds(4))
+  {
+    m_audio_probe_done = true;
+    GstPad* asrc = gst_element_get_static_pad(m_audio_appsrc, "src");
+    const bool capless = asrc == nullptr || gst_pad_get_current_caps(asrc) == nullptr;
+    if (asrc != nullptr) {
+      gst_object_unref(asrc);
+    }
+    if (capless) {
+      GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
+      if (mux != nullptr) {
+        GstIterator* it = gst_element_iterate_sink_pads(mux);
+        GValue item = G_VALUE_INIT;
+        while (gst_iterator_next(it, &item) == GST_ITERATOR_OK) {
+          auto* candidate = GST_PAD(g_value_get_object(&item));
+          const char* pname = GST_PAD_NAME(candidate);
+          if (pname != nullptr && g_str_has_prefix(pname, "audio") == TRUE) {
+            GstPad* peer = gst_pad_get_peer(candidate);
+            if (peer != nullptr) {
+              gst_pad_unlink(peer, candidate);
+              gst_object_unref(peer);
+            }
+            log("audio pad had no caps; dropping it so the video can publish\n");
+            break;
+          }
+          g_value_reset(&item);
+        }
+        g_value_unset(&item);
+        gst_iterator_free(it);
+        gst_object_unref(mux);
+      }
+    }
+  }
+
   frame_ring::frame_meta vmeta;
   const std::size_t vgot =
       m_frames->read(m_frame_consumer, vmeta, m_frame_buf.data(),
