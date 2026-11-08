@@ -297,7 +297,8 @@ auto test_two_streams_share_offset() -> void
 }
 
 // ---------------------------------------------------------------------------
-// the follower takes the driver's offset and never touches the shared state
+// the follower takes the driver's offset, clamps only against its OWN floor,
+// and never touches the shared state
 // ---------------------------------------------------------------------------
 auto test_follower_never_moves_state() -> void
 {
@@ -318,33 +319,46 @@ auto test_follower_never_moves_state() -> void
   const std::int64_t last_before = timeline.last_out_ns();
   const std::int64_t offset_before = timeline.offset_ns();
 
-  // (a) a follower buffer an arbitrary amount in FRONT of the driver: no clamp,
-  // no compression, no state movement.
-  std::int64_t ahead_pts = 500'000'000LL + 4 * k_frame;
+  // (a) a follower buffer that steps forward on its own clock takes exactly the
+  // current offset: no clamp, no compression, no state movement.
+  std::int64_t ahead_pts = 101 * k_frame;
   std::int64_t ahead_dts = ahead_pts;
   expect(timeline.apply_follower(ahead_pts, ahead_dts), "follower ahead accepted");
-  expect(ahead_pts == 500'000'000LL + 4 * k_frame + offset_before,
+  expect(ahead_pts == 101 * k_frame + offset_before,
          "the follower is shifted by exactly the current offset");
   expect(timeline.last_out_ns() == last_before,
          "a follower ahead of the driver does not move last_out");
   expect(timeline.offset_ns() == offset_before,
          "a follower ahead of the driver does not move the offset");
+  const std::int64_t advanced_floor = ahead_pts;
 
-  // (b) a follower buffer BEHIND last_out -- the case that used to clamp and
-  // drag the video with it -- is shifted, not clamped.
-  std::int64_t behind_pts = 0;  // far behind the published timeline
+  // (b) a follower buffer far BEHIND its own floor: bumped exactly one tick
+  // past the FOLLOWER's floor -- never to the driver's last_out + frame, which
+  // would silently lift a stream that is merely a little late.
+  std::int64_t behind_pts = 0;  // on the new offset this is far behind
   std::int64_t behind_dts = 0;
   expect(timeline.apply_follower(behind_pts, behind_dts),
          "follower behind accepted");
-  expect(behind_pts == offset_before,
-         "a follower behind the driver is not clamped to last_out + frame");
+  expect(behind_pts == advanced_floor + 1,
+         "a backdated follower is clamped one tick past its own floor");
+  expect(behind_pts != last_before + k_frame,
+         "a backdated follower is not clamped to the driver's floor");
   expect(timeline.last_out_ns() == last_before,
          "a follower behind the driver does not move last_out");
   expect(timeline.offset_ns() == offset_before,
          "a follower behind the driver does not move the offset");
 
-  // (c) a follower B-frame keeps its reorder distance.
-  std::int64_t bframe_pts = 600'000'000LL;
+  // (c) the same source stamp twice: the duplicate advances one tick, not a
+  // frame, and still never moves the shared state.
+  std::int64_t dup_pts = 0;
+  std::int64_t dup_dts = 0;
+  expect(timeline.apply_follower(dup_pts, dup_dts), "duplicate accepted");
+  expect(dup_pts == behind_pts + 1, "a duplicate advances exactly one tick");
+  expect(timeline.last_out_ns() == last_before, "duplicate moved no last_out");
+  expect(timeline.offset_ns() == offset_before, "duplicate moved no offset");
+
+  // (d) a follower B-frame keeps its reorder distance.
+  std::int64_t bframe_pts = dup_pts + 100 * k_frame;
   std::int64_t bframe_dts = bframe_pts - k_reorder;
   expect(timeline.apply_follower(bframe_pts, bframe_dts), "follower b-frame ok");
   expect(bframe_pts - bframe_dts == k_reorder,
@@ -357,7 +371,202 @@ auto test_follower_never_moves_state() -> void
          "a dts-after-pts follower is refused");
   expect(timeline.last_out_ns() == last_before, "refusal moved nothing");
   expect(timeline.offset_ns() == offset_before, "refusal moved no offset");
+  expect(timeline.last_follower_ns() == bframe_pts,
+         "refusal did not move the follower's own floor");
   std::puts("ok: follower never moves state");
+}
+
+// ---------------------------------------------------------------------------
+// across a backwards driver clamp the follower moves forward with the offset
+// and never steps back
+// ---------------------------------------------------------------------------
+auto test_follower_across_backwards_clamp() -> void
+{
+  timeline_state timeline(k_frame, k_max_gap);
+  constexpr std::int64_t k_audio_frame = 21'333'333;  // 1024 @ 48 kHz
+
+  std::int64_t video_src = 0;
+  std::int64_t audio_src = 10 * k_audio_frame;
+  for (int idx = 0; idx < 10; ++idx) {
+    drive_ok(timeline, make_stamp(video_src));
+    video_src += k_frame;
+    follow_ok(timeline, {.pts = audio_src, .dts = audio_src});
+    audio_src += k_audio_frame;
+  }
+  std::int64_t last_audio_out = audio_src - k_audio_frame;
+
+  for (int jump = 0; jump < 3; ++jump) {
+    // The source jumps back five frames; the driver clamps and lifts the
+    // shared offset by the difference.
+    video_src -= 5 * k_frame;
+    const std::int64_t driver_before = timeline.last_out_ns();
+    const stamp_pair video = drive_ok(timeline, make_stamp(video_src));
+    expect(video.pts == driver_before + k_frame,
+           "the driver clamps to last_out + one frame");
+    video_src += k_frame;
+    const std::int64_t offset = timeline.offset_ns();
+
+    for (int idx = 0; idx < 4; ++idx) {
+      const std::int64_t driver_floor = timeline.last_out_ns();
+      std::int64_t pts = audio_src;
+      std::int64_t dts = audio_src;
+      expect(timeline.apply_follower(pts, dts), "audio accepted after the clamp");
+      expect(pts == audio_src + offset,
+             "each audio buffer takes exactly the driver's offset, unclamped");
+      expect(pts > last_audio_out,
+             "audio stays strictly monotonic across a backwards clamp");
+      expect(timeline.offset_ns() == offset,
+             "the follower never moves the shared offset");
+      expect(timeline.last_out_ns() == driver_floor,
+             "the follower never moves the driver's floor");
+      last_audio_out = pts;
+      audio_src += k_audio_frame;
+    }
+    // Let the video run a few frames before the next jump.
+    for (int idx = 0; idx < 3; ++idx) {
+      drive_ok(timeline, make_stamp(video_src));
+      video_src += k_frame;
+    }
+  }
+  std::puts("ok: follower across a backwards clamp");
+}
+
+// ---------------------------------------------------------------------------
+// a forward-gap compression pulls the offset BACK; an audio buffer already
+// stamped on the pre-gap clock must be bumped forward, not emitted backwards
+// ---------------------------------------------------------------------------
+auto test_follower_clamps_after_gap_compression() -> void
+{
+  timeline_state timeline(k_frame, k_max_gap);
+  constexpr std::int64_t k_audio_frame = 21'333'333;
+
+  // Settle both streams on one clock.
+  std::int64_t video_src = 0;
+  std::int64_t audio_src = 0;
+  for (int idx = 0; idx < 20; ++idx) {
+    drive_ok(timeline, make_stamp(video_src));
+    video_src += k_frame;
+    follow_ok(timeline, {.pts = audio_src, .dts = audio_src});
+    audio_src += k_audio_frame;
+  }
+  const std::int64_t audio_floor = audio_src - k_audio_frame;
+  expect(timeline.offset_ns() == 0, "a clean run leaves no offset");
+
+  // The encoder vanishes for 270 s and resumes on its own clock: the driver
+  // compresses the hole, which drags the shared offset 270 s backwards.
+  video_src += 270'000'000'000LL;
+  drive_ok(timeline, make_stamp(video_src));
+  const std::int64_t offset = timeline.offset_ns();
+  expect(offset <= -270'000'000'000LL,
+         "the compression pulled the shared offset far backwards");
+  const std::int64_t driver_floor = timeline.last_out_ns();
+
+  // An audio AU already stamped on the old clock arrives after the switch. On
+  // the new offset it would land 270 s before the last audio published: a
+  // muxer would reject it. It must be bumped one tick past the audio floor.
+  std::int64_t pts = audio_src;
+  std::int64_t dts = audio_src;
+  expect(timeline.apply_follower(pts, dts), "the in-flight audio AU is accepted");
+  expect(pts == audio_floor + 1,
+         "the in-flight audio AU is clamped one tick past its own floor");
+  expect(pts == dts, "audio pts == dts is still honoured after the clamp");
+  expect(timeline.offset_ns() == offset, "the clamp moved no shared offset");
+  expect(timeline.last_out_ns() == driver_floor,
+         "the clamp moved no driver floor");
+
+  // A second pre-gap AU advances a tick, not a frame back.
+  audio_src += k_audio_frame;
+  std::int64_t pts2 = audio_src;
+  std::int64_t dts2 = audio_src;
+  expect(timeline.apply_follower(pts2, dts2), "the second AU is accepted");
+  expect(pts2 == pts + 1, "each backdated AU advances exactly one tick");
+
+  // Once the audio source clock has also jumped the gap, its buffers line up
+  // again naturally: the clamp cost the in-flight frames only.
+  const std::int64_t caught_up = audio_src + 270'000'000'000LL;
+  std::int64_t pts3 = caught_up;
+  std::int64_t dts3 = caught_up;
+  expect(timeline.apply_follower(pts3, dts3), "the post-gap AU is accepted");
+  expect(pts3 == caught_up + offset,
+         "a post-gap AU takes the offset with no clamp");
+  expect(pts3 > pts2, "the follower continues forward after the switch");
+  expect(timeline.offset_ns() == offset, "the run moved no shared offset");
+  std::puts("ok: follower clamps after a gap compression");
+}
+
+// ---------------------------------------------------------------------------
+// 100 pseudo-random driver steps with audio in lock-step: the follower output
+// is strictly increasing and always equals the driver's offset or its floor+1
+// ---------------------------------------------------------------------------
+auto test_follower_monotonic_under_random_steps() -> void
+{
+  timeline_state timeline(k_frame, k_max_gap);
+  constexpr std::int64_t k_audio_frame = 21'333'333;
+
+  std::uint32_t rng = 0x2545F491U;
+  auto next_rand = [&rng]() -> std::uint32_t
+  {
+    rng ^= rng << 13U;
+    rng ^= rng >> 17U;
+    rng ^= rng << 5U;
+    return rng;
+  };
+
+  std::int64_t video_src = 50 * k_frame;
+  std::int64_t audio_src = 50 * k_frame;
+  std::int64_t prev_audio_out = 0;
+  bool have_audio = false;
+  int bumps = 0;
+  int natural = 0;
+
+  for (int idx = 0; idx < 100; ++idx) {
+    const std::uint32_t pick = next_rand() % 100U;
+    std::int64_t step = k_frame;
+    if (pick < 30U) {
+      step = -static_cast<std::int64_t>(1U + next_rand() % 200U) * k_frame;
+    } else if (pick < 55U) {
+      step = static_cast<std::int64_t>(1U + next_rand() % 600U)
+             * 1'000'000'000LL;
+    } else if (pick < 65U) {
+      step = 0;
+    }
+    video_src += step;
+    drive_ok(timeline, make_stamp(video_src));
+
+    const std::int64_t offset = timeline.offset_ns();
+    const std::int64_t driver_floor = timeline.last_out_ns();
+
+    for (int tick = 0; tick < 2; ++tick) {
+      std::int64_t pts = audio_src;
+      std::int64_t dts = audio_src;
+      expect(timeline.apply_follower(pts, dts), "random follower accepted");
+      const std::int64_t wanted = audio_src + offset;
+      if (have_audio && wanted <= prev_audio_out) {
+        expect(pts == prev_audio_out + 1,
+               "a backdated audio buffer is bumped exactly one tick");
+        ++bumps;
+      } else {
+        expect(pts == wanted, "an in-order audio buffer takes the offset");
+        ++natural;
+      }
+      if (have_audio) {
+        expect(pts > prev_audio_out,
+               "the follower is strictly monotonic under random churn");
+      }
+      expect(pts >= audio_src + offset, "the follower never moves backwards");
+      expect(timeline.offset_ns() == offset,
+             "the follower never moves the shared offset");
+      expect(timeline.last_out_ns() == driver_floor,
+             "the follower never moves the driver's floor");
+      prev_audio_out = pts;
+      have_audio = true;
+      audio_src += k_audio_frame;
+    }
+  }
+  expect(bumps > 0 && natural > 0,
+         "the random run hit both the clamp and the pass-through path");
+  std::printf("ok: follower monotonic under random steps (%d bumps, %d natural)\n",
+              bumps, natural);
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +726,9 @@ auto main() -> int
   test_anchor();
   test_two_streams_share_offset();
   test_follower_never_moves_state();
+  test_follower_across_backwards_clamp();
+  test_follower_clamps_after_gap_compression();
+  test_follower_monotonic_under_random_steps();
   test_follower_monotonic_under_clamps();
   test_malformed_refused();
   test_monotonic_under_churn();
