@@ -98,6 +98,20 @@ if(NOT OBR_TESTS_ONLY)
   target_include_directories(rtmp_publish_harness PRIVATE
     ${CMAKE_SOURCE_DIR}/external)
 
+  # Stamp the binary with the commit it was linked against. A verdict is about
+  # that commit only, and without the stamp a report cannot say which code it
+  # measured. The run script refuses a binary older than its sources.
+  execute_process(
+    COMMAND git -C ${CMAKE_SOURCE_DIR} rev-parse --short HEAD
+    OUTPUT_VARIABLE OBR_SOURCE_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(NOT OBR_SOURCE_COMMIT)
+    set(OBR_SOURCE_COMMIT "unknown")
+  endif()
+  target_compile_definitions(rtmp_publish_harness PRIVATE
+    OBR_SOURCE_COMMIT="${OBR_SOURCE_COMMIT}")
+
   option(OBR_RTMP_HARNESS_TESTS
     "Register the RTMP publish harness with CTest (needs a sink on 11935/18080)"
     OFF)
