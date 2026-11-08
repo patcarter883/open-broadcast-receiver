@@ -68,6 +68,12 @@ cmake -S . -B build-tests -D OBR_TESTS_ONLY=ON
 cmake --build build-tests && ctest --test-dir build-tests
 ```
 
+RTMP output path, end to end, against a local sink (no rig, no platform):
+
+```sh
+test/harness/rtmp_publish_harness.sh    # see test/harness/README.md
+```
+
 ## Run (self-hosting quickstart)
 
 The control API binds **127.0.0.1 by default**. Two sane setups:

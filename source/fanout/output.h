@@ -111,6 +111,14 @@ public:
   [[nodiscard]] auto connected_s() const -> int64_t;
   [[nodiscard]] auto last_error() const -> std::string;
 
+  // A new reference to the current attempt's pipeline, or nullptr between
+  // attempts (caller owns the reference). The local RTMP harness
+  // (test/source/rtmp_publish_harness.cpp) uses it to probe the muxer's pads and
+  // read element state: only what the muxer emitted and what the server received
+  // show that an output publishes, while bytes_sent counts pushes into the
+  // appsrc and can read healthy with nothing leaving the box.
+  [[nodiscard]] auto pipeline() const -> GstElement*;
+
   // Registry pre-check for /start. Returns the first unsatisfied element
   // requirement (base chain => element_unavailable; transcode chain =>
   // transcode_unavailable), or nullopt when every requirement is met. For a
@@ -180,6 +188,10 @@ private:
 
   mutable std::mutex m_err_mutex;
   std::string m_last_error;
+
+  // Guards the pipeline pointer handed out by pipeline(); every other use of
+  // m_pipeline is on the worker thread.
+  mutable std::mutex m_pipe_mutex;
 
   mutable std::mutex m_enc_mutex;
   std::string m_encoder_name;

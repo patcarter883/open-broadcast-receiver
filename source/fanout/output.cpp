@@ -142,6 +142,15 @@ auto output::last_error() const -> std::string
   return m_last_error;
 }
 
+auto output::pipeline() const -> GstElement*
+{
+  std::lock_guard<std::mutex> guard(m_pipe_mutex);
+  if (m_pipeline == nullptr) {
+    return nullptr;
+  }
+  return GST_ELEMENT(gst_object_ref(m_pipeline));
+}
+
 auto output::set_last_error(const std::string& err) -> void
 {
   std::lock_guard<std::mutex> guard(m_err_mutex);
@@ -368,7 +377,11 @@ auto output::build_pipeline(std::string& err) -> bool
       is_transcode ? chosen_encoder.c_str() : nullptr);
 
   GError* gerr = nullptr;
-  m_pipeline = gst_parse_launch(tmpl.c_str(), &gerr);
+  GstElement* parsed = gst_parse_launch(tmpl.c_str(), &gerr);
+  {
+    std::lock_guard<std::mutex> guard(m_pipe_mutex);
+    m_pipeline = parsed;
+  }
   if (m_pipeline == nullptr || gerr != nullptr) {
     err = (gerr != nullptr && gerr->message != nullptr)
         ? gerr->message
@@ -651,8 +664,14 @@ auto output::demux_pad_added(GstElement* /*demux*/,
 
 auto output::destroy_pipeline() -> void
 {
-  if (m_pipeline != nullptr) {
-    gst_element_set_state(m_pipeline, GST_STATE_NULL);
+  GstElement* pipeline = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(m_pipe_mutex);
+    pipeline = m_pipeline;
+    m_pipeline = nullptr;
+  }
+  if (pipeline != nullptr) {
+    gst_element_set_state(pipeline, GST_STATE_NULL);
   }
   if (m_bus != nullptr) {
     gst_object_unref(m_bus);
@@ -666,9 +685,8 @@ auto output::destroy_pipeline() -> void
     gst_object_unref(m_audio_appsrc);
     m_audio_appsrc = nullptr;
   }
-  if (m_pipeline != nullptr) {
-    gst_object_unref(m_pipeline);
-    m_pipeline = nullptr;
+  if (pipeline != nullptr) {
+    gst_object_unref(pipeline);
   }
 }
 
@@ -775,8 +793,9 @@ auto output::stop() -> void
   // and the NULL transition is what releases it -- so the join must not be
   // attempted until the pipeline is down, or stop blocks for as long as the
   // block lasts. destroy_pipeline() issues that transition and is idempotent.
-  if (m_pipeline != nullptr) {
-    gst_element_set_state(m_pipeline, GST_STATE_NULL);
+  if (GstElement* pipeline_now = pipeline(); pipeline_now != nullptr) {
+    gst_element_set_state(pipeline_now, GST_STATE_NULL);
+    gst_object_unref(pipeline_now);
   }
   if (m_thread.joinable()) {
     m_thread.join();
