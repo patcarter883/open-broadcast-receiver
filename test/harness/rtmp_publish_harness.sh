@@ -118,6 +118,11 @@ for mode in $MODES; do
       exit 2
     fi
     mode_args=(--fixture "$FIXTURE")
+    # FIXTURE_AUDIO names what the file carries, the same way the fixture
+    # generator does: a clip with AAC must satisfy the audio assertions.
+    if [[ "${FIXTURE_AUDIO:-1}" != "0" ]]; then
+      mode_args+=(--fixture-audio)
+    fi
   fi
   if "$HARNESS_BIN" --mode "$mode" \
       --host 127.0.0.1 --port "$RTMP_PORT" \

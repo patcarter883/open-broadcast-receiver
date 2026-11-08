@@ -36,6 +36,12 @@
 #                         counts for h264 video, plus for aac audio when the
 #                         fixture carries it. A stream that is declared but
 #                         carries 0 packets fails the run.
+#   * audio at the muxer — when the fixture carries AAC, the run fails unless the
+#                         receiver log shows the muxer's audio pad receiving
+#                         AAC-LC 48 kHz stereo raw with codec_data 1190, and
+#                         unless the 4 s no-buffer probe did NOT retire that pad.
+#                         A source with no AAC must instead never hand the muxer
+#                         an audio pad at all.
 #
 # Usage:
 #   test/harness/receiver_e2e_local.sh
@@ -255,6 +261,18 @@ if ! grep -q "stream_type=0x06" "${PROOF_LOG}" \
 fi
 echo "fixture: tsdemux exposes video/x-av1; PMT carries stream_type 0x06 + AV1G"
 
+# The audio checks later in this script are assertions about THIS file, so the
+# file's tracks are checked here against what the run expects. A video-only
+# fixture reused under the default name would otherwise make them vacuous.
+if [[ "${FIXTURE_AUDIO:-1}" != "0" ]]; then
+  if ! grep -q "GstAacParse:aacparse0.GstPad:src: caps = audio/mpeg" "${PROOF_LOG}"; then
+    echo "FIXTURE INVALID: audio is expected (FIXTURE_AUDIO!=0) but ${FIXTURE}" >&2
+    echo "                 exposes no AAC pad; regenerate it or set FIXTURE_AUDIO=0" >&2
+    exit 1
+  fi
+  echo "fixture: AAC track present — $(grep -m1 'GstAacParse:aacparse0.GstPad:src' "${PROOF_LOG}" | sed 's/.*caps = //')"
+fi
+
 # ---- local RTMP sink -------------------------------------------------------
 echo
 echo "=== sink (MediaMTX) ==="
@@ -441,6 +459,34 @@ else
 fi
 
 verdict=0
+# What the muxer was actually handed. The readback proves an AAC stream exists;
+# this proves the branch produced the declared caps rather than something the
+# destination cannot carry, and that the audio pad was not retired by the 4 s
+# no-buffer probe (which is the path a missing or stuck audio branch takes).
+audio_mux_ok=1
+if [[ "${audio_expected}" -eq 1 ]]; then
+  mux_audio_line=$(grep -am1 "muxer audio in:" "${RECEIVER_LOG}")
+  echo
+  echo "=== muxer audio input (from the receiver log) ==="
+  echo "${mux_audio_line:-  (no 'muxer audio in' line: the audio branch never delivered a buffer)}"
+  if [[ -z "${mux_audio_line}" ]] \
+     || ! grep -q "stream-format=(string)raw" <<<"${mux_audio_line}" \
+     || ! grep -q "rate=(int)48000" <<<"${mux_audio_line}" \
+     || ! grep -q "channels=(int)2" <<<"${mux_audio_line}" \
+     || ! grep -q "codec_data=(buffer)1190" <<<"${mux_audio_line}"; then
+    audio_mux_ok=0
+  fi
+  if grep -aq "audio pad received no buffers" "${RECEIVER_LOG}"; then
+    echo "  the 4 s probe retired the muxer's audio pad: no AAC reached it"
+    audio_mux_ok=0
+  fi
+else
+  # No audio in the source: the only correct shape is no muxer audio pad at all.
+  if grep -aq "source TS carries audio" "${RECEIVER_LOG}"; then
+    echo "a video-only source still handed the muxer an audio pad" >&2
+    audio_mux_ok=0
+  fi
+fi
 if [[ "${max_rist}" -eq 0 ]]; then
   echo "VERDICT: STALLED at RIST ingest (no packets received)"
   verdict=1
@@ -466,6 +512,11 @@ elif [[ "${sink_growth}" -lt 32768 ]]; then
   echo "         '$(tail -1 "${SAMPLE_LOG}" | cut -f4)' with bytes_sent"
   echo "         $(tail -1 "${SAMPLE_LOG}" | cut -f5) — that counter is NV12 frames"
   echo "         pushed into the video appsrc, not bytes on the wire."
+  verdict=1
+elif [[ "${audio_mux_ok}" -ne 1 ]]; then
+  echo "VERDICT: PARTIAL — the stream published, but the audio branch did not hand"
+  echo "         the muxer AAC-LC 48 kHz stereo raw with codec_data 1190 (see the"
+  echo "         muxer audio input above); treat the audio path as unproven."
   verdict=1
 elif [[ "${pull_ok}" -ne 1 ]]; then
   echo "VERDICT: PARTIAL — sink received ${sink_growth} B but the pulled stream did not"
