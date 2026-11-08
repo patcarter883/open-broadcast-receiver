@@ -418,7 +418,7 @@ auto make_ts(const std::string& description) -> std::vector<std::uint8_t>
   const int frames = (48000 / 1024) * seconds;
   return make_ts(std::format(
       "videotestsrc is-live=false num-buffers={} ! "
-      "video/x-raw,width={},height={},framerate=30/1 ! "
+      "video/x-raw,format=NV12,width={},height={},framerate=30/1 ! "
       "x264enc tune=zerolatency key-int-max=30 bitrate={} ! "
       "h264parse config-interval=-1 ! mux. "
       "audiotestsrc is-live=false num-buffers={} wave=sine ! "
@@ -433,7 +433,7 @@ auto make_ts(const std::string& description) -> std::vector<std::uint8_t>
 {
   return make_ts(std::format(
       "videotestsrc is-live=false num-buffers={} ! "
-      "video/x-raw,width={},height={},framerate=30/1 ! "
+      "video/x-raw,format=NV12,width={},height={},framerate=30/1 ! "
       "x264enc tune=zerolatency key-int-max=30 bitrate={} ! "
       "h264parse config-interval=-1 ! mpegtsmux alignment=7 ! "
       "appsink name=sink sync=false",
@@ -642,6 +642,30 @@ auto dump_element_states(GstElement* pipeline) -> void
   }
   g_value_unset(&item);
   gst_iterator_free(it);
+}
+
+auto element_sink_caps(GstElement* pipeline, const char* name) -> std::string
+{
+  GstElement* element = gst_bin_get_by_name(GST_BIN(pipeline), name);
+  if (element == nullptr) {
+    return {};
+  }
+  std::string text;
+  GstPad* pad = gst_element_get_static_pad(element, "sink");
+  if (pad != nullptr) {
+    GstCaps* caps = gst_pad_get_current_caps(pad);
+    if (caps != nullptr) {
+      gchar* rendered = gst_caps_to_string(caps);
+      if (rendered != nullptr) {
+        text = rendered;
+        g_free(rendered);
+      }
+      gst_caps_unref(caps);
+    }
+    gst_object_unref(pad);
+  }
+  gst_object_unref(element);
+  return text;
 }
 
 auto dump_mux_pads(GstElement* pipeline) -> void
@@ -977,16 +1001,53 @@ auto main(int argc, char** argv) -> int
     ok = false;
     mode_failure = "audio reached the muxer in a video-only mode";
   }
-  const bool failed = !ok;
-  if (failed) {
-    if (GstElement* pipeline = out.pipeline(); pipeline != nullptr) {
-      dump_element_states(pipeline);
-      dump_mux_pads(pipeline);
+
+  // The destinations are 4:2:0 8-bit, so that is what has to reach the muxer. An
+  // encoder whose input is left unpinned negotiates whatever its widest sink
+  // caps allow (4:4:4, or a 10-bit layout) and the muxer then publishes a stream
+  // the destination cannot decode -- and in the FLV case, one it cannot even
+  // mux. Assert on what actually negotiated rather than on the template.
+  std::string encoder_input_caps;
+  {
+    GstElement* pipeline = out.pipeline();
+    if (pipeline != nullptr) {
+      if (opts.run_mode == mode::transcode_av
+          || opts.run_mode == mode::transcode_video_only) {
+        encoder_input_caps = element_sink_caps(pipeline, "venc");
+      }
+      if (!ok) {
+        dump_element_states(pipeline);
+        dump_mux_pads(pipeline);
+      }
       gst_object_unref(pipeline);
-    } else {
+    } else if (!ok) {
       std::printf("  pipeline: none (attempt already torn down)\n");
     }
   }
+
+  {
+    const auto mux_video_final = inst.mux_video_buffers.load();
+    std::lock_guard<std::mutex> guard(inst.mutex);
+    // Only a mode that actually published is judged: copy-video-only is pinned
+    // as an expected stall, and its caps say nothing when nothing was muxed.
+    if (ok && server_grew && mux_video_final != 0) {
+      const bool is_420 = inst.video_caps.find("chroma-format=(string)4:2:0")
+          != std::string::npos;
+      const bool is_8bit =
+          inst.video_caps.find("bit-depth-luma=(uint)8") != std::string::npos;
+      if (!is_420 || !is_8bit) {
+        ok = false;
+        mode_failure = "muxer video input is not 4:2:0 8-bit";
+      }
+    }
+  }
+  if (ok && !encoder_input_caps.empty()
+      && encoder_input_caps.find("format=(string)NV12") == std::string::npos) {
+    ok = false;
+    mode_failure = "encoder input is not NV12 (4:2:0, 8-bit)";
+  }
+
+  const bool failed = !ok;
 
   // Copied out before stop(): the output's log callback takes this same mutex
   // from the worker thread that stop() joins.
@@ -1035,6 +1096,9 @@ auto main(int argc, char** argv) -> int
               audio_caps.empty() ? "(none)" : audio_caps.c_str());
   std::printf("video caps           %s\n",
               video_caps.empty() ? "(none)" : video_caps.c_str());
+  if (!encoder_input_caps.empty()) {
+    std::printf("encoder input caps   %s\n", encoder_input_caps.c_str());
+  }
   if (!last_error.empty()) {
     std::printf("last error           %s\n", last_error.c_str());
   }

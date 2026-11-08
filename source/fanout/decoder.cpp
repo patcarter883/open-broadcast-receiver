@@ -31,13 +31,19 @@ constexpr auto k_stats_period = std::chrono::seconds(2);
 // Decoded frames published per feed iteration; the appsink drops beyond its
 // own queue, so draining it fully keeps the frame ring current.
 constexpr int k_publish_burst = 8;
-// How long an attempt may run without emitting a single decoded frame before it
-// is retired and the next decoder in the chain is built. A working decoder
-// emits inside the first second; this window only has to be longer than a slow
-// preroll, and it is the bound that turns a silently wedged hardware decoder
-// (pipeline parked in ASYNC, no bus error) into a fallback instead of a stall.
-constexpr auto k_attempt_window = std::chrono::seconds(3);
-constexpr auto k_ingest_wait = std::chrono::seconds(10);
+// How long a decoder attempt may run after the demuxer first hands it a video
+// buffer without emitting a decoded frame before it is retired and the next
+// decoder in the chain is built. A working decoder emits within a frame or two
+// of the stream's first keyframe; the window is wide enough to cover preroll
+// plus one keyframe interval, so a stream whose first received bytes start
+// mid-GOP is not mistaken for a broken decoder. It is still the bound that turns
+// a silently wedged hardware decoder (pipeline parked in ASYNC, no bus error)
+// into a fallback instead of a stall.
+constexpr auto k_attempt_window = std::chrono::seconds(5);
+// The same bound for the step before it: TS bytes have been fed to tsdemux, which
+// has produced no video buffer at all. Measured from the first fed chunk of the
+// attempt, so a stream that has not started yet never enters it.
+constexpr auto k_demux_window = std::chrono::seconds(5);
 
 auto now_steady() -> std::chrono::steady_clock::time_point
 {
@@ -655,7 +661,13 @@ auto decoder::start_attempt(std::size_t index, std::string& err) -> bool
                   gst_element_state_change_return_get_name(scr),
                   gst_element_state_get_name(pending)));
 
-  m_attempt_start_ns.store(steady_ns(), std::memory_order_relaxed);
+  m_attempt_start_ns.store(0, std::memory_order_relaxed);
+  m_attempt_feed_start_ns.store(0, std::memory_order_relaxed);
+  m_attempt_base_in.store(
+      m_in_chunks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  m_attempt_base_demux.store(
+      m_demux_buffers.load(std::memory_order_relaxed),
+      std::memory_order_relaxed);
   m_attempt_base_decoder.store(
       m_decoder_buffers.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
@@ -764,40 +776,63 @@ auto decoder::check_attempt_health() -> bool
     }
   }
 
-  // No bus error. A decoder that emitted nothing inside the window is just as
-  // dead: av1parse on this box posts NOT_NEGOTIATED while the pipeline is still
-  // prerolling, so the error can arrive after -- or not at all -- and this
+  // No bus error. A decoder that takes video buffers and emits nothing is just
+  // as dead: av1parse on this box posts NOT_NEGOTIATED while the pipeline is
+  // still prerolling, so the error can arrive after -- or not at all -- and this
   // window is what still makes the stage recover.
-  const auto attempt_start_ns = m_attempt_start_ns.load(std::memory_order_relaxed);
-  const bool fed = m_in_chunks.load(std::memory_order_relaxed) > 0;
-  const auto window = (fed || m_ever_fed.load(std::memory_order_relaxed))
-                          ? k_attempt_window
-                          : k_ingest_wait;
-  if (m_pipeline != nullptr && attempt_start_ns != 0
-      && steady_ns() - attempt_start_ns
-             >= std::chrono::duration_cast<std::chrono::nanoseconds>(window)
-                    .count()) {
-    if (!fed) {
-      GstState st = GST_STATE_VOID_PENDING;
-      GstState pending = GST_STATE_VOID_PENDING;
-      gst_element_get_state(m_pipeline, &st, &pending, 0);
-      log_stats();
-      return degrade(std::format("no TS chunk in {} s (state={}, pending={})",
-                                 k_ingest_wait.count(),
-                                 gst_element_state_get_name(st),
-                                 gst_element_state_get_name(pending)));
-    }
-    if (m_decoder_buffers.load(std::memory_order_relaxed)
-        == m_attempt_base_decoder.load(std::memory_order_relaxed)) {
-      GstState st = GST_STATE_VOID_PENDING;
-      GstState pending = GST_STATE_VOID_PENDING;
-      gst_element_get_state(m_pipeline, &st, &pending, 0);
-      log_stats();
-      return degrade(std::format("no decoded frame in {} s (state={}, pending={})",
-                                 k_attempt_window.count(),
-                                 gst_element_state_get_name(st),
-                                 gst_element_state_get_name(pending)));
-    }
+  //
+  // Both clocks are armed by data arriving, never by the pipeline being built: a
+  // session's stream starts seconds after /start, and a decoder retired before
+  // its first buffer arrives is a healthy hardware decoder replaced by a
+  // software one. The demux clock starts at the attempt's first fed TS chunk;
+  // the decoder clock starts when tsdemux first hands the branch a video buffer
+  // (which happens once the stream's headers have been parsed, so the decoder's
+  // own preroll starts from there).
+  if (m_pipeline == nullptr) {
+    return false;
+  }
+  const auto demux_now = m_demux_buffers.load(std::memory_order_relaxed);
+  const auto in_now = m_in_chunks.load(std::memory_order_relaxed);
+  if (m_attempt_feed_start_ns.load(std::memory_order_relaxed) == 0
+      && in_now > m_attempt_base_in.load(std::memory_order_relaxed)) {
+    m_attempt_feed_start_ns.store(steady_ns(), std::memory_order_relaxed);
+  }
+  if (m_attempt_start_ns.load(std::memory_order_relaxed) == 0
+      && demux_now > m_attempt_base_demux.load(std::memory_order_relaxed)) {
+    m_attempt_start_ns.store(steady_ns(), std::memory_order_relaxed);
+  }
+
+  const auto window_elapsed = [](std::int64_t start_ns,
+                                 std::chrono::seconds window) -> bool
+  {
+    return start_ns != 0
+        && steady_ns() - start_ns
+               >= std::chrono::duration_cast<std::chrono::nanoseconds>(window)
+                      .count();
+  };
+  const auto state_text = [this]() -> std::string
+  {
+    GstState st = GST_STATE_VOID_PENDING;
+    GstState pending = GST_STATE_VOID_PENDING;
+    gst_element_get_state(m_pipeline, &st, &pending, 0);
+    return std::format("state={}, pending={}", gst_element_state_get_name(st),
+                       gst_element_state_get_name(pending));
+  };
+
+  if (window_elapsed(m_attempt_start_ns.load(std::memory_order_relaxed),
+                     k_attempt_window)
+      && m_decoder_buffers.load(std::memory_order_relaxed)
+             == m_attempt_base_decoder.load(std::memory_order_relaxed)) {
+    log_stats();
+    return degrade(std::format("no decoded frame in {} s ({})",
+                               k_attempt_window.count(), state_text()));
+  }
+  if (window_elapsed(m_attempt_feed_start_ns.load(std::memory_order_relaxed),
+                     k_demux_window)
+      && demux_now == m_attempt_base_demux.load(std::memory_order_relaxed)) {
+    log_stats();
+    return degrade(std::format("tsdemux produced no video in {} s ({})",
+                               k_demux_window.count(), state_text()));
   }
   return false;
 }
@@ -943,11 +978,6 @@ auto decoder::worker() -> void
           log("first TS chunk fed to the decode stage: " + std::to_string(got)
               + " bytes\n");
           announced_first_feed = true;
-          m_ever_fed.store(true, std::memory_order_relaxed);
-          m_attempt_start_ns.store(steady_ns(), std::memory_order_relaxed);
-          m_attempt_base_decoder.store(
-              m_decoder_buffers.load(std::memory_order_relaxed),
-              std::memory_order_relaxed);
         }
         GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
         gst_buffer_fill(gbuf, 0, tsbuf.data(), got);

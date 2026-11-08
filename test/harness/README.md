@@ -53,7 +53,11 @@ server receives nothing and the muxer's source pad stays at zero.
 ## PASS rule
 
 A mode passes when the server's `bytes_in` grew by at least 32 KiB after at least
-2 s of feeding, matching the mode's expectation. The floor exists because
+2 s of feeding, matching the mode's expectation, and -- when it published -- when
+the caps that reached the muxer's video pad are H.264 4:2:0 8-bit and the
+encoder's sink pad is `video/x-raw, format=NV12`. Those caps are read from the
+running pipeline, not from the template, so a negotiation that stopped pinning
+the format fails the mode instead of silently publishing High 4:4:4 10-bit. The floor exists because
 nginx-rtmp counts the RTMP handshake and the connect/publish commands (~3 KB): a
 publisher that connects and then sends nothing would otherwise look healthy —
 exactly the shape of the live-rig failure. The video-only mode additionally
@@ -79,10 +83,14 @@ Against `alfg/nginx-rtmp` on this box, with `vah264enc`:
 
 | mode | result | numbers |
 | --- | --- | --- |
-| `transcode-av` | PASS | 61 frames pushed, 61 video + 89 audio buffers at the muxer, 136 buffers emitted, server +596 246 B |
-| `copy-av` | PASS | 69 video + 109 audio buffers at the muxer, 90 emitted, server +281 319 B |
-| `copy-video-only` | PASS (expected stall) | 52 video buffers at the muxer, 0 emitted, server +288 B (handshake only) |
-| `transcode-video-only` | PASS | 137 frames pushed, 110 video buffers at the muxer, 133 emitted, server +1 202 044 B |
+| `transcode-av` | PASS | 61 frames pushed, 61 video + 90 audio buffers at the muxer, 138 emitted, server +608 689 B; encoder input `video/x-raw,format=NV12`; muxer video `profile=high, chroma-format=4:2:0, bit-depth-luma=8` |
+| `copy-av` | PASS | 69 video + 109 audio buffers at the muxer, 90 emitted, server +283 032 B |
+| `copy-video-only` | PASS (expected stall) | 53 video buffers at the muxer, 0 emitted, server +288 B (handshake only) |
+| `transcode-video-only` | PASS | 109 video buffers at the muxer, 132 emitted, server +1 190 073 B, no audio buffer at the muxer |
+
+The H.264 fixtures state `format=NV12` and nothing wider: an unpinned
+`videotestsrc ! x264enc` negotiates High 4:4:4 10-bit on this box, which is not
+what the encoder sends (4:2:0 8-bit) and not what any destination decodes.
 
 ### The capless audio pad
 

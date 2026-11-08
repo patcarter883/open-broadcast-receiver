@@ -89,6 +89,10 @@ auto main() -> int
     expect(has(tmpl, "stream-format=raw,rate=48000,channels=2,"
                     "codec_data=(buffer)1190"),
            "h264 rtmp declares the AAC-LC 48 kHz stereo codec_data");
+    // The encoder input is pinned: the destinations are 4:2:0 8-bit, and the
+    // encoder's own sink caps would otherwise accept 4:4:4 or 10-bit layouts.
+    expect(has(tmpl, "video/x-raw,format=NV12 ! vah264enc name=venc"),
+           "h264 rtmp encoder input is pinned to NV12 (4:2:0, 8-bit)");
     expect(parses(tmpl), "h264 rtmp transcode template parses");
   }
 
@@ -111,6 +115,8 @@ auto main() -> int
         output_template(output_proto::srt, h265, "vah265enc");
     expect(has(tmpl, "mpegtsmux alignment=7"), "srt mpegtsmux");
     expect(has(tmpl, "srtsink name=osink"), "srt sink");
+    expect(has(tmpl, "video/x-raw,format=NV12 ! vah265enc name=venc"),
+           "srt encoder input is pinned to NV12 (4:2:0, 8-bit)");
     expect(!has(tmpl, "appsrc name=asrc"), "srt transcode is video-only");
     expect(parses(tmpl), "srt transcode template parses");
   }

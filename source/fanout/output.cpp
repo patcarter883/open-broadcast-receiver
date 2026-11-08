@@ -238,6 +238,17 @@ auto output_template(output_proto proto,
   const std::string enc = encoder != nullptr ? encoder : "";
   const std::string parse = transcode_target_parser(transcode.target);
 
+  // The encoder is handed 4:2:0 8-bit and nothing else. Every destination this
+  // product serves is 4:2:0, the decode stage publishes NV12, and the two
+  // encoders' sink caps are wide (x264enc lists Y444/I422/I420_10LE, vah264enc
+  // lists the VA memory variants of the same set) -- so an unconstrained link
+  // lets negotiation pick a 4:4:4 or 10-bit layout, and the muxer then carries a
+  // High 4:4:4 10-bit stream that the destination cannot decode. The filter
+  // states the format rather than converting it: a stream that does not satisfy
+  // it fails to negotiate instead of silently changing profile. Placed after the
+  // scaler so the scaler's own output is constrained by it too.
+  constexpr std::string_view k_raw_nv12 = "video/x-raw,format=NV12 ! ";
+
   // An output size is applied to the RAW frames BEFORE the encoder, so the
   // destination receives the size it was promised rather than the ingest size.
   //
@@ -297,7 +308,7 @@ auto output_template(output_proto proto,
           // specified at build time; the feed thread starts audio before video
           // and unlinks the mux's audio pad if it has received nothing, so audio
           // can never gate the first video frame.
-          "{}! queue ! {}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
+          "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
           "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=ad "
           "queue name=aq ! aacparse "
           "! audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
@@ -306,6 +317,7 @@ auto output_template(output_proto proto,
           "! rtmp2sink name=osink async-connect=true",
           k_appsrc,
           scale,
+          k_raw_nv12,
           enc,
           parse,
           vcaps,
@@ -322,11 +334,12 @@ auto output_template(output_proto proto,
       const char* custom = transcode.target == transcode_target::av1
           ? " enable-custom-mappings=true" : "";
       return std::format(
-          "{}! queue ! {}{} name=venc ! {} config-interval=-1 "
+          "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 "
           "! mpegtsmux alignment=7{} "
           "! srtsink name=osink wait-for-connection=false",
           k_appsrc,
           scale,
+          k_raw_nv12,
           enc,
           parse,
           custom);
@@ -335,10 +348,11 @@ auto output_template(output_proto proto,
       const char* custom = transcode.target == transcode_target::av1
           ? " enable-custom-mappings=true" : "";
       return std::format(
-          "{}! queue ! {}{} name=venc ! {} config-interval=-1 "
+          "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 "
           "! mpegtsmux alignment=7{} ! ristsink name=osink",
           k_appsrc,
           scale,
+          k_raw_nv12,
           enc,
           parse,
           custom);
