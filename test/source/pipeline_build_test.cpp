@@ -165,6 +165,110 @@ auto main() -> int
            "rist transcode chain");
   }
 
+  // -------------------------------------------------------------------------
+  // Standby-enabled (ES-fed) shapes. With standby_config.enabled the stage
+  // demuxes once and publishes access units, so a copy output remuxes AUs and
+  // must contain no demuxer of its own; the disabled path must stay byte for
+  // byte what it was.
+  // -------------------------------------------------------------------------
+  {
+    const es_input_spec off {};
+    for (const output_proto proto :
+         {output_proto::rtmp, output_proto::rtmps, output_proto::srt,
+          output_proto::rist}) {
+      for (const transcode_config& cfg : {transcode_config {}, h264, h265}) {
+        const char* enc = cfg.target == transcode_target::h265 ? "vah265enc"
+            : cfg.target == transcode_target::h264                 ? "vah264enc"
+                                                                  : nullptr;
+        expect(output_template(proto, cfg, enc, off)
+                   == output_template(proto, cfg, enc),
+               "the disabled path is exactly the pre-standby template");
+      }
+    }
+
+    es_input_spec es;
+    es.enabled = true;
+    es.video_codec = codec::h264;
+    es.audio = true;
+
+    const std::string rtmp = output_template(output_proto::rtmp,
+                                             transcode_config {}, nullptr, es);
+    std::printf("es copy rtmp: %s\n", rtmp.c_str());
+    expect(!has(rtmp, "tsparse") && !has(rtmp, "tsdemux"),
+           "es copy rtmp has no demuxer of its own");
+    expect(has(rtmp, "h264parse config-interval=-1"),
+           "es copy rtmp parses the AUs with config-interval=-1");
+    expect(has(rtmp, "video/x-h264,stream-format=avc,alignment=au"),
+           "es copy rtmp asks the parser for AVC access units");
+    expect(has(rtmp, "flvmux name=mux"), "es copy rtmp keeps flvmux");
+    expect(has(rtmp, "appsrc name=asrc") && has(rtmp, "aacparse name=aparse"),
+           "es copy rtmp takes audio AUs from the audio es_ring");
+    expect(has(rtmp, "funnel name=ddrop ! fakesink sync=false async=false"),
+           "es copy rtmp keeps the drop funnel");
+    expect(parses(rtmp), "es copy rtmp template parses");
+
+    // Video-only: no audio branch at all, so flvmux never waits on it.
+    es_input_spec es_video_only = es;
+    es_video_only.audio = false;
+    const std::string rtmp_vo = output_template(output_proto::rtmp,
+                                                transcode_config {},
+                                                nullptr, es_video_only);
+    expect(!has(rtmp_vo, "appsrc name=asrc") && !has(rtmp_vo, "aacparse"),
+           "es copy rtmp video-only has no audio appsrc");
+    expect(parses(rtmp_vo), "es copy rtmp video-only template parses");
+
+    // HEVC copy on rtmp must use Enhanced FLV, like the transcode tier.
+    es_input_spec es_hevc = es;
+    es_hevc.video_codec = codec::h265;
+    const std::string rtmp_hevc = output_template(
+        output_proto::rtmp, transcode_config {}, nullptr, es_hevc);
+    expect(has(rtmp_hevc, "h265parse config-interval=-1")
+               && has(rtmp_hevc, "video/x-h265,stream-format=hvc1,alignment=au")
+               && has(rtmp_hevc, "eflvmux name=mux")
+               && !has(rtmp_hevc, " flvmux name=mux"),
+           "es copy rtmp h265 uses eflvmux and hvc1 caps");
+    expect(parses(rtmp_hevc), "es copy rtmp h265 template parses");
+
+    const std::string srt =
+        output_template(output_proto::srt, transcode_config {}, nullptr, es);
+    std::printf("es copy srt: %s\n", srt.c_str());
+    expect(!has(srt, "tsparse") && !has(srt, "tsdemux"),
+           "es copy srt has no demuxer of its own");
+    expect(has(srt, "h264parse config-interval=-1"),
+           "es copy srt parses the AUs with config-interval=-1");
+    expect(has(srt, "mpegtsmux name=mux alignment=7")
+               && has(srt, "srtsink name=osink"),
+           "es copy srt remuxes the AUs into its own TS");
+    expect(parses(srt), "es copy srt template parses");
+
+    const std::string rist =
+        output_template(output_proto::rist, transcode_config {}, nullptr, es);
+    std::printf("es copy rist: %s\n", rist.c_str());
+    expect(!has(rist, "tsparse") && !has(rist, "tsdemux"),
+           "es copy rist has no demuxer of its own");
+    expect(has(rist, "mpegtsmux name=mux alignment=7")
+               && has(rist, "ristsink name=osink"),
+           "es copy rist remuxes the AUs into its own TS");
+
+    // Transcode rtmp: video still from the frame ring, audio from the es_ring.
+    const std::string tr =
+        output_template(output_proto::rtmp, h264, "vah264enc", es);
+    std::printf("es transcode rtmp: %s\n", tr.c_str());
+    expect(!has(tr, "tsparse") && !has(tr, "tsdemux"),
+           "es transcode rtmp runs no per-output demuxer");
+    expect(has(tr, "vah264enc name=venc") && has(tr, "flvmux name=mux"),
+           "es transcode rtmp keeps the encode chain and muxer");
+    expect(has(tr, "appsrc name=asrc") && has(tr, "avdec_aac"),
+           "es transcode rtmp re-encodes the audio AUs");
+    expect(parses(tr), "es transcode rtmp template parses");
+
+    // A transcode srt/rist output is video-only either way: the ES flag must
+    // not change its string.
+    expect(output_template(output_proto::srt, h265, "vah265enc", es)
+               == output_template(output_proto::srt, h265, "vah265enc"),
+           "es transcode srt is unchanged (video-only)");
+  }
+
   // Decoder stage templates.
   {
     const std::string av1 = decoder_template(codec::av1, "av1parse", "vaav1dec");
@@ -192,6 +296,27 @@ auto main() -> int
     expect(!has(h264d, "profile="),
            "no profile is pinned where the decoder lists several");
     expect(parses(h264d), "h264 decoder template parses");
+
+    // ES input mode (standby enabled): the stage's one demux already ran, so
+    // the decode stage must not demux again.
+    const std::string esd =
+        decoder_es_template(codec::h264, "h264parse", "vah264dec");
+    std::printf("es decoder: %s\n", esd.c_str());
+    expect(!has(esd, "tsparse") && !has(esd, "tsdemux"),
+           "the es decoder template demuxes nothing");
+    expect(has(esd, "caps=video/x-h264") && has(esd, "h264parse"),
+           "the es decoder declares the AU media type and parses it");
+    expect(has(esd, "queue name=vqueue")
+               && has(esd, "video/x-raw,format=NV12")
+               && has(esd, "appsink name=dsink sync=false"),
+           "the es decoder keeps the frame-ring hand-off unchanged");
+    expect(has(esd, "block=false") && !has(esd, "block=true"),
+           "the es decode appsrc never blocks the feed thread");
+    expect(parses(esd), "es decoder template parses");
+
+    const std::string esd_av1 =
+        decoder_es_template(codec::av1, "av1parse", "av1dec");
+    expect(has(esd_av1, "caps=video/av1"), "es av1 decoder declares video/av1");
   }
 
   // Transit-buffer watchdog phases (output::wait_appsrc_drain). A connect

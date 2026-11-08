@@ -24,6 +24,10 @@
 namespace
 {
 constexpr std::size_t k_read_chunk = 32 * 1024;
+// One video access unit. Sized for the worst case (a 4K IDR at a high ingest
+// bitrate is megabytes) because es_ring::read skips an AU that does not fit its
+// destination whole.
+constexpr std::size_t k_es_au_max = 8U * 1024U * 1024U;
 constexpr std::chrono::milliseconds k_read_timeout {0};   // non-blocking feed
 constexpr GstClockTime k_pull_timeout = 5 * GST_MSECOND;  // decoded-frame poll
 constexpr guint64 k_appsrc_max_bytes = 4 * 1024 * 1024;
@@ -368,12 +372,59 @@ auto decoder_template(codec /*in_codec*/,
       branch);
 }
 
-decoder::decoder(ts_ring& ring, codec in_codec, log_fn log, fail_fn on_fail)
+auto decoder_es_template(codec in_codec,
+                         const char* source_parser,
+                         const char* decoder) -> std::string
+{
+  // Standby enabled: the stage's one demux already produced these access units,
+  // so this pipeline starts at the parser. No tsparse (there is no TS to
+  // reassemble timestamps from) and no tsdemux (the pads it would route do not
+  // exist), which also removes the funnel that existed only to absorb them.
+  //
+  // `vqueue` stays, and stays FIRST: it is the pacing queue in front of the
+  // parser/decoder, and the demux-buffer probe counts what arrives at its sink
+  // pad — on this path, the AUs fed into the branch. The appsrc caps pin the
+  // media type from the declared source codec so the parser cannot be handed
+  // something else, but the stream-format is left open: the stage may publish
+  // byte-stream or length-prefixed AUs, and the parser converts either.
+  const std::string caps = decoder_branch_caps(decoder);
+  const std::string branch = caps.empty()
+                                 ? std::string {" ! "} + decoder
+                                 : " ! " + caps + " ! " + decoder;
+  const char* media = "video/x-h264";
+  switch (in_codec) {
+    case codec::h265:
+      media = "video/x-h265";
+      break;
+    case codec::av1:
+      media = "video/av1";
+      break;
+    case codec::h264:
+    default:
+      break;
+  }
+  return std::format(
+      "appsrc name=dsrc is-live=true do-timestamp=true format=time "
+      "block=false max-bytes=4194304 caps={} "
+      "! queue name=vqueue ! {}{} ! videoconvert ! video/x-raw,format=NV12 "
+      "! appsink name=dsink sync=false max-buffers=8 drop=true",
+      media, source_parser, branch);
+}
+
+decoder::decoder(ts_ring& ring,
+                 codec in_codec,
+                 log_fn log,
+                 fail_fn on_fail,
+                 es_ring* es_video)
     : m_ring {ring}
     , m_in_codec {in_codec}
     , m_log {std::move(log)}
     , m_on_fail {std::move(on_fail)}
+    , m_es {es_video}
 {
+  if (m_es != nullptr) {
+    m_es_buf.resize(k_es_au_max);
+  }
 }
 
 decoder::~decoder()
@@ -409,6 +460,10 @@ auto decoder::stop() -> void
   if (m_consumer >= 0) {
     m_ring.remove_consumer(m_consumer);
     m_consumer = -1;
+  }
+  if (m_es_consumer >= 0 && m_es != nullptr) {
+    m_es->remove_consumer(m_es_consumer);
+    m_es_consumer = -1;
   }
 }
 
@@ -467,8 +522,9 @@ auto decoder::build_pipeline(std::string& err, const std::string& decoder_name)
     return false;
   }
 
-  const std::string tmpl =
-      decoder_template(m_in_codec, parser->c_str(), decoder_name.c_str());
+  const std::string tmpl = (m_es != nullptr)
+      ? decoder_es_template(m_in_codec, parser->c_str(), decoder_name.c_str())
+      : decoder_template(m_in_codec, parser->c_str(), decoder_name.c_str());
   // Log the elements actually chosen and the exact pipeline. Every external factor
   // has been checked (bytes, demuxer, plugins, GStreamer version, GPU, permissions)
   // and the same template succeeds outside the receiver, so the remaining question
@@ -491,23 +547,30 @@ auto decoder::build_pipeline(std::string& err, const std::string& decoder_name)
   // Link tsdemux's src pads by caps -- never by a bare `d.` request (see the
   // template comment). The queue is created by the parse and left unlinked, which
   // gst_parse_launch tolerates without error (verified on 1.28.6).
-  GstElement* demux = gst_bin_get_by_name(GST_BIN(m_pipeline), "d");
-  GstElement* vqueue = gst_bin_get_by_name(GST_BIN(m_pipeline), "vqueue");
-  GstElement* adrop = gst_bin_get_by_name(GST_BIN(m_pipeline), "adrop");
-  if (demux == nullptr || vqueue == nullptr || adrop == nullptr) {
-    err = "decode pipeline is missing d/vqueue/adrop";
-    if (demux != nullptr) { gst_object_unref(demux); }
-    if (vqueue != nullptr) { gst_object_unref(vqueue); }
-    if (adrop != nullptr) { gst_object_unref(adrop); }
-    destroy_pipeline();
-    return false;
+  //
+  // In ES mode there is no demuxer at all: the stage's single demux already
+  // happened, and the parser is linked statically in the template. Nothing here
+  // may touch `d`/`adrop`, whose absence is the point.
+  if (m_es == nullptr) {
+    GstElement* demux = gst_bin_get_by_name(GST_BIN(m_pipeline), "d");
+    GstElement* vqueue = gst_bin_get_by_name(GST_BIN(m_pipeline), "vqueue");
+    GstElement* adrop = gst_bin_get_by_name(GST_BIN(m_pipeline), "adrop");
+    if (demux == nullptr || vqueue == nullptr || adrop == nullptr) {
+      err = "decode pipeline is missing d/vqueue/adrop";
+      if (demux != nullptr) { gst_object_unref(demux); }
+      if (vqueue != nullptr) { gst_object_unref(vqueue); }
+      if (adrop != nullptr) { gst_object_unref(adrop); }
+      destroy_pipeline();
+      return false;
+    }
+    pad_targets targets {vqueue, adrop, this};
+    m_pad_targets = targets;
+    g_signal_connect(demux, "pad-added", G_CALLBACK(on_demux_pad_added),
+                     &m_pad_targets);
+    gst_object_unref(demux);
+    gst_object_unref(vqueue);
+    gst_object_unref(adrop);
   }
-  pad_targets targets {vqueue, adrop, this};
-  m_pad_targets = targets;
-  g_signal_connect(demux, "pad-added", G_CALLBACK(on_demux_pad_added), &m_pad_targets);
-  gst_object_unref(demux);
-  gst_object_unref(vqueue);
-  gst_object_unref(adrop);
 
   m_appsrc = gst_bin_get_by_name(GST_BIN(m_pipeline), "dsrc");
   m_appsink = gst_bin_get_by_name(GST_BIN(m_pipeline), "dsink");
@@ -928,7 +991,8 @@ auto decoder::check_attempt_health() -> bool
           elapsed_ms(m_attempt_feed_start_ns.load(std::memory_order_relaxed)))) {
     log_stats();
     return degrade(std::format(
-        "tsdemux produced no video in {} ms with {} KiB fed ({})",
+        "{} produced no video in {} ms with {} KiB fed ({})",
+        m_es != nullptr ? "the es input" : "tsdemux",
         elapsed_ms(m_attempt_feed_start_ns.load(std::memory_order_relaxed)).count(),
         health.fed_bytes / 1024U, state_text()));
   }
@@ -937,18 +1001,33 @@ auto decoder::check_attempt_health() -> bool
 
 auto decoder::start() -> bool
 {
-  m_consumer = m_ring.add_consumer();
-  if (m_consumer < 0) {
-    log("no ts_ring consumer slot\n");
-    m_failed.store(true, std::memory_order_relaxed);
-    return false;
+  if (m_es != nullptr) {
+    m_es_consumer = m_es->add_consumer();
+    if (m_es_consumer < 0) {
+      log("no video es_ring consumer slot\n");
+      m_failed.store(true, std::memory_order_relaxed);
+      return false;
+    }
+  } else {
+    m_consumer = m_ring.add_consumer();
+    if (m_consumer < 0) {
+      log("no ts_ring consumer slot\n");
+      m_failed.store(true, std::memory_order_relaxed);
+      return false;
+    }
   }
 
   m_chain = transcode_decoder_chain(m_in_codec, &registry_has_element);
   if (m_chain.empty()) {
     log(std::format("no decoder for source codec {}\n", to_string(m_in_codec)));
-    m_ring.remove_consumer(m_consumer);
-    m_consumer = -1;
+    if (m_consumer >= 0) {
+      m_ring.remove_consumer(m_consumer);
+      m_consumer = -1;
+    }
+    if (m_es_consumer >= 0) {
+      m_es->remove_consumer(m_es_consumer);
+      m_es_consumer = -1;
+    }
     m_failed.store(true, std::memory_order_relaxed);
     return false;
   }
@@ -976,8 +1055,14 @@ auto decoder::start() -> bool
     log(std::format("no usable decoder for source codec {}\n",
                     to_string(m_in_codec)));
     destroy_pipeline();
-    m_ring.remove_consumer(m_consumer);
-    m_consumer = -1;
+    if (m_consumer >= 0) {
+      m_ring.remove_consumer(m_consumer);
+      m_consumer = -1;
+    }
+    if (m_es_consumer >= 0) {
+      m_es->remove_consumer(m_es_consumer);
+      m_es_consumer = -1;
+    }
     m_failed.store(true, std::memory_order_relaxed);
     return false;
   }
@@ -1080,25 +1165,68 @@ auto decoder::worker() -> void
         stall_reported = false;
         log("decode appsrc draining again\n");
       }
-      for (;;) {
-        const std::size_t got = m_ring.read(
-            m_consumer, tsbuf.data(), tsbuf.size(), k_read_timeout);
-        if (got == 0) {
-          break;
+      if (m_es != nullptr) {
+        // ES input: the stage's single demux already ran, so the unit read here
+        // is a whole access unit with its own timestamps and keyframe flag.
+        // Handing it to the same appsrc means everything downstream (parser,
+        // decoder, frame ring, per-output encoders) is unchanged.
+        for (;;) {
+          es_ring::au_meta meta;
+          const std::size_t got = m_es->read(
+              m_es_consumer, meta, m_es_buf.data(), m_es_buf.size(),
+              k_read_timeout);
+          if (got == 0) {
+            break;
+          }
+          if (!announced_first_feed) {
+            log(std::format(
+                "first access unit fed to the decode stage: {} bytes, keyframe="
+                "{}\n",
+                got, meta.keyframe ? "yes" : "no"));
+            announced_first_feed = true;
+          }
+          GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
+          gst_buffer_fill(gbuf, 0, m_es_buf.data(), got);
+          // A negative value is the stage saying "unknown": the appsrc's
+          // do-timestamp then stamps from the pipeline clock, and publish_sample
+          // synthesises a monotonic timeline from whatever arrives.
+          if (meta.pts_ns >= 0) {
+            GST_BUFFER_PTS(gbuf) = static_cast<GstClockTime>(meta.pts_ns);
+          }
+          if (meta.dts_ns >= 0) {
+            GST_BUFFER_DTS(gbuf) = static_cast<GstClockTime>(meta.dts_ns);
+          }
+          if (!meta.keyframe) {
+            GST_BUFFER_FLAG_SET(gbuf, GST_BUFFER_FLAG_DELTA_UNIT);
+          }
+          if (gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf)
+              != GST_FLOW_OK) {
+            break;
+          }
+          m_in_chunks.fetch_add(1, std::memory_order_relaxed);
+          m_in_bytes.fetch_add(got, std::memory_order_relaxed);
         }
-        if (!announced_first_feed) {
-          log("first TS chunk fed to the decode stage: " + std::to_string(got)
-              + " bytes\n");
-          announced_first_feed = true;
+      } else {
+        for (;;) {
+          const std::size_t got = m_ring.read(
+              m_consumer, tsbuf.data(), tsbuf.size(), k_read_timeout);
+          if (got == 0) {
+            break;
+          }
+          if (!announced_first_feed) {
+            log("first TS chunk fed to the decode stage: " + std::to_string(got)
+                + " bytes\n");
+            announced_first_feed = true;
+          }
+          GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
+          gst_buffer_fill(gbuf, 0, tsbuf.data(), got);
+          if (gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf)
+              != GST_FLOW_OK) {
+            break;
+          }
+          m_in_chunks.fetch_add(1, std::memory_order_relaxed);
+          m_in_bytes.fetch_add(got, std::memory_order_relaxed);
         }
-        GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
-        gst_buffer_fill(gbuf, 0, tsbuf.data(), got);
-        if (gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf)
-            != GST_FLOW_OK) {
-          break;
-        }
-        m_in_chunks.fetch_add(1, std::memory_order_relaxed);
-        m_in_bytes.fetch_add(got, std::memory_order_relaxed);
       }
     }
 
