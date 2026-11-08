@@ -568,6 +568,21 @@ auto main() -> int
                        last_live_pts / 1'000'000,
                        now_aus.back().meta.pts_ns / 1'000'000));
     check_monotonic(now_aus, "starvation + slate");
+    // The slate loop is joined wherever it happens to be, so the first slate AU
+    // published after the request must be decodable on its own: the renderer
+    // pins a keyframe on every frame of the slate.
+    bool found_slate = false;
+    collected first_slate;
+    for (const auto& au : now_aus) {
+      if (au.meta.pts_ns > last_live_pts) {
+        first_slate = au;
+        found_slate = true;
+        break;
+      }
+    }
+    expect(found_slate, "a slate AU is published after the request");
+    expect(first_slate.meta.keyframe,
+           "the first slate AU presented is a keyframe, not a mid-loop one");
   }
 
   // ---- 5. rebuild under a running stage, timeline preserved --------------

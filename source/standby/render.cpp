@@ -68,16 +68,33 @@ auto element_is_present(const char* name) -> bool
 // The software encoders are pinned to their fastest preset because this runs
 // inside the control plane's /start latency budget, and quality of a static
 // slate is not what anyone is looking at.
+//
+// The slate is encoded all-intra: every frame is a keyframe. The loop replays
+// the file from its first access unit, and the switch presents the branch at
+// whatever point the loop has reached when an operator presses standby, so
+// every access unit must be independently decodable. Anything short of
+// all-intra leaves a mid-loop start showing a picture whose reference frames
+// were never sent. A still image costs almost nothing at this content, and the
+// output is a slate, not a programme.
 auto encoder_fragment(const std::string& encoder, int bitrate_kbps)
     -> std::string
 {
   if (encoder == "av1enc") {
-    return std::format("av1enc target-bitrate={} cpu-used=8", bitrate_kbps);
+    return std::format(
+        "av1enc target-bitrate={} cpu-used=8 keyframe-max-dist=1",
+        bitrate_kbps);
   }
   if (encoder == "x264enc" || encoder == "x265enc") {
-    return std::format("{} bitrate={} speed-preset=ultrafast tune=zerolatency",
-                       encoder, bitrate_kbps);
+    return std::format(
+        "{} bitrate={} speed-preset=ultrafast tune=zerolatency key-int-max=1",
+        encoder, bitrate_kbps);
   }
+  if (encoder == "vah264enc" || encoder == "vah265enc"
+      || encoder == "vaav1enc") {
+    return std::format("{} bitrate={} key-int-max=1", encoder, bitrate_kbps);
+  }
+  // An encoder without a known GOP property: the looper reports the ES as not
+  // all-intra, which is the honest state rather than a silent mid-GOP join.
   return std::format("{} bitrate={}", encoder, bitrate_kbps);
 }
 
@@ -265,8 +282,8 @@ auto slate_parse_caps(slate_codec cod) -> const char*
 auto slate_cache_key(const slate_request& req) -> std::string
 {
   const std::string identity = std::format(
-      "{}|{}|{}|{}|{}|{}|{}", req.codec, req.width, req.height, req.fps,
-      req.logo_path, req.brand_path, req.text);
+      "{}|{}|{}|{}|{}|{}|{}|all-intra", req.codec, req.width, req.height,
+      req.fps, req.logo_path, req.brand_path, req.text);
   gchar* digest = g_compute_checksum_for_string(
       G_CHECKSUM_SHA256, identity.c_str(), static_cast<gssize>(identity.size()));
   std::string key {digest != nullptr ? digest : ""};
@@ -373,7 +390,8 @@ auto plan_slate(const slate_request& req,
       "videoconvert ! video/x-raw,format=NV12 ! "
       "{} ! {} ! {} ! filesink location=\"{}\"",
       2 * req.fps, req.width, req.height, req.fps, overlays,
-      escape_pipeline_value(req.text), encoder_fragment(plan.encoder, req.bitrate_kbps),
+      escape_pipeline_value(req.text),
+      encoder_fragment(plan.encoder, req.bitrate_kbps),
       parser_props, slate_parse_caps(cod),
       escape_pipeline_value(plan.video_path));
 

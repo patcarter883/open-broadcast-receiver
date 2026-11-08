@@ -364,6 +364,27 @@ auto es_looper::start() -> bool
     return false;
   }
 
+  // The switch presents this branch at whatever access unit the loop has
+  // reached, so every one of them has to be independently decodable. Count the
+  // ones that are not, and say so once: a slate rendered by this build is
+  // all-intra, so a non-zero count means the file was produced elsewhere (or by
+  // an older cache) and a standby press can land on a picture with no
+  // references.
+  std::size_t non_keyframes = 0;
+  for (const au_span& span : m_aus) {
+    const std::uint8_t* au = m_data.data() + span.first;
+    const bool keyframe = m_codec == es_codec::av1
+        ? obu_au_is_keyframe(au, span.second)
+        : au_is_keyframe(m_codec, au, span.second);
+    non_keyframes += keyframe ? 0 : 1;
+  }
+  if (non_keyframes != 0) {
+    note(std::format(
+        "standby: slate ES '{}' is not all-intra ({} of {} access units are "
+        "not keyframes); a standby press can start the slate mid-GOP",
+        m_path, non_keyframes, m_aus.size()));
+  }
+
   m_thread = std::thread([this] { run(); });
   return true;
 }

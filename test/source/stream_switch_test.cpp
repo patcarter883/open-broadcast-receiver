@@ -29,7 +29,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
+#include <format>
+#include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +45,8 @@
 #include <utility>
 #include <vector>
 
+#include "standby/es_looper.h"
+#include "standby/render.h"
 #include "standby/stream_switch.h"
 
 namespace
@@ -484,15 +490,17 @@ auto recorder_cb(GstPad* /*pad*/, GstPadProbeInfo* info, gpointer user)
 }
 
 auto make_rig(bool wait_for_keyframe, const char* slate_caps,
-              standby::stream_switch::log_fn log, std::string& err)
+              standby::stream_switch::log_fn log, std::string& err,
+              std::shared_ptr<standby::switch_gate> gate = nullptr,
+              std::int64_t deadline_ms = 2000, bool audio = false)
     -> std::unique_ptr<rig>
 {
   const std::string desc =
       "input-selector name=sel ! fakesink sync=false "
       "appsrc name=live format=time is-live=false block=false max-bytes=8388608"
-      " ! queue ! sel.sink_0 "
+      " ! sel.sink_0 "
       "appsrc name=slate format=time is-live=false block=false max-bytes=8388608"
-      " ! queue ! sel.sink_1";
+      " ! sel.sink_1";
   GError* gerr = nullptr;
   GstElement* pipe = gst_parse_launch(desc.c_str(), &gerr);
   if (pipe == nullptr) {
@@ -524,8 +532,10 @@ auto make_rig(bool wait_for_keyframe, const char* slate_caps,
   gst_object_unref(sel);
 
   standby::switch_config cfg;
-  cfg.audio = false;
+  cfg.audio = audio;
   cfg.wait_for_keyframe = wait_for_keyframe;
+  cfg.gate = std::move(gate);
+  cfg.deadline_ms = deadline_ms;
   cfg.live_caps = k_live_caps;
   cfg.slate_caps = slate_caps;
   r->sw = std::make_unique<standby::stream_switch>(std::move(log));
@@ -750,6 +760,211 @@ auto test_caps_mismatch_after_negotiation(const std::vector<au>& aus) -> void
   expect(!second.caps_ok(), "caps_ok() false on negotiated mismatch");
   std::printf("ok: caps mismatch caught on negotiated caps\n");
 }
+
+// ---------------------------------------------------------------------------
+// 5. audio follows the video switch and its PTS; it never crosses first
+// ---------------------------------------------------------------------------
+auto test_audio_follows_video(const std::vector<au>& aus) -> void
+{
+  std::string err;
+  auto gate = std::make_shared<standby::switch_gate>();
+  std::mutex log_mutex;
+  std::vector<std::string> log;
+  auto logger = [&log, &log_mutex](const std::string& line) {
+    std::lock_guard<std::mutex> guard(log_mutex);
+    log.push_back(line);
+  };
+
+  auto video = make_rig(true, k_live_caps, logger, err, gate);
+  expect(video != nullptr && video->sw != nullptr, "video rig built: " + err);
+  auto audio = make_rig(false, k_live_caps, logger, err, gate, 2000, true);
+  expect(audio != nullptr && audio->sw != nullptr, "audio rig built: " + err);
+
+  au audio_au;
+  audio_au.bytes = {0x5A, 0x01, 0x02, 0x03};
+
+  expect(gst_element_set_state(video->pipe, GST_STATE_PLAYING)
+             != GST_STATE_CHANGE_FAILURE,
+         "video rig reaches PLAYING");
+  expect(gst_element_set_state(audio->pipe, GST_STATE_PLAYING)
+             != GST_STATE_CHANGE_FAILURE,
+         "audio rig reaches PLAYING");
+
+  expect(aus.front().key, "the fixture's first AU is a keyframe");
+
+  // Both selectors start on the slate. The audio is moved by the video's
+  // switch event, so it needs no buffer of its own to get there.
+  push_au(video->slate, aus.front(), k_slate_base, k_slate_tag);
+  std::size_t found = 0;
+  expect(video->wait_for_branch(false, 0, found),
+         "the video selector lands on the slate");
+  push_au(audio->slate, audio_au, k_slate_base, k_slate_tag);
+  expect(audio->wait_for_branch(false, 0, found),
+         "the audio selector is on the slate");
+
+  // Ask for live with no IDR on the live branch, then feed both branches.
+  video->sw->set_slate(false);
+  audio->sw->set_slate(false);
+  expect(video->sw->slate_active(), "video waits on the slate for an IDR");
+  expect(audio->sw->slate_active(),
+         "audio does not cross while the video is still on the slate");
+
+  expect(!aus[3].key, "AU 3 is mid-GOP");
+  push_au(video->live, aus[3], 1'000'000'000, k_live_tag);
+  push_au(audio->live, audio_au, 1'000'000'000, k_live_tag);
+  g_usleep(100'000);
+  expect(video->sw->slate_active(), "a mid-GOP live AU does not cross the video");
+  expect(audio->sw->slate_active(),
+         "the audio pad is still on the slate after live audio arrived");
+  expect(!audio->wait_for_branch(true, 0, found, 0),
+         "live audio is not delivered while the video waits for an IDR");
+
+  // The IDR carries the video across; the audio follows that event alone, with
+  // no audio buffer of its own in between.
+  push_au(video->live, aus.front(), 1'100'000'000, k_live_tag);
+  expect(video->wait_for_branch(true, 0, found),
+         "the video switch lands on the IDR");
+  expect(video->get(found).key, "the video switch lands on a keyframe");
+
+  bool followed = false;
+  for (int i = 0; i < 400 && !followed; ++i) {
+    followed = !audio->sw->slate_active();
+    g_usleep(500);
+  }
+  expect(followed, "the audio selector follows the video switch");
+  expect(!audio->sw->slate_active(), "the audio selector is on live");
+
+  // And the next live audio buffer is delivered from the live branch.
+  push_au(audio->live, audio_au, 1'133'333'333, k_live_tag);
+  expect(audio->wait_for_branch(true, 0, found),
+         "live audio is delivered once the video has crossed");
+  expect(audio->get(found).pts == 1'133'333'333,
+         "the delivered live audio buffer is the live branch's");
+
+  std::printf("ok: audio held on the slate until video crossed\n");
+}
+
+// ---------------------------------------------------------------------------
+// 6. the slate can be joined wherever its loop has reached
+// ---------------------------------------------------------------------------
+auto test_slate_switch_presents_keyframe() -> void
+{
+  if (gst_element_factory_find("x264enc") == nullptr) {
+    std::printf("ok: slate join test skipped (no x264enc)\n");
+    return;
+  }
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / "obr_switch_slate";
+  std::filesystem::remove_all(dir);
+
+  // The real renderer, at the smallest geometry that still runs one.
+  standby::slate_request req;
+  req.codec = "h264";
+  req.width = 160;
+  req.height = 120;
+  req.fps = 10;
+  req.bitrate_kbps = 300;
+  req.text = "standby";
+  req.out_dir = dir.string();
+  req.encoder_override = "x264enc";
+
+  std::string err;
+  const auto assets = standby::render_slate(req, err);
+  expect(assets.has_value(), "the slate renders: " + err);
+
+  std::ifstream in(assets->video_path, std::ios::binary);
+  const std::vector<std::uint8_t> data {std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+  const auto spans = standby::split_access_units(data.data(), data.size());
+  expect(spans.size() == static_cast<std::size_t>(2 * req.fps),
+         "the ES is 2*fps access units");
+
+  // This is the property the switch relies on: it moves the selector at the
+  // moment standby is pressed, wherever the loop has got to, so every AU has
+  // to be a keyframe -- not just AU 0.
+  std::size_t non_keyframes = 0;
+  for (const auto& span : spans) {
+    if (!standby::au_is_keyframe(standby::es_codec::h264,
+                                 data.data() + span.first, span.second)) {
+      ++non_keyframes;
+    }
+  }
+  expect(non_keyframes == 0,
+         std::format("every rendered slate AU is a keyframe ({} of {} are not)",
+                     non_keyframes, spans.size()));
+
+  // Join the loop five AUs past its start, as an operator pressing standby
+  // mid-loop would.
+  auto r = make_rig(true, k_live_caps, {}, err);
+  expect(r != nullptr && r->sw != nullptr, "slate join rig built: " + err);
+  expect(gst_element_set_state(r->pipe, GST_STATE_PLAYING)
+             != GST_STATE_CHANGE_FAILURE,
+         "slate join rig reaches PLAYING");
+
+  au unit;
+  unit.bytes.assign(data.data() + spans[5].first,
+                    data.data() + spans[5].first + spans[5].second);
+  expect(push_au(r->slate, unit, k_slate_base, k_slate_tag),
+         "a mid-loop slate AU is pushed");
+  std::size_t found = 0;
+  expect(r->wait_for_branch(false, 0, found), "the slate delivers");
+  expect(r->get(found).key,
+         "the first slate AU presented is a keyframe, not the mid-loop one");
+
+  std::filesystem::remove_all(dir);
+  std::printf("ok: the slate presents a keyframe from any loop position\n");
+}
+
+// ---------------------------------------------------------------------------
+// 7. a pending switch reports degraded on its deadline and still applies later
+// ---------------------------------------------------------------------------
+auto test_deadline_degrades(const std::vector<au>& aus) -> void
+{
+  std::string err;
+  std::mutex log_mutex;
+  std::vector<std::string> log;
+  auto logger = [&log, &log_mutex](const std::string& line) {
+    std::lock_guard<std::mutex> guard(log_mutex);
+    log.push_back(line);
+  };
+  auto r = make_rig(true, k_live_caps, logger, err, nullptr, 40);
+  expect(r != nullptr && r->sw != nullptr, "deadline rig built: " + err);
+  expect(gst_element_set_state(r->pipe, GST_STATE_PLAYING)
+             != GST_STATE_CHANGE_FAILURE,
+         "deadline rig reaches PLAYING");
+
+  std::size_t found = 0;
+  push_au(r->slate, aus.front(), k_slate_base, k_slate_tag);
+  expect(r->wait_for_branch(false, 0, found), "the slate is up");
+
+  r->sw->set_slate(false);
+  expect(!aus[3].key, "AU 3 is mid-GOP");
+  push_au(r->live, aus[3], 0, k_live_tag);  // never an IDR
+  g_usleep(60'000);                          // past the 40 ms deadline
+  r->sw->tick();
+
+  expect(r->sw->degraded(), "the switch reports degraded instead of pending");
+  expect(r->sw->deadline_reports() == 1,
+         "the degradation is reported once, not once per buffer");
+  expect(r->sw->slate_active(),
+         "the outputs stayed on the slate rather than flipping blind");
+  {
+    std::lock_guard<std::mutex> guard(log_mutex);
+    bool said_so = false;
+    for (const std::string& line : log) {
+      said_so = said_so || line.find("DEGRADED") != std::string::npos;
+    }
+    expect(said_so, "the log says DEGRADED");
+  }
+
+  // The pending switch was not abandoned: the IDR still carries it.
+  push_au(r->live, aus.front(), k_frame, k_live_tag);
+  expect(r->wait_for_branch(true, 0, found),
+         "the keyframe still carries the switch after the deadline");
+  expect(!r->sw->slate_active(), "the switch lands on live after the degrade");
+
+  std::printf("ok: a 40 ms deadline degraded once, then the IDR applied\n");
+}
 #endif  // OBR_HAVE_GSTREAMER
 
 }  // namespace
@@ -775,6 +990,9 @@ auto main() -> int
   test_immediate_flip(aus);
   test_caps_mismatch_refused(aus);
   test_caps_mismatch_after_negotiation(aus);
+  test_audio_follows_video(aus);
+  test_slate_switch_presents_keyframe();
+  test_deadline_degrades(aus);
 #endif  // OBR_HAVE_GSTREAMER
 
   std::puts("stream_switch_test: ALL OK");
