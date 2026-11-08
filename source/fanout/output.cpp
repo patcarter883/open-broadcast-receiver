@@ -38,10 +38,6 @@ constexpr guint64 k_appsrc_ceiling_bytes = 64 * 1024 * 1024;
 // How long the transit buffer may stay pinned at its limit before the sink is
 // treated as stalled and the attempt is rebuilt.
 constexpr auto k_stall_timeout = std::chrono::seconds(5);
-// How long after the first video frame a silent audio branch may stay linked to
-// the muxer. flvmux emits nothing while its audio pad has no data, so this is
-// the window the output spends unable to publish at all.
-constexpr auto k_audio_probe_delay = std::chrono::milliseconds(500);
 // Period of the transcode feed's accounting line.
 constexpr auto k_feed_stats_period = std::chrono::seconds(2);
 
@@ -315,20 +311,22 @@ auto output_template(output_proto proto,
       // ts_ring AAC copy path so RTMP audio passthrough is unchanged. h265
       // uses the Enhanced FLV muxer (eflvmux) — legacy flvmux cannot carry
       // H.265.
+      //
+      // Audio is declared, never discovered: the source is AAC-LC 48 kHz
+      // stereo, so the branch states that and carries the matching
+      // AudioSpecificConfig (0x11 0x90: AOT 2, 48 kHz, 2 channels) as
+      // codec_data, which is what FLV requires and what flvmux otherwise
+      // waits for. The branch ENDS at `acaps` in this template: the muxer's
+      // audio pad is requested only from demux_pad_added(), i.e. only when the
+      // source TS actually exposes an audio pad. A video-only ingest therefore
+      // never hands flvmux an audio pad to wait on, and video publishes on the
+      // first encoded frame with no timeout involved.
       return std::format(
-          // Audio is declared, never discovered: the source is AAC-LC 48 kHz
-          // stereo, so the branch states that and carries the matching
-          // AudioSpecificConfig (0x11 0x90: AOT 2, 48 kHz, 2 channels) as
-          // codec_data, which is what FLV requires and what flvmux otherwise
-          // waits for. The audio pad is only present because the branch is fully
-          // specified at build time; the feed thread starts audio before video
-          // and unlinks the mux's audio pad if it has received nothing, so audio
-          // can never gate the first video frame.
           "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
           "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=ad "
-          "queue name=aq ! aacparse "
-          "! audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
-          "codec_data=(buffer)1190 ! mux. "
+          "queue name=aq ! aacparse ! capsfilter name=acaps "
+          "caps=audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
+          "codec_data=(buffer)1190 "
           "{} name=mux streamable=true "
           // The transcode sink does not sync to the pipeline clock. Its input is
           // a live drop-oldest ring: pacing the encoder by the output clock
@@ -610,40 +608,6 @@ auto output::build_pipeline(std::string& err) -> bool
           gst_object_unref(demux);
         }
       }
-      // Count what the muxer's audio pad receives. flvmux emits nothing until
-      // that pad carries data, and caps alone do not prove it ever will.
-      GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
-      if (mux != nullptr) {
-        GstIterator* it = gst_element_iterate_sink_pads(mux);
-        GValue item = G_VALUE_INIT;
-        bool done = false;
-        while (!done) {
-          switch (gst_iterator_next(it, &item)) {
-            case GST_ITERATOR_OK: {
-              auto* pad = GST_PAD(g_value_get_object(&item));
-              const char* pname = GST_PAD_NAME(pad);
-              if (pname != nullptr && g_str_has_prefix(pname, "audio") == TRUE) {
-                gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
-                                  &count_buffer_probe, &m_audio_frames,
-                                  nullptr);
-                done = true;
-              }
-              g_value_reset(&item);
-              break;
-            }
-            case GST_ITERATOR_RESYNC:
-              gst_iterator_resync(it);
-              break;
-            case GST_ITERATOR_ERROR:
-            case GST_ITERATOR_DONE:
-              done = true;
-              break;
-          }
-        }
-        g_value_unset(&item);
-        gst_iterator_free(it);
-        gst_object_unref(mux);
-      }
       // Where the feed's frames go after the appsrc: buffers arriving at the
       // encoder and buffers the muxer emits. A pinned appsrc with a low encoder
       // input count is the encoder, a high input count with a low output count
@@ -699,44 +663,18 @@ auto output::demux_pad_added(GstElement* demux,
     if (demux_name == nullptr || g_strcmp0(demux_name, "ad") != 0) {
       return;
     }
-    GstElement* adrop = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "adrop");
-    if (adrop == nullptr) {
-      return;
-    }
-    GstPad* sink = gst_element_request_pad_simple(adrop, "sink_%u");
-    if (sink != nullptr) {
-      if (!gst_pad_is_linked(sink)) {
-        const GstPadLinkReturn lr = gst_pad_link(pad, sink);
-        if (lr != GST_PAD_LINK_OK) {
-          out->log(std::format("non-audio pad from the audio branch could not "
-                               "be sunk ({}); output runs video-only\n",
-                               gst_pad_link_get_name(lr)));
-        }
-      }
-      gst_object_unref(sink);
-    }
-    gst_object_unref(adrop);
+    out->sink_into_drop(pad);
     return;
   }
 
-  // Transcode path: route the audio pad to the declared audio branch. Its caps
-  // are fixed in the template, so nothing here reads the demuxer's caps.
-  GstElement* aq = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "aq");
-  if (aq != nullptr) {
-    GstPad* sink = gst_element_get_static_pad(aq, "sink");
-    if (sink != nullptr) {
-      if (!gst_pad_is_linked(sink)) {
-        const GstPadLinkReturn lr = gst_pad_link(pad, sink);
-        if (lr != GST_PAD_LINK_OK) {
-          out->m_audio_dropped.store(true, std::memory_order_relaxed);
-          out->log(std::format("audio pad link failed ({}); output runs "
-                               "video-only\n",
-                               gst_pad_link_get_name(lr)));
-        }
-      }
-      gst_object_unref(sink);
-    }
-    gst_object_unref(aq);
+  // Transcode path: route the audio pad into the declared audio branch, and
+  // attach that branch to the muxer only now that the TS has proven it carries
+  // audio. A second audio pad has nowhere to go; it is sunk like the demux's
+  // non-audio pads so its absence from the mux cannot stall the pipeline.
+  if (GstElement* acaps = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "acaps");
+      acaps != nullptr) {
+    gst_object_unref(acaps);
+    out->attach_audio_branch(pad);
     return;
   }
 
@@ -974,7 +912,7 @@ auto output::run_once() -> bool
   }
 
   m_run_started = std::chrono::steady_clock::now();
-  m_audio_probe_done = false;
+  m_audio_linked.store(false, std::memory_order_relaxed);
   m_first_video_push = std::chrono::steady_clock::time_point {};
   m_first_output_logged.store(false);
   m_feed = feed_stats {};
@@ -1001,23 +939,31 @@ auto output::run_once() -> bool
           GError* gerr = nullptr;
           gchar* dbg = nullptr;
           gst_message_parse_error(msg, &gerr, &dbg);
-          // The debug string (dbg) can carry URIs/element internals — it is
-          // parsed but deliberately never logged; only gerr->message is, and
-          // it is redacted below as a belt-and-suspenders guard (F4).
           const std::string text = redact_secret(
               (gerr != nullptr && gerr->message != nullptr) ? gerr->message
                                                             : "unknown",
               m_cfg.key_or_streamid);
-          terminal = is_codec_terminal(
-              gerr, GST_ELEMENT(GST_MESSAGE_SRC(msg)));
-          set_last_error(terminal ? "rtmp_codec_unsupported" : text);
           // The element name is ours (venc/mux/h264parse/...), so naming it is
           // safe and it is the only way to tell a negotiation failure in the
-          // encoder chain from the sink's transport error.
+          // encoder chain from the sink's transport error. The GError domain,
+          // code and debug string are logged too: "Internal data stream error."
+          // is the same text for a negotiation failure, a not-negotiated flow
+          // return and a broken pad link, so the message alone cannot be acted
+          // on. Both the message and the debug string go through the same
+          // redaction as last_error.
           GstObject* src_obj = GST_MESSAGE_SRC(msg);
           const char* who = (src_obj != nullptr && GST_OBJECT_NAME(src_obj))
               ? GST_OBJECT_NAME(src_obj) : "?";
-          log(std::format("bus error from {}: {}\n", who, text));
+          const char* domain = (gerr != nullptr && gerr->domain != 0)
+              ? g_quark_to_string(gerr->domain) : "none";
+          const int code = gerr != nullptr ? gerr->code : 0;
+          const std::string debug = redact_secret(
+              dbg != nullptr ? dbg : "", m_cfg.key_or_streamid);
+          terminal = is_codec_terminal(gerr, GST_ELEMENT(src_obj));
+          set_last_error(terminal ? "rtmp_codec_unsupported" : text);
+          log(std::format("bus error from {}: domain={} code={} ({}) debug={}\n",
+                          who, domain != nullptr ? domain : "none", code, text,
+                          debug.empty() ? "-" : debug));
           if (gerr != nullptr) {
             g_error_free(gerr);
           }
@@ -1080,72 +1026,110 @@ auto output::run_once() -> bool
   return true;  // stopping
 }
 
-// flvmux emits nothing until its audio pad carries data, so a linked-but-silent
-// audio branch holds the sink in PAUSED with no error anywhere. Once a video
-// frame has been pushed and that pad has still received nothing for
-// k_audio_probe_delay, the branch is retired with unlink + EOS. Called from the
-// feed loop and again from the backpressure wait: a muxer that is not
-// collecting is what backs the appsrc up, and the feed loop is blocked there.
-auto output::retire_empty_audio_pad() -> void
+// flvmux emits nothing until its audio pad carries data, so an audio pad it was
+// given but never receives data on holds the sink in PAUSED with no error
+// anywhere. The muxer's audio pad is therefore requested HERE, from the demux's
+// audio pad-added signal: the presence of that pad is the TS saying it carries
+// an audio stream. A video-only ingest never gets this far and flvmux runs
+// with a video pad alone, so nothing time-based decides whether video publishes.
+auto output::attach_audio_branch(GstPad* demux_pad) -> void
 {
-  if (!m_audio_probe_done && m_audio_appsrc != nullptr
-      && m_first_video_push != std::chrono::steady_clock::time_point {}
-      && std::chrono::steady_clock::now() - m_first_video_push
-          > k_audio_probe_delay)
-  {
-    m_audio_probe_done = true;
-    GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
-    if (mux != nullptr) {
-      // Judge by the MUXER's pad and by what it has RECEIVED: caps without
-      // buffers is the state in which flvmux waits forever, and that state looks
-      // healthy from every other angle.
-      GstIterator* it = gst_element_iterate_sink_pads(mux);
-      GValue item = G_VALUE_INIT;
-      bool done = false;
-      while (!done) {
-        switch (gst_iterator_next(it, &item)) {
-          case GST_ITERATOR_OK: {
-            auto* candidate = GST_PAD(g_value_get_object(&item));
-            const char* pname = GST_PAD_NAME(candidate);
-            if (pname != nullptr && g_str_has_prefix(pname, "audio") == TRUE) {
-              done = true;
-              if (gst_pad_get_current_caps(candidate) == nullptr
-                  || m_audio_frames.load(std::memory_order_relaxed) == 0)
-              {
-                GstPad* peer = gst_pad_get_peer(candidate);
-                if (peer != nullptr) {
-                  gst_pad_unlink(peer, candidate);
-                  gst_object_unref(peer);
-                }
-                // Unlinking alone leaves flvmux's request pad in its collect
-                // aggregate; without caps it never completes negotiation and
-                // the muxer stays silent. EOS retires the pad.
-                const bool retired =
-                    gst_pad_send_event(candidate, gst_event_new_eos()) == TRUE;
-                m_audio_dropped.store(true, std::memory_order_relaxed);
-                log(std::format("audio pad received no buffers; dropped it so "
-                                "video publishes (eos={})\n",
-                                retired ? "sent" : "refused"));
-              }
-              break;
-            }
-            g_value_reset(&item);
-            break;
-          }
-          case GST_ITERATOR_RESYNC:
-            gst_iterator_resync(it);
-            break;
-          case GST_ITERATOR_ERROR:
-          case GST_ITERATOR_DONE:
-            done = true;
-            break;
-        }
-      }
-      g_value_unset(&item);
-      gst_iterator_free(it);
-      gst_object_unref(mux);
+  if (m_audio_linked.exchange(true)) {
+    // One muxer audio pad per output; a second audio ES has nowhere to go.
+    sink_into_drop(demux_pad);
+    log("second audio pad from the source TS; the output keeps the first\n");
+    return;
+  }
+
+  GstElement* aq = gst_bin_get_by_name(GST_BIN(m_pipeline), "aq");
+  GstElement* acaps = gst_bin_get_by_name(GST_BIN(m_pipeline), "acaps");
+  GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
+  if (aq == nullptr || acaps == nullptr || mux == nullptr) {
+    if (aq != nullptr) { gst_object_unref(aq); }
+    if (acaps != nullptr) { gst_object_unref(acaps); }
+    if (mux != nullptr) { gst_object_unref(mux); }
+    m_audio_dropped.store(true, std::memory_order_relaxed);
+    return;
+  }
+
+  GstPad* aq_sink = gst_element_get_static_pad(aq, "sink");
+  const GstPadLinkReturn lr = (aq_sink != nullptr && !gst_pad_is_linked(aq_sink))
+      ? gst_pad_link(demux_pad, aq_sink)
+      : GST_PAD_LINK_REFUSED;
+  if (aq_sink != nullptr) {
+    gst_object_unref(aq_sink);
+  }
+  if (lr != GST_PAD_LINK_OK) {
+    log(std::format("audio pad link into the AAC branch failed ({}); output "
+                    "runs video-only\n",
+                    gst_pad_link_get_name(lr)));
+    m_audio_dropped.store(true, std::memory_order_relaxed);
+    sink_into_drop(demux_pad);
+    gst_object_unref(aq);
+    gst_object_unref(acaps);
+    gst_object_unref(mux);
+    return;
+  }
+
+  GstPad* caps_src = gst_element_get_static_pad(acaps, "src");
+  // flvmux/eflvmux expose the audio pad template as the literal name "audio",
+  // not "audio_%u"; request that first and only fall back to a numbered
+  // template.
+  GstPad* mux_audio = gst_element_request_pad_simple(mux, "audio");
+  if (mux_audio == nullptr) {
+    mux_audio = gst_element_request_pad_simple(mux, "audio_%u");
+  }
+  bool linked = false;
+  if (caps_src != nullptr && mux_audio != nullptr) {
+    gst_pad_add_probe(mux_audio, GST_PAD_PROBE_TYPE_BUFFER, &count_buffer_probe,
+                      &m_audio_frames, nullptr);
+    linked = gst_pad_link(caps_src, mux_audio) == GST_PAD_LINK_OK;
+    if (!linked) {
+      // A requested-but-unlinked audio pad is exactly the state that stalls
+      // flvmux, so it is handed back rather than left on the muxer.
+      gst_element_release_request_pad(mux, mux_audio);
     }
   }
+  if (!linked) {
+    log("AAC branch could not be attached to the muxer; output runs "
+        "video-only\n");
+    m_audio_dropped.store(true, std::memory_order_relaxed);
+  } else {
+    log("source TS carries audio; muxer audio pad linked\n");
+  }
+  if (caps_src != nullptr) {
+    gst_object_unref(caps_src);
+  }
+  if (mux_audio != nullptr) {
+    gst_object_unref(mux_audio);
+  }
+  gst_object_unref(aq);
+  gst_object_unref(acaps);
+  gst_object_unref(mux);
+}
+
+// A demux src pad with nowhere to go fails the pipeline with "streaming
+// stopped, reason=not-linked", so pads the output does not consume are sunk
+// into the drop funnel.
+auto output::sink_into_drop(GstPad* pad) -> void
+{
+  GstElement* adrop = gst_bin_get_by_name(GST_BIN(m_pipeline), "adrop");
+  if (adrop == nullptr) {
+    return;
+  }
+  GstPad* sink = gst_element_request_pad_simple(adrop, "sink_%u");
+  if (sink != nullptr) {
+    if (!gst_pad_is_linked(sink)) {
+      const GstPadLinkReturn lr = gst_pad_link(pad, sink);
+      if (lr != GST_PAD_LINK_OK) {
+        log(std::format("pad {} could not be sunk ({}); it stays unlinked\n",
+                        GST_PAD_NAME(pad) != nullptr ? GST_PAD_NAME(pad) : "?",
+                        gst_pad_link_get_name(lr)));
+      }
+    }
+    gst_object_unref(sink);
+  }
+  gst_object_unref(adrop);
 }
 
 // Transcode feed: encoded VIDEO comes from the shared decode frame ring; AAC
@@ -1154,8 +1138,6 @@ auto output::retire_empty_audio_pad() -> void
 // caller should stop the attempt (appsrc gone).
 auto output::feed_transcode(bool& video_caps_set) -> bool
 {
-  retire_empty_audio_pad();
-
   const guint64 cap = gst_app_src_get_max_bytes(GST_APP_SRC(m_appsrc));
   const guint64 level =
       gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc));
@@ -1184,11 +1166,9 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
     }
   }
 
-  // Audio first: the branch is pre-linked, so the earliest audio buffer is what
-  // keeps the muxer's audio pad from being the thing video waits on. Audio that
-  // is absent or unparsable is handled by retire_empty_audio_pad(), which
-  // unlinks the pad rather than letting flvmux hold the output in PAUSED
-  // forever.
+  // Audio first: the TS is what proves an audio stream exists, so the demux's
+  // audio pad is seen (and the muxer's audio pad requested) as early as
+  // possible. A source with no audio simply never links one.
   if (m_audio_appsrc != nullptr) {
     std::vector<uint8_t> abuf(k_read_chunk);
     for (;;) {
@@ -1292,13 +1272,6 @@ auto output::wait_appsrc_drain(guint64 cap) -> bool
       log("sink stalled with a full appsrc; rebuilding the output\n");
       return false;
     }
-    // The usual reason nothing is leaving the appsrc is a muxer waiting on an
-    // audio pad that never fills; that check has to run here too.
-    lock.unlock();
-    retire_empty_audio_pad();
-    lock.lock();
-    // Timed so stop() and a dead sink are still observed; the appsrc probe
-    // wakes this immediately on the normal path.
     m_feed_cv.wait_for(lock, std::chrono::milliseconds(50));
   }
   return !m_stopping.load(std::memory_order_acquire);

@@ -146,9 +146,13 @@ private:
   auto log_muxer_input() -> void;
   // Transcode feed accounting: one line every k_feed_stats_period.
   auto report_feed() -> void;
-  // Retires the muxer's audio pad with unlink + EOS once it has carried no
-  // buffers for k_audio_probe_delay after the first video frame.
-  auto retire_empty_audio_pad() -> void;
+  // Links the source TS's audio pad into the AAC branch and requests the
+  // muxer's audio pad for it. Called from demux_pad_added(), i.e. only when the
+  // TS actually carries an audio stream.
+  auto attach_audio_branch(GstPad* demux_pad) -> void;
+  // Sinks a demux src pad the output does not consume into the drop funnel, so
+  // it cannot fail the pipeline with not-linked.
+  auto sink_into_drop(GstPad* pad) -> void;
   // Blocks until the video appsrc is below `cap`, bounded by k_stall_timeout.
   // Returns false when the attempt should end (stopping or a stalled sink).
   auto wait_appsrc_drain(guint64 cap) -> bool;
@@ -187,10 +191,12 @@ private:
   std::atomic<run_state> m_state {run_state::starting};
   std::atomic<uint64_t> m_reconnects {0};
   std::chrono::steady_clock::time_point m_run_started {};
-  bool m_audio_probe_done {false};
+  // Set once the muxer's audio pad has been requested for the source TS's
+  // audio stream; guards against a second audio ES taking a second pad.
+  std::atomic_bool m_audio_linked {false};
   std::atomic_bool m_first_output_logged {false};
-  // When the first decoded frame reached the video appsrc; the audio-pad
-  // deadline is measured from here, not from the attempt's start.
+  // When the first decoded frame reached the video appsrc; the "first published
+  // frame" latency line is measured from here, not from the attempt's start.
   std::chrono::steady_clock::time_point m_first_video_push {};
   bool m_muxer_input_logged {false};
   std::atomic<uint64_t> m_bytes_sent {0};
