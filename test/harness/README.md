@@ -118,3 +118,82 @@ and only then reports the pad dropped.
 - The harness publishes. Run it only against a sink you started for it; the
   script removes its own container by name on exit and touches nothing else.
 - Ports are overridable: `RTMP_PORT=21935 STAT_PORT=28080 ...`.
+
+## Whole-binary e2e: RIST in, RTMP out
+
+    test/harness/receiver_e2e_local.sh
+
+`rtmp_publish_harness` drives `output` directly with synthetic ring contents.
+This harness instead runs the **shipped binary, unmodified, from its own control
+API**: a real AV1-in-MPEG-TS fixture goes over real RIST (`rist_feed`,
+ADVANCED/SOURCE) into `--rist-port`, `POST /start` configures one transcode
+output, and `/stats` is sampled once a second while the RTMP server's own
+counters are read from MediaMTX's `/v3/paths/list`.
+
+Nothing leaves the machine, and nothing needs the capture box.
+
+### The fixture is checked before anything else runs
+
+`test/tools/make-av1-ts-fixture.sh` muxes it with the encoder's exact settings
+(`mpegtsmux alignment=7 enable-custom-mappings=true`, `av1parse` pinned to
+`obu-stream,alignment=frame`). The harness then prints, and gates on:
+
+- the PMT actually present in the file — `stream_type=0x06` with the `AV1G`
+  registration descriptor and the `0x80` av1C record;
+- `filesrc ! tsparse ! tsdemux` exposing a **`video/x-av1`** pad.
+
+`ffprobe` is printed too, but it reports `codec_name=bin_data` for this
+fixture: FFmpeg's MPEG-TS demuxer has no mapping for AV1 in a private
+(0x06/AV1G) stream, so it *cannot* be the validity gate. A fixture that is
+genuinely bin_data+AAC fails the PMT and tsdemux checks above, which is what
+makes those two the real gate — the earlier, invalid `test_av1.ts` would have
+failed them.
+
+### Why the sink is not on 127.0.0.1
+
+The receiver's egress policy refuses loopback unconditionally (`classify()` in
+`source/lib/lib.cpp` returns `"loopback"` for 127.0.0.0/8 even with
+`--egress-allow-private`). The harness therefore points at the box's own first
+global IPv4 (`SINK_HOST=` to override) — still on this machine, still no
+network — and runs MediaMTX bound to that address.
+
+### PASS rule
+
+All three, from data the receiver does not produce:
+
+1. the decoder's staged counters show `decoded>0` and `state=PLAYING`;
+2. the RTMP server's `bytesReceived` for the path grows by ≥ 32 KiB;
+3. 3 s of the published stream are pulled **back out** of the RTMP server with
+   `ffmpeg -c copy` and probe as H.264 video with frames in it.
+
+`bytes_sent` is printed but never trusted: for a transcode output it counts the
+NV12 frames pushed into the video `appsrc` (≈230 MB for 10 s of 720p), so it
+grows healthily even when nothing reaches RTMP.
+
+On failure the verdict names the first stage that stopped — RIST ingest, TS
+ring, decode appsrc, tsdemux, decoder, or the output — with the counters that
+prove it.
+
+### Current results (this box, RX 9070, vaav1dec + vah264enc)
+
+| fixture | decode | frames dropped | sink growth | pulled back |
+| --- | --- | --- | --- | --- |
+| 1280x720, 300 frames | 298/298, `vaav1dec`, PLAYING | 135–136 (~45 %) | +1.09–1.11 MB | H.264 1280x720, 40 frames / 3 s |
+| 640x360, 300 frames | 297/297, `vaav1dec`, PLAYING | 0 | +2.33 MB | H.264 640x360, 91 frames / 3 s |
+
+Both run twice, exit 0 both times. Publishing starts ~6 s after the first TS
+chunk: the first 4 s are the audio-pad probe, which is what retires the
+capless audio pad and lets `flvmux` emit. A feed shorter than ~6 s therefore
+loses the race and looks like a stall.
+
+### Known finding: 720p transcodes run at ~13 fps
+
+At 1280x720 the frame ring drops ~45 % of decoded frames and the published
+stream is ~13 fps (40 frames in 3 s, irregular PTS gaps), while the same run at
+640x360 drops nothing and publishes a clean 30 fps. `vah264enc` alone does
+284 fps at 720p on this box, so the encoder element is not the limit. The
+shape of the numbers matches `feed_transcode()`'s byte-based throttle: the
+video `appsrc` is capped at `k_appsrc_max_bytes = 4 MB`, a 720p NV12 frame is
+1.38 MB (so ~2.9 frames fit), and each iteration that finds the level at or
+over the cap sleeps 20 ms and then reads only one frame. Not fixed here — the
+harness records it.
