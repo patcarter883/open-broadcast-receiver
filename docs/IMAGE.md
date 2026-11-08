@@ -127,8 +127,17 @@ Verify the push actually landed in the registry (not just in the local daemon):
 ```sh
 docker buildx imagetools inspect \
   ghcr.io/patcarter883/open-broadcast-receiver:$(git rev-parse --short HEAD)
-# or, without a login:
-docker manifest inspect ghcr.io/patcarter883/open-broadcast-receiver:latest
+```
+
+The GHCR package is **private**, so every form of inspection and pull needs the
+host login above; an unauthenticated `docker manifest inspect` returns
+`unauthorized`, not a manifest.
+
+`make image-push` always tags `:latest` as well, which repoints what a session
+pulls. To publish a probe or throwaway tag without touching `:latest`:
+
+```sh
+make image-push TAG=probe-$(date +%Y%m%d) LATEST=0
 ```
 
 Equivalent direct invocation:
