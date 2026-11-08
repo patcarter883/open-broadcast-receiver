@@ -37,7 +37,7 @@ FROM ${BASE_IMAGE}
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav libgstreamer1.0-0 curl ca-certificates tini \
-    libva2 libva-drm2 mesa-va-drivers \
+    libva2 libva-drm2 mesa-va-drivers fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 10001 -m obr
 # Address-family policy: a name that answers both families must rank IPv4 first
@@ -51,6 +51,11 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
 RUN printf '%s\n' '# IPv4 first: this image runs on nodes without an IPv6 route.' \
                   'precedence ::ffff:0:0/96 100' > /etc/gai.conf
 COPY --from=build /src/build/open-broadcast-receiver /usr/local/bin/
+# The slate's wordmark. fonts-dejavu-core above is REQUIRED, not cosmetic:
+# textoverlay renders nothing without a font, so the slate's caption would be
+# invisible in an image that installed none. The placeholder lives in
+# docker/standby/ (see its README); --standby-assets points here.
+COPY docker/standby/logo.png /usr/local/share/open-broadcast/standby-logo.png
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 USER 10001:10001

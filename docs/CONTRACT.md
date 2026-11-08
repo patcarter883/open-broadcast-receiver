@@ -92,8 +92,8 @@ FLV; a non-AAC audio ES degrades rtmp outputs to video-only (§4 validation) rat
 
 Idempotent on an identical body (returns 200 describing the running session). A second `/start` with a
 **differing** body or a different `session_id` while running returns **409 `already_running`**. The operator CLI
-values (`--rist-port` and the recovery flags) are applied over the body **before** the idempotency comparison, so
-idempotency is judged on the effective config.
+values (`--rist-port`, the recovery flags and the standby flags) are applied over the body **before** the
+idempotency comparison, so idempotency is judged on the effective config.
 
 ### Request body
 ```json
@@ -155,6 +155,24 @@ absent or not yet arriving, so a destination connection is never starved into a 
 
 The object is part of the **wire config**: it participates in `/start` idempotency, so re-posting the same body is a
 no-op and changing only the slate is a **different** body (⇒ **409 `already_running`** while a session runs).
+
+#### Standby operator overrides
+
+The container's operator can override the body's standby block from the command line (the node agent reaches these
+through `OBR_STANDBY` / `OBR_STANDBY_BRAND`). They are applied to the effective config **before** the idempotency
+comparison, exactly like `--rist-port`:
+
+| Flag | Effect |
+|------|--------|
+| `--standby-slate` | force the slate **on** regardless of the body's `standby.enabled` (including a v4 body, which otherwise forces it off) |
+| `--no-standby` | force the slate **off** — the operator kill switch, whatever the body says |
+| `--standby-brand <path>` | replace the body's `standby.brand_image` (absolute path inside the container) |
+| `--standby-assets <dir>` | directory holding the shipped wordmark `standby-logo.png`; default `/usr/local/share/open-broadcast` |
+
+`--no-standby` and `--standby-slate` are mutually exclusive in intent; if both are given the last one on the
+command line wins. A missing `standby-logo.png` or `--standby-brand` file costs the slate that overlay (logged
+once), never the render. The entrypoint maps `OBR_STANDBY=0`/`false` to `--no-standby` and anything else (or absent) to
+`--standby-slate`.
 
 `outputs[]`:
 | Field | Type | Required | Notes |
@@ -352,15 +370,15 @@ Poll for health/state, decoupled from RIST. Recommended encoder poll interval **
 - `audio_frames` counts the buffers the muxer's audio pad has received. `audio_dropped: false` with `audio_frames: 0`
   is an audio branch that is linked but has published nothing yet; `audio_dropped: true` means the output is running
   video-only, either because the source carries no AAC or because the branch was retired at runtime.
-- **`standby` object (documented ahead of implementation — the receiver does not emit it yet).** `GET /status` will
-  carry a top-level `standby` object once the standby source lands, with these members so a panel can show why a
+- **`standby` object.** `GET /status` carries a top-level `standby` object so a panel can show why a
   slate is or is not on air: `{ "enabled": true, "mode": "live|slate|switching", "switches": 3,
-  "last_live_ms_ago": 812, "caps_ok": true, "stage_rebuilds": 0, "degraded": false }` —
+  "last_live_ms_ago": 812, "caps_ok": true, "stage_rebuilds": 0, "degraded": "" }` —
   `mode` is the source currently feeding the fan-out, `switches` a monotonic count of live⇄slate transitions,
   `last_live_ms_ago` the age of the last live payload, `caps_ok` whether the slate output negotiated its declared
-  caps, `stage_rebuilds` how many times the slate stage had to be rebuilt, and `degraded` whether the slate is
-  running below its requested geometry/bitrate. Nothing in this document depends on its presence yet; `enabled`
-  echoes the `standby.enabled` the running session was started with.
+  caps, `stage_rebuilds` how many times the slate stage had to be rebuilt, and `degraded` is a **string**:
+  the reason the slate is running below its request (`"geometry defaulted"`, a render error, `"stage failed to
+  start"`) or the **empty string** when it is healthy — it is **not** a boolean, and `enabled` echoes the
+  `standby.enabled` the running session was started with (after the operator overrides below).
 - Session `state` ∈ `"running"`, `"stopped"`, `"error"`. It stays `running` while **any** output runs or the
   session is intact with zero outputs; **per-output failure is never session-fatal**. `error` is reserved for
   session-level failures (`idle_timeout`, listener death), reported with `last_bus_error` until the next `/start`.

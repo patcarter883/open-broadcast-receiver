@@ -75,6 +75,13 @@ auto print_usage(const char* argv0) -> void
       << "  --allow-enhanced-rtmp   permit an h265 transcode target on rtmp/\n"
       << "                          rtmps (Enhanced FLV via eflvmux; platform\n"
       << "                          eRTMP-HEVC support varies)\n"
+      << "  --standby-slate         force the standby slate ON regardless of the\n"
+      << "                          /start body's standby block\n"
+      << "  --no-standby            force the slate OFF (operator kill switch);\n"
+      << "                          wins over the body and OBR_STANDBY\n"
+      << "  --standby-brand <path>  override the body's standby.brand_image\n"
+      << "  --standby-assets <dir>  directory holding the shipped slate logo\n"
+      << "                          (default /usr/local/share/open-broadcast)\n"
       << "  --buffer-min <ms>       RIST recovery buffer floor (default 1000)\n"
       << "  --buffer-max <ms>       RIST recovery buffer ceiling (default 5000)\n"
       << "  --rtt-min <ms>          RIST recovery RTT min (default 40)\n"
@@ -203,6 +210,13 @@ auto main(int argc, char** argv) -> int
   int rtt_max = receiver_defaults::rtt_max_ms;
   int reorder_buffer = receiver_defaults::reorder_buffer_ms;
   int session_timeout = receiver_defaults::session_timeout_ms;
+  // Standby overrides (plan B3). -1 = leave the /start body's standby.enabled
+  // alone; 0 = force off (--no-standby, the operator kill switch); 1 = force on
+  // (--standby-slate). Applied over the body in do_start, before the
+  // idempotency comparison, like --rist-port.
+  int standby_force = -1;
+  std::string standby_brand;  // empty = use the body's standby.brand_image
+  std::string standby_assets = "/usr/local/share/open-broadcast";
 
   for (int idx = 1; idx < argc; ++idx) {
     const std::string_view arg = argv[idx];
@@ -293,6 +307,18 @@ auto main(int argc, char** argv) -> int
       egress.allow_private = true;
     } else if (arg == "--allow-enhanced-rtmp") {
       opts.allow_enhanced_rtmp = true;
+    } else if (arg == "--standby-slate") {
+      standby_force = 1;
+    } else if (arg == "--no-standby") {
+      standby_force = 0;
+    } else if (arg == "--standby-brand") {
+      if (!next_str(standby_brand)) {
+        return 2;
+      }
+    } else if (arg == "--standby-assets") {
+      if (!next_str(standby_assets)) {
+        return 2;
+      }
     } else if (arg == "--buffer-min") {
       if (!next(buffer_min)) {
         return 2;
@@ -407,9 +433,17 @@ auto main(int argc, char** argv) -> int
     sess.standby_degraded.clear();
   };
 
+  // Warn once per process about slate art that was asked for but is not on
+  // disk. The render still proceeds: a missing logo/brand costs the slate that
+  // overlay, never the render (and never a log line per session).
+  bool logo_warned = false;
+  bool brand_warned = false;
+
   const auto do_start = [&ctx, &lifecycle, &sess, &teardown, &egress, &opts,
-                         rist_port, buffer_min, buffer_max, rtt_min, rtt_max,
-                         reorder_buffer, session_timeout](receiver_config& cfg,
+                         &logo_warned, &brand_warned, rist_port, buffer_min,
+                         buffer_max, rtt_min, rtt_max, reorder_buffer,
+                         session_timeout, standby_force, standby_brand,
+                         standby_assets](receiver_config& cfg,
                                          std::string& err_code,
                                          std::string& err_field,
                                          std::string& err_msg,
@@ -427,6 +461,19 @@ auto main(int argc, char** argv) -> int
     cfg.ingest.rtt_max = rtt_max;
     cfg.ingest.reorder_buffer = reorder_buffer;
     cfg.ingest.session_timeout = session_timeout;
+
+    // Standby overrides (plan B3) are operator-authoritative too, and applied
+    // here for the same reason: idempotency must compare the effective config,
+    // so re-posting an identical body with the same flags stays a 200 no-op and
+    // a flag change is a genuinely different session. --no-standby wins over
+    // --standby-slate when both are given only by appearing later; keep the
+    // entrypoint's mapping to one of them.
+    if (standby_force >= 0) {
+      cfg.standby.enabled = standby_force != 0;
+    }
+    if (!standby_brand.empty()) {
+      cfg.standby.brand_image = standby_brand;
+    }
 
     if (ctx.state.is_running.load(std::memory_order_acquire)) {
       std::string current_session;
@@ -558,13 +605,30 @@ auto main(int argc, char** argv) -> int
       }
       // The shipped mark is optional: the image may not be installed on a
       // minimal host, and a missing file must cost the slate its logo, never
-      // the render.
+      // the render. The renderer is handed the path only when it exists; the
+      // absence is logged once so a typo in --standby-assets is visible.
       {
-        constexpr std::string_view k_logo =
-            "/usr/share/open-broadcast/logo.png";
         std::error_code ec;
-        if (std::filesystem::is_regular_file(k_logo, ec)) {
-          req.logo_path = std::string {k_logo};
+        const auto logo =
+            std::filesystem::path(standby_assets) / "standby-logo.png";
+        if (std::filesystem::is_regular_file(logo, ec)) {
+          req.logo_path = logo.string();
+        } else if (!logo_warned) {
+          logo_warned = true;
+          stderr_log("standby: no logo at " + logo.string()
+                     + "; the slate renders without the mark\n");
+        }
+      }
+      // Same contract for the per-account brand image: render_slate drops the
+      // overlay when the file is absent (render.h), and the caller says so.
+      if (!req.brand_path.empty()) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(req.brand_path, ec)
+            && !brand_warned)
+        {
+          brand_warned = true;
+          stderr_log("standby: brand image " + req.brand_path
+                     + " is not readable; the slate renders without it\n");
         }
       }
 
