@@ -144,3 +144,47 @@ fixture, not the decoder.
 
 `decode_file` feeds the fixture through a real `ts_ring` in 1316-byte RIST
 datagrams and prints the stage's own counters; `frames=` is the measurement.
+
+---
+
+## 7. Decoder selection: hardware first, software as the safety net
+
+The decode stage does not commit to one decoder. `transcode_decoder_alternatives()`
+(`lib.cpp`) lists, per source codec, the hardware decoder first and the software
+decoder for the same codec second — `{vaav1dec, av1dec}`,
+`{vah265dec, avdec_h265}`, `{vah264dec, avdec_h264}` — and `transcode_decoder_chain()`
+keeps the entries the registry actually has, in that order.
+
+`decoder` builds the **first** chain entry. That attempt is retired, and the next
+entry built in its place, when either happens:
+
+- the attempt posts a bus **error** (which is what a decoder whose sink caps the
+  stream cannot satisfy reports — `av1parse` carries the `not-negotiated (-4)`
+  upstream), or
+- the attempt produces **no decoded frame within 3 s** of its own start while TS
+  bytes have been fed to it — the bound for a decoder that wedges without saying
+  anything, leaving the pipeline in `ASYNC`.
+
+The failure is logged once, naming the element and GStreamer's own debug string,
+before the rebuild. The camera-side requirement is unchanged: hardware decode is
+the preference, and the software decoder exists only for a driver/element
+combination that advertises a profile it cannot negotiate (VAAPI on RDNA4
+advertises `VAProfileAV1Profile0` while `vaav1dec`'s sink caps are
+`profile=main` only, so any non-main AV1 stream is refused outright).
+
+The periodic decode line carries the decision, so an operator can tell the two
+apart without reading startup logs:
+
+```
+in=800 chunks/2524 KiB demux=172 decoded=118 sink=118 level=0 KiB dec=vaav1dec fallback=0 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
+in=469 chunks/2282 KiB demux=113 decoded=86  sink=86  level=0 KiB dec=av1dec    fallback=1 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
+```
+
+`dec=` is the decoder element in use; `fallback=1` means it is not the
+hardware-preferred first entry. `decoded=` is the decoder output buffer count.
+
+`decode_fallback_test` (ctest) asserts the chain for av1, generates a
+`profile=high` 4:4:4 fixture that `vaav1dec` refuses and checks that frames still
+flow on `av1dec`, checks the 4:2:0 stream stays on the hardware decoder, drives a
+forced first-attempt failure, and checks that an undecodable stream exhausts the
+chain instead of retrying forever.

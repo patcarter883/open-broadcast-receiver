@@ -3,6 +3,7 @@
 
 #include "fanout/decoder.h"
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <string>
@@ -29,6 +30,12 @@ constexpr auto k_stats_period = std::chrono::seconds(2);
 // Decoded frames published per feed iteration; the appsink drops beyond its
 // own queue, so draining it fully keeps the frame ring current.
 constexpr int k_publish_burst = 8;
+// How long an attempt may run without emitting a single decoded frame before it
+// is retired and the next decoder in the chain is built. A working decoder
+// emits inside the first second; this window only has to be longer than a slow
+// preroll, and it is the bound that turns a silently wedged hardware decoder
+// (pipeline parked in ASYNC, no bus error) into a fallback instead of a stall.
+constexpr auto k_attempt_window = std::chrono::seconds(3);
 
 auto now_steady() -> std::chrono::steady_clock::time_point
 {
@@ -247,26 +254,25 @@ auto decoder::destroy_pipeline() -> void
   }
 }
 
-auto decoder::build_pipeline(std::string& err) -> bool
+auto decoder::build_pipeline(std::string& err, const std::string& decoder_name)
+    -> bool
 {
   const auto parser = choose_present(
       transcode_source_parser_alternatives(m_in_codec), &registry_has_element);
-  const auto decode = choose_present(
-      transcode_decoder_alternatives(m_in_codec), &registry_has_element);
-  if (!parser || !decode) {
-    err = std::format("no decoder for source codec {}",
+  if (!parser) {
+    err = std::format("no parser for source codec {}",
                       to_string(m_in_codec));
     return false;
   }
 
   const std::string tmpl =
-      decoder_template(m_in_codec, parser->c_str(), decode->c_str());
+      decoder_template(m_in_codec, parser->c_str(), decoder_name.c_str());
   // Log the elements actually chosen and the exact pipeline. Every external factor
   // has been checked (bytes, demuxer, plugins, GStreamer version, GPU, permissions)
   // and the same template succeeds outside the receiver, so the remaining question
   // is what THIS process builds and what it selects at runtime.
   fprintf(stderr, "[decoder] source codec=%s parser=%s decoder=%s\n",
-          to_string(m_in_codec), parser->c_str(), decode->c_str());
+          to_string(m_in_codec), parser->c_str(), decoder_name.c_str());
   fprintf(stderr, "[decoder] pipeline: %s\n", tmpl.c_str());
   GError* gerr = nullptr;
   m_pipeline = gst_parse_launch(tmpl.c_str(), &gerr);
@@ -309,7 +315,7 @@ auto decoder::build_pipeline(std::string& err) -> bool
     return false;
   }
   gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), k_appsrc_max_bytes);
-  attach_probes(decode->c_str());
+  attach_probes(decoder_name.c_str());
   m_bus = gst_element_get_bus(m_pipeline);
   return true;
 }
@@ -355,23 +361,173 @@ auto decoder::log_stats() -> void
   GstState state = GST_STATE_VOID_PENDING;
   GstState pending = GST_STATE_VOID_PENDING;
   const GstStateChangeReturn scr =
-      gst_element_get_state(m_pipeline, &state, &pending, 0);
+      m_pipeline != nullptr ? gst_element_get_state(m_pipeline, &state, &pending, 0)
+                            : GST_STATE_CHANGE_FAILURE;
   const guint64 level = m_appsrc != nullptr
       ? gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc))
       : 0;
   log(std::format(
-      "in={} chunks/{} KiB demux={} dec={} sink={} level={} KiB "
-      "state={} ({}) pending={} stalled={}\n",
+      "in={} chunks/{} KiB demux={} decoded={} sink={} level={} KiB "
+      "dec={} fallback={} state={} ({}) pending={} stalled={}\n",
       m_in_chunks.load(std::memory_order_relaxed),
       m_in_bytes.load(std::memory_order_relaxed) / 1024U,
       m_demux_buffers.load(std::memory_order_relaxed),
       m_decoder_buffers.load(std::memory_order_relaxed),
       m_sink_buffers.load(std::memory_order_relaxed),
       level / 1024U,
+      decoder_element().empty() ? "none" : decoder_element().c_str(),
+      m_using_fallback.load(std::memory_order_relaxed) ? 1 : 0,
       gst_element_state_get_name(state),
       gst_element_state_change_return_get_name(scr),
       gst_element_state_get_name(pending),
       m_stall_since == std::chrono::steady_clock::time_point {} ? 0 : 1));
+}
+
+auto decoder::start_attempt(std::size_t index, std::string& err) -> bool
+{
+  m_attempt = index;
+  {
+    const std::scoped_lock lock {m_name_mutex};
+    m_decoder_name = m_chain[index];
+  }
+  m_using_fallback.store(index > 0, std::memory_order_relaxed);
+
+  if (!build_pipeline(err, m_decoder_name)) {
+    destroy_pipeline();
+    return false;
+  }
+  if (gst_element_set_state(m_pipeline, GST_STATE_PLAYING)
+      == GST_STATE_CHANGE_FAILURE) {
+    err = "pipeline refused PLAYING";
+    destroy_pipeline();
+    return false;
+  }
+
+  // Report what the pipeline reached and whether the demux exposed anything: a
+  // bare "Internal data stream error" says nothing about which of the two
+  // failed, and this is cheap. ASYNC is expected here -- preroll completes in
+  // the background and the no-frame window is what bounds it.
+  GstState st = GST_STATE_VOID_PENDING;
+  GstState pending = GST_STATE_VOID_PENDING;
+  const GstStateChangeReturn scr =
+      gst_element_get_state(m_pipeline, &st, &pending, GST_SECOND);
+  log(std::format("{} attempt decoder={} state={} ({}) pending={}\n",
+                  index == 0 ? "primary" : "fallback", m_decoder_name,
+                  gst_element_state_get_name(st),
+                  gst_element_state_change_return_get_name(scr),
+                  gst_element_state_get_name(pending)));
+
+  m_attempt_start = now_steady();
+  m_attempt_base_decoder = m_decoder_buffers.load(std::memory_order_relaxed);
+  m_stall_since = std::chrono::steady_clock::time_point {};
+  return true;
+}
+
+auto decoder::degrade(const std::string& reason) -> bool
+{
+  const std::string failed_name = m_decoder_name;
+
+  // Tear down first: the log line that follows describes an attempt that no
+  // longer exists, and the stage counters are reset so the next stats line is
+  // about the new attempt rather than the dead one.
+  destroy_pipeline();
+  m_demux_buffers.store(0, std::memory_order_relaxed);
+  m_decoder_buffers.store(0, std::memory_order_relaxed);
+  m_sink_buffers.store(0, std::memory_order_relaxed);
+  m_stall_since = std::chrono::steady_clock::time_point {};
+
+  if (m_attempt + 1 >= m_chain.size()) {
+    log(std::format(
+        "decoder {} failed: {}; no decoder left for {} -- transcode outputs "
+        "stop here\n",
+        failed_name, reason, to_string(m_in_codec)));
+    m_failed.store(true, std::memory_order_relaxed);
+    return false;
+  }
+
+  log(std::format(
+      "decoder {} failed: {}; rebuilding with {} (software fallback)\n",
+      failed_name, reason, m_chain[m_attempt + 1]));
+
+  while (m_attempt + 1 < m_chain.size()) {
+    std::string err;
+    if (start_attempt(m_attempt + 1, err)) {
+      log(std::format("fallback decoder {} is running ({} failed)\n",
+                      m_decoder_name, failed_name));
+      return true;
+    }
+    log(std::format("fallback decoder {} could not be built: {}\n",
+                    m_chain[m_attempt + 1], err));
+  }
+
+  log(std::format("no decoder left for {} -- transcode outputs stop here\n",
+                  to_string(m_in_codec)));
+  m_failed.store(true, std::memory_order_relaxed);
+  return false;
+}
+
+auto decoder::check_attempt_health() -> bool
+{
+  if (m_simulate_failure && m_attempt == 0) {
+    // Test hook: the same retire-and-rebuild path a real failure takes.
+    m_simulate_failure = false;
+    return degrade("simulated decoder failure (test hook)");
+  }
+
+  if (m_bus != nullptr) {
+    GstMessage* msg = gst_bus_pop_filtered(m_bus, GST_MESSAGE_ERROR);
+    if (msg != nullptr) {
+      GError* gerr = nullptr;
+      gchar* dbg = nullptr;
+      gst_message_parse_error(msg, &gerr, &dbg);
+      // Name the element and keep GStreamer's own debug string: the generic
+      // "Internal data stream error" only says SOMETHING failed to negotiate,
+      // `dbg` carries which element and the flow error (not-negotiated (-4)).
+      GstObject* src = GST_MESSAGE_SRC(msg);
+      const std::string who =
+          (src != nullptr && GST_OBJECT_NAME(src) != nullptr)
+          ? GST_OBJECT_NAME(src)
+          : "?";
+      std::string text =
+          (gerr != nullptr && gerr->message != nullptr) ? gerr->message
+                                                        : "unknown";
+      if (dbg != nullptr) {
+        std::string detail {dbg};
+        std::replace(detail.begin(), detail.end(), '\n', ' ');
+        if (detail.size() > 400) {
+          detail.resize(400);
+          detail += "...";
+        }
+        text += " -- " + detail;
+      }
+      if (gerr != nullptr) {
+        g_error_free(gerr);
+      }
+      g_free(dbg);
+      gst_message_unref(msg);  // before degrade: it frees the pipeline
+      return degrade(who + " posted " + text);
+    }
+  }
+
+  // No bus error. A decoder that emitted nothing inside the window is just as
+  // dead: av1parse on this box posts NOT_NEGOTIATED while the pipeline is still
+  // prerolling, so the error can arrive after -- or not at all -- and this
+  // window is what still makes the stage recover.
+  if (m_pipeline != nullptr && m_in_chunks.load(std::memory_order_relaxed) > 0
+      && m_attempt_start != std::chrono::steady_clock::time_point {}
+      && now_steady() - m_attempt_start >= k_attempt_window
+      && m_decoder_buffers.load(std::memory_order_relaxed)
+             == m_attempt_base_decoder) {
+    GstState st = GST_STATE_VOID_PENDING;
+    GstState pending = GST_STATE_VOID_PENDING;
+    gst_element_get_state(m_pipeline, &st, &pending, 0);
+    log_stats();
+    return degrade(std::format("no decoded frame in {} s (state={}, pending={})",
+                               k_attempt_window.count(),
+                               gst_element_state_get_name(st),
+                               gst_element_state_get_name(pending)));
+  }
+  return false;
 }
 
 auto decoder::start() -> bool
@@ -383,19 +539,37 @@ auto decoder::start() -> bool
     return false;
   }
 
-  std::string err;
-  if (!build_pipeline(err)) {
-    log("pipeline build failed: " + err + "\n");
+  m_chain = transcode_decoder_chain(m_in_codec, &registry_has_element);
+  if (m_chain.empty()) {
+    log(std::format("no decoder for source codec {}\n", to_string(m_in_codec)));
     m_ring.remove_consumer(m_consumer);
     m_consumer = -1;
     m_failed.store(true, std::memory_order_relaxed);
     return false;
   }
 
-  if (gst_element_set_state(m_pipeline, GST_STATE_PLAYING)
-      == GST_STATE_CHANGE_FAILURE)
-  {
-    log("pipeline refused PLAYING\n");
+  m_in_chunks.store(0, std::memory_order_relaxed);
+  m_in_bytes.store(0, std::memory_order_relaxed);
+  m_demux_buffers.store(0, std::memory_order_relaxed);
+  m_decoder_buffers.store(0, std::memory_order_relaxed);
+  m_sink_buffers.store(0, std::memory_order_relaxed);
+  m_stall_since = std::chrono::steady_clock::time_point {};
+
+  // The hardware decoder is the preference; it is also disposable. Building all
+  // of them up front would mean nothing here -- one tsdemux cannot feed two
+  // decoders -- so only the first attempt is built, and the rest are built on
+  // demand by degrade() from the feeder thread.
+  bool launched = false;
+  for (std::size_t idx = 0; idx < m_chain.size() && !launched; ++idx) {
+    std::string err;
+    launched = start_attempt(idx, err);
+    if (!launched) {
+      log(std::format("decoder {} could not be built: {}\n", m_chain[idx], err));
+    }
+  }
+  if (!launched) {
+    log(std::format("no usable decoder for source codec {}\n",
+                    to_string(m_in_codec)));
     destroy_pipeline();
     m_ring.remove_consumer(m_consumer);
     m_consumer = -1;
@@ -403,37 +577,7 @@ auto decoder::start() -> bool
     return false;
   }
 
-  // Report what the pipeline actually reached and whether the demux exposed
-  // anything: a bare "Internal data stream error" says nothing about which of the
-  // two failed, and this is cheap.
-  GstState st = GST_STATE_VOID_PENDING;
-  GstState pending = GST_STATE_VOID_PENDING;
-  const GstStateChangeReturn scr =
-      gst_element_get_state(m_pipeline, &st, &pending, GST_SECOND);
-  GstElement* d = gst_bin_get_by_name(GST_BIN(m_pipeline), "d");
-  int src_pads = 0;
-  if (d != nullptr) {
-    GstIterator* it = gst_element_iterate_src_pads(d);
-    GValue item = G_VALUE_INIT;
-    while (gst_iterator_next(it, &item) == GST_ITERATOR_OK) {
-      src_pads++;
-      g_value_reset(&item);
-    }
-    g_value_unset(&item);
-    gst_iterator_free(it);
-    gst_object_unref(d);
-  }
-  log(std::format("pipeline state={} ({}) demux src pads={}\n",
-                  static_cast<int>(st),
-                  gst_element_state_change_return_get_name(scr), src_pads));
-
   m_stopping.store(false, std::memory_order_release);
-  m_in_chunks.store(0, std::memory_order_relaxed);
-  m_in_bytes.store(0, std::memory_order_relaxed);
-  m_demux_buffers.store(0, std::memory_order_relaxed);
-  m_decoder_buffers.store(0, std::memory_order_relaxed);
-  m_sink_buffers.store(0, std::memory_order_relaxed);
-  m_stall_since = std::chrono::steady_clock::time_point {};
   m_thread = std::thread([this]() -> void { worker(); });
   log("decode stage running\n");
   return true;
@@ -476,56 +620,30 @@ auto decoder::publish_sample(GstSample* sample) -> void
 auto decoder::worker() -> void
 {
   std::vector<std::uint8_t> tsbuf(k_read_chunk);
-  bool announced_failure = false;
   bool announced_first_feed = false;
   bool stall_reported = false;
   auto last_stats = now_steady();
 
   while (!m_stopping.load(std::memory_order_acquire)) {
-    // 1) bus: surface a decoder error once, then keep draining the ring so a
-    //    transient error does not wedge the stage; copy outputs are unaffected.
-    while (m_bus != nullptr) {
-      GstMessage* msg =
-          gst_bus_pop_filtered(m_bus, GST_MESSAGE_ERROR);
-      if (msg == nullptr) {
-        break;
-      }
-      GError* gerr = nullptr;
-      gchar* dbg = nullptr;
-      gst_message_parse_error(msg, &gerr, &dbg);
-      if (!announced_failure) {
-        // Name the element and keep GStreamer's own debug string. The generic
-        // "Internal data stream error" only says SOMETHING failed to negotiate;
-        // `dbg` carries which element and why, and it was being read and thrown
-        // away -- which is why this stage could fail with no usable evidence.
-        GstObject* src = GST_MESSAGE_SRC(msg);
-        const std::string who =
-            (src != nullptr && GST_OBJECT_NAME(src) != nullptr)
-            ? GST_OBJECT_NAME(src)
-            : "?";
-        const std::string text =
-            (gerr != nullptr && gerr->message != nullptr) ? gerr->message
-                                                          : "unknown";
-        log("decode error from " + who + ": " + text
-            + (dbg != nullptr ? (" -- " + std::string {dbg}) : std::string {})
-            + "\n");
-        announced_failure = true;
-      }
-      m_failed.store(true, std::memory_order_relaxed);
-      if (gerr != nullptr) {
-        g_error_free(gerr);
-      }
-      g_free(dbg);
-      gst_message_unref(msg);
+    // 1) health: a posted error, or an attempt that produced no frame inside the
+    //    window, is retired here and the next decoder is built. The pipeline
+    //    this loop feeds is replaced underneath it; everything below reads the
+    //    current attempt's elements, so the loop never holds a stale pointer.
+    if (check_attempt_health()) {
+      last_stats = now_steady();
+      continue;
     }
 
     // 2) feed: ts_ring -> dsrc. The appsrc is block=false, so a full queue means
     //    the decode chain has stopped consuming: hold the ring cursor instead of
     //    pushing (draining on would hand tsdemux a stream with holes in it) and
     //    keep this loop alive so the bus, the pull and the report still run.
-    const guint64 level =
-        gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc));
-    if (level >= k_appsrc_max_bytes) {
+    if (m_appsrc == nullptr) {
+      // Every attempt failed: keep the stage alive so stop() is prompt and the
+      // periodic line keeps reporting that nothing is decoding.
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } else if (gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc))
+               >= k_appsrc_max_bytes) {
       const auto now = now_steady();
       if (m_stall_since == std::chrono::steady_clock::time_point {}) {
         m_stall_since = now;
@@ -566,14 +684,16 @@ auto decoder::worker() -> void
     }
 
     // 3) publish decoded frames (bounded burst keeps the loop responsive).
-    for (int pulled = 0; pulled < k_publish_burst; ++pulled) {
-      GstSample* sample = gst_app_sink_try_pull_sample(
-          GST_APP_SINK(m_appsink), pulled == 0 ? k_pull_timeout : 0);
-      if (sample == nullptr) {
-        break;
+    if (m_appsink != nullptr) {
+      for (int pulled = 0; pulled < k_publish_burst; ++pulled) {
+        GstSample* sample = gst_app_sink_try_pull_sample(
+            GST_APP_SINK(m_appsink), pulled == 0 ? k_pull_timeout : 0);
+        if (sample == nullptr) {
+          break;
+        }
+        publish_sample(sample);
+        gst_sample_unref(sample);
       }
-      publish_sample(sample);
-      gst_sample_unref(sample);
     }
 
     const auto now = now_steady();

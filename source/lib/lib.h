@@ -459,7 +459,17 @@ auto first_missing_requirement(const std::vector<element_requirement>& reqs,
 // ---------------------------------------------------------------------------
 
 // Decoder for the arriving elementary stream, keyed by the source codec.
+// Ordered hardware first, software last; the decode stage walks this list
+// attempt by attempt rather than committing to its first entry.
 auto transcode_decoder_alternatives(codec in_codec) -> std::vector<std::string>;
+
+// The usable subset of transcode_decoder_alternatives(), in the same order:
+// every decoder the registry has, hardware first. The decode stage builds from
+// this list and degrades to the next entry when an attempt produces no frames,
+// so a hardware decoder the driver advertises but the element cannot negotiate
+// (VAAPI on RDNA4 refuses some AV1 streams) costs one attempt, not the stage.
+auto transcode_decoder_chain(codec in_codec, const element_present_fn& present)
+    -> std::vector<std::string>;
 
 // Elementary-stream parser ahead of the decoder, keyed by the source codec.
 auto transcode_source_parser_alternatives(codec in_codec)

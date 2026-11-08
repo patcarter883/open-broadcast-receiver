@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,6 +31,11 @@
 //
 // A decoder failure is contained: the feeder logs and stops producing, the
 // session and copy outputs are unaffected, and transcode outputs simply idle.
+// Which decoder: hardware first (the driver is asked to hold on the GPU), with
+// the software decoder for the same codec as the last resort. An attempt that
+// posts an error or produces no frame inside k_attempt_window is torn down and
+// the next entry in the chain is built, so a hardware decoder that advertises a
+// profile it cannot negotiate costs one attempt instead of the whole stage.
 // Where each tsdemux src pad goes. Both destinations exist in the bin from
 // build_pipeline(): tsdemux returns GST_FLOW_NOT_LINKED while it has no linked
 // src pad, and the live ingest exposes its AUDIO pad before its video pad, so
@@ -57,8 +63,8 @@ public:
   auto operator=(decoder&&) -> decoder& = delete;
 
   // Attach a ts_ring cursor, build the decode pipeline and launch the feeder
-  // thread. Returns false if no ring slot is free or the pipeline cannot be
-  // built; the session still runs (copy outputs are independent).
+  // thread. Returns false if no ring slot is free or no attempt could be built;
+  // the session still runs (copy outputs are independent).
   auto start() -> bool;
 
   // Stop the feeder, destroy the pipeline, close the frame_ring (waking every
@@ -74,15 +80,44 @@ public:
     return m_failed.load(std::memory_order_relaxed);
   }
 
+  // The decoder element of the attempt currently (or last) running. Copied
+  // under the name lock: the feeder thread replaces it when it degrades.
+  [[nodiscard]] auto decoder_element() const -> std::string
+  {
+    const std::scoped_lock lock {m_name_mutex};
+    return m_decoder_name;
+  }
+
+  // True while the running attempt is not the hardware-preferred first entry.
+  [[nodiscard]] auto using_fallback() const noexcept -> bool
+  {
+    return m_using_fallback.load(std::memory_order_relaxed);
+  }
+
+  // Test hook: retire the first attempt as if its decoder had failed, without
+  // waiting for a real driver fault. The rebuild path taken is the same one a
+  // NOT_NEGOTIATED or a silent no-frame decoder takes.
+  auto simulate_first_attempt_failure() -> void { m_simulate_failure = true; }
+
 private:
   auto worker() -> void;
-  auto build_pipeline(std::string& err) -> bool;
+  auto build_pipeline(std::string& err, const std::string& decoder_name) -> bool;
   auto destroy_pipeline() -> void;
   auto publish_sample(GstSample* sample) -> void;
+  // Build, launch and time one attempt from m_chain. On false nothing is left
+  // running and the next attempt may be tried.
+  auto start_attempt(std::size_t index, std::string& err) -> bool;
+  // Retire the running attempt with `reason`, then try every remaining decoder
+  // in m_chain in order. Returns false when the chain is exhausted, having
+  // marked the stage failed.
+  auto degrade(const std::string& reason) -> bool;
+  // Bus ERROR / no-frame timeout for the running attempt; promotes to the next
+  // decoder when one remains. Returns true when the pipeline was replaced.
+  auto check_attempt_health() -> bool;
   // Attach the buffer-count probes: demux output, decoder output, appsink input.
   auto attach_probes(const char* decoder_name) -> void;
-  // One compact line per k_stats_period with the stage counters and the state the
-  // pipeline actually reached.
+  // One compact line per k_stats_period with the stage counters, the decoder in
+  // use and the state the pipeline actually reached.
   auto log_stats() -> void;
   auto log(const std::string& msg) const -> void;
 
@@ -99,6 +134,20 @@ private:
   std::thread m_thread;
   std::atomic_bool m_stopping {false};
   std::atomic_bool m_failed {false};
+  std::atomic_bool m_using_fallback {false};
+
+  // Decoders the registry has for m_in_codec, hardware first; m_attempt indexes
+  // it. The name is kept as a string, not a pointer, because the attempt is torn
+  // down and rebuilt between attempts.
+  std::vector<std::string> m_chain;
+  std::size_t m_attempt = 0;
+  std::string m_decoder_name;
+  mutable std::mutex m_name_mutex;  // guards m_decoder_name for the accessor
+  std::chrono::steady_clock::time_point m_attempt_start {};
+  // Decoder-output count when the attempt started: a decoder that produced
+  // nothing since then is what the no-frame window measures.
+  std::uint64_t m_attempt_base_decoder = 0;
+  bool m_simulate_failure = false;
 
   // Decode-stage counters, read only by the periodic line: TS chunks pushed into
   // the demux appsrc, buffers out of tsdemux, buffers out of the decoder, and

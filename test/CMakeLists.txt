@@ -49,6 +49,19 @@ if(NOT OBR_TESTS_ONLY)
   target_compile_features(pipeline_build_test PRIVATE cxx_std_20)
   add_test(NAME pipeline_build_test COMMAND pipeline_build_test)
 
+  # decode_fallback_test exercises decoder selection with real pipelines: it
+  # generates AV1 fixtures in-process, forces a hardware refusal (4:4:4 against
+  # vaav1dec's profile=main caps) and asserts the stage degrades to av1dec with
+  # frames still flowing.
+  add_executable(decode_fallback_test source/decode_fallback_test.cpp)
+  target_link_libraries(decode_fallback_test PRIVATE
+    fanout_lib
+    PkgConfig::gstreamer
+    PkgConfig::gstreamer-app
+    Threads::Threads)
+  target_compile_features(decode_fallback_test PRIVATE cxx_std_20)
+  add_test(NAME decode_fallback_test COMMAND decode_fallback_test)
+
   # decode_file drives the receiver's real decode stage from a local MPEG-TS
   # fixture. It needs a working VA (or software) decoder and a fixture, so it is
   # a manual tool, not a ctest entry:

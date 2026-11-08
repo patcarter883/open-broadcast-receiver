@@ -549,13 +549,26 @@ auto transcode_decoder_alternatives(codec in_codec) -> std::vector<std::string>
 {
   switch (in_codec) {
     case codec::av1:
-      return {"vaav1dec", "av1dec", "dav1ddec"};
+      return {"vaav1dec", "av1dec"};
     case codec::h265:
       return {"vah265dec", "avdec_h265"};
     case codec::h264:
       return {"vah264dec", "avdec_h264"};
   }
   return {};
+}
+
+auto transcode_decoder_chain(codec in_codec,
+                             const element_present_fn& present)
+    -> std::vector<std::string>
+{
+  std::vector<std::string> chain;
+  for (const std::string& name : transcode_decoder_alternatives(in_codec)) {
+    if (present(name.c_str())) {
+      chain.push_back(name);
+    }
+  }
+  return chain;
 }
 
 auto transcode_source_parser_alternatives(codec in_codec)
