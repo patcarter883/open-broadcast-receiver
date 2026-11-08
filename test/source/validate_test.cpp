@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <format>
 #include <utility>
 #include <cstdlib>
 #include <ranges>
@@ -63,6 +64,10 @@ auto test_structural() -> void
     cfg.schema_version = 1;
     const auto res = validate_config(cfg);
     expect(!res.ok && res.error_code == "invalid_schema", "v1 body rejected");
+    expect(res.message
+               == std::format("unsupported schema_version (expected {})",
+                              k_schema_version),
+           "the rejection names the schema_version this build accepts");
   }
   {
     receiver_config cfg = make_cfg();

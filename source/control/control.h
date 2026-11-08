@@ -21,7 +21,7 @@
 // GET /status and the agent-facing GET /stats are built from the snapshot
 // callback (atomics only — never pipeline locks).
 
-// Parse + schema-check a POST /start body (schema_version 3). On success
+// Parse + schema-check a POST /start body (schema_version 4). On success
 // fills `cfg` and returns true. On failure returns false and fills the
 // CONTRACT error code/field/message (the HTTP handler maps these onto a 400
 // body). Exposed so the parser is unit-testable without a live server.

@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <string>
 
 #include "control/control.h"
@@ -139,7 +140,8 @@ auto test_parse() -> void
     expect(field == "outputs[0].transcode.codec", "names the codec field");
   }
 
-  // A non-3 schema_version body is still an invalid_schema error.
+  // A body at any other schema_version is an invalid_schema error that names
+  // the version this build speaks.
   {
     receiver_config cfg;
     std::string code;
@@ -152,6 +154,10 @@ auto test_parse() -> void
            "v2 body rejected");
     expect(code == "invalid_schema" && field == "schema_version",
            "v2 -> invalid_schema schema_version");
+    expect(msg
+               == std::format("unsupported schema_version (expected {})",
+                              k_schema_version),
+           "the rejection names the schema_version this build accepts");
   }
 
   // Malformed JSON => invalid_schema.

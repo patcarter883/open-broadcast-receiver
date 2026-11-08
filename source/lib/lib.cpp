@@ -861,7 +861,8 @@ auto validate_config(receiver_config& cfg) -> validation_result
   if (cfg.schema_version != k_schema_version) {
     return fail("invalid_schema",
                 "schema_version",
-                "unsupported schema_version (expected 3)");
+                std::format("unsupported schema_version (expected {})",
+                            k_schema_version));
   }
 
   if (const auto res = validate_ingest(cfg.ingest); !res.ok) {
