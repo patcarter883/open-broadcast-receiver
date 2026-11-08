@@ -230,6 +230,12 @@ private:
   std::chrono::steady_clock::time_point m_stall_since {};
 
   GstElement* m_pipeline = nullptr;
+  // Guards m_pipeline across threads: stop() runs on the control thread while
+  // the feeder thread retires an attempt, and pipeline() hands out a reference
+  // so a caller can use the pipeline after the lock is released.
+  mutable std::mutex m_pipe_mutex;
+
+  [[nodiscard]] auto pipeline() const -> GstElement*;
   GstElement* m_appsrc = nullptr;  // ref held via gst_bin_get_by_name
   GstElement* m_appsink = nullptr;
   // The running decoder's sink template caps, and the caps the parser produced

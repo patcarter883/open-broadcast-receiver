@@ -422,6 +422,9 @@ struct output_stat
   uint64_t bytes_sent = 0;
   uint64_t dropped_bytes = 0;
   bool audio_dropped = false;
+  // Buffers the muxer's audio pad received; 0 with audio_dropped=false is an
+  // audio branch that is linked but has published nothing yet.
+  uint64_t audio_frames = 0;
   std::string last_error;  // empty = none; never contains URLs/keys
 };
 
