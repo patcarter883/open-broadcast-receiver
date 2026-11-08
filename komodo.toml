@@ -1,8 +1,9 @@
 # Komodo resource sync for the production receiver image (BACKPLANE §13.9).
 # Target instance: https://komodo.huntervalleyit.net.au/
 # Applied via a Resource Sync pointing at komodo.toml in
-# github.com/patcarter883/open-broadcast-receiver. Builder "Builder1",
-# GHCR account patcarter883.
+# github.com/patcarter883/open-broadcast-receiver. Builder "dev-cachyos" (the
+# outbound-periphery on the build host — "Builder1" was deleted 2026-10, which
+# left every build queued in `Building` forever), GHCR account patcarter883.
 #
 # This builds ONLY the image; there is no receiver stack — the node agent
 # spawns one container per session at allocate time (it is not a long-running
@@ -13,7 +14,7 @@ name = "obr-receiver-build"
 description = "open-broadcast receiver (copy-only fan-out) production image"
 tags = ["open-broadcast", "receiver"]
 [build.config]
-builder_id = "Builder1"
+builder_id = "dev-cachyos"
 git_provider = "github.com"
 git_account = "patcarter883"
 repo = "patcarter883/open-broadcast-receiver"
