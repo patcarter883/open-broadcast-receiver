@@ -34,7 +34,8 @@ auto make_stat() -> output_stat
   stat.state = "running";
   stat.connected_s = 12;
   stat.reconnects = 2;
-  stat.bytes_sent = 1234;
+  stat.bytes_published_total = 1234;
+  stat.frames_published_total = 89;
   stat.dropped_bytes = 5;
   stat.audio_dropped = false;
   stat.audio_frames = 3392;
@@ -62,8 +63,11 @@ auto main() -> int
     const json stats = json::parse(output_stat_json(stat, true));
     expect(stats["transcode"]["encoder"] == "vah264enc", "stats encoder");
     expect(stats["transcode"]["codec"] == "h264", "stats codec is h264");
-    expect(stats["bytes_sent"] == 1234 && stats["dropped_bytes"] == 5,
-           "stats keeps byte counters");
+    expect(stats["bytes_published_total"] == 1234
+               && stats["frames_published_total"] == 89,
+           "stats reports sink truth");
+    expect(stats["bytes_sent"] == stats["bytes_published_total"],
+           "bytes_sent is the deprecated alias of bytes_published_total");
     expect(!stats.contains("type"), "stats omits type");
   }
 

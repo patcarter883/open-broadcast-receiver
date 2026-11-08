@@ -9,11 +9,9 @@
 // platform: the ingest side is replaced by fixtures this binary generates with
 // GStreamer, and the destination is rtmp://127.0.0.1:11935/live/test.
 //
-// Why the server's counter and not output::bytes_sent(): bytes_sent counts
-// pushes into the appsrc, so it reads healthy while nothing leaves the box —
-// publish accepted, egress flat, no GStreamer error. The muxer's sink pads are
-// probed for the same reason: an appsrc can be caps'd and accepting buffers
-// while the branch downstream of it is stalled.
+// Why the server's counter and not the receiver's publish counters: the sink pad
+// proves buffers left the pipeline, but only the server proves they arrived.
+// output::bytes_published_total() measures the same pad, so the two should agree.
 //
 // Modes (all use the production templates; nothing here rebuilds a pipeline by
 // hand):
@@ -1734,7 +1732,8 @@ auto main(int argc, char** argv) -> int
   const bool audio_dropped = out.audio_dropped();
   const std::string last_error = out.last_error();
   const std::string encoder = out.encoder_name();
-  const std::uint64_t bytes_sent = out.bytes_sent();
+  const std::uint64_t bytes_published = out.bytes_published_total();
+  const std::uint64_t frames_published = out.frames_published_total();
   const int64_t reconnects = static_cast<int64_t>(out.reconnects());
   const char* state_name = out.state_name();
   // Decode-stage provenance, sampled while the stage is still running.
@@ -1982,8 +1981,9 @@ auto main(int argc, char** argv) -> int
     std::printf("reconnect attempts   %llu\n",
                 static_cast<unsigned long long>(reconnects_during));
   }
-  std::printf("output bytes_sent    %llu  (appsrc pushes, not evidence)\n",
-              static_cast<unsigned long long>(bytes_sent));
+  std::printf("output published     %llu bytes in %llu sink buffers\n",
+              static_cast<unsigned long long>(bytes_published),
+              static_cast<unsigned long long>(frames_published));
   std::printf("audio pad            dropped=%s caps=%s\n",
               audio_dropped ? "yes" : "no",
               audio_caps.empty() ? "(none)" : audio_caps.c_str());

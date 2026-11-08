@@ -392,7 +392,11 @@ auto output_stat_json(const output_stat& stat, bool stats_view) -> std::string
     obj["audio_dropped"] = stat.audio_dropped;
     obj["audio_frames"] = stat.audio_frames;
   } else {
-    obj["bytes_sent"] = stat.bytes_sent;
+    obj["bytes_published_total"] = stat.bytes_published_total;
+    obj["frames_published_total"] = stat.frames_published_total;
+    // Deprecated alias: same value, so nothing keeps reading the old inflated
+    // appsrc-push figure.
+    obj["bytes_sent"] = stat.bytes_published_total;
     obj["dropped_bytes"] = stat.dropped_bytes;
     obj["reconnects"] = stat.reconnects;
   }
@@ -545,6 +549,46 @@ auto control_server::build_status_json() const -> std::string
   return out.dump();
 }
 
+// The rist block of GET /stats (§6a). Window figures are what the last
+// completed ~1 s window counted; the `_total` figures are cumulative since the
+// session's listener started. The bare names are deprecated aliases of the
+// window figures. Exposed so the split is unit-testable without a live server.
+auto rist_stat_json(const rist_flow_stat& stat) -> std::string
+{
+  json rist;
+  rist["quality"] = stat.quality;
+  rist["rtt_ms"] = stat.rtt_ms;
+  rist["received_total"] = stat.received_total;
+  rist["recovered_total"] = stat.recovered_total;
+  rist["recovered_one_retry_total"] = stat.recovered_one_retry_total;
+  rist["lost_total"] = stat.lost_total;
+  rist["received_window"] = stat.received_window;
+  rist["missing"] = stat.missing;
+  rist["recovered_window"] = stat.recovered_window;
+  rist["recovered_one_retry_window"] = stat.recovered_one_retry_window;
+  rist["lost_window"] = stat.lost_window;
+  rist["received"] = stat.received_window;
+  rist["recovered"] = stat.recovered_window;
+  rist["recovered_one_retry"] = stat.recovered_one_retry_window;
+  rist["lost"] = stat.lost_window;
+  rist["reordered"] = stat.reordered;
+  rist["bandwidth_bps"] = stat.bandwidth_bps;
+  rist["retry_bandwidth_bps"] = stat.retry_bandwidth_bps;
+  json peers = json::array();
+  for (const rist_peer_stat& peer : stat.peers) {
+    json pobj;
+    pobj["id"] = peer.id;
+    pobj["rtt_ms"] = peer.rtt_ms;
+    pobj["avg_rtt_ms"] = peer.avg_rtt_ms;
+    pobj["received"] = peer.received;
+    pobj["received_bytes"] = peer.received_bytes;
+    pobj["bandwidth_bps"] = peer.bandwidth_bps;
+    peers.push_back(std::move(pobj));
+  }
+  rist["peers"] = std::move(peers);
+  return rist.dump();
+}
+
 auto control_server::build_stats_json() const -> std::string
 {
   json out;
@@ -561,29 +605,7 @@ auto control_server::build_stats_json() const -> std::string
   const session_stats snap = m_get_stats ? m_get_stats() : session_stats {};
   out["ring_size_bytes"] = snap.ring_size_bytes;
 
-  json rist;
-  rist["quality"] = snap.rist.quality;
-  rist["rtt_ms"] = snap.rist.rtt_ms;
-  rist["received"] = snap.rist.received;
-  rist["missing"] = snap.rist.missing;
-  rist["recovered"] = snap.rist.recovered;
-  rist["recovered_one_retry"] = snap.rist.recovered_one_retry;
-  rist["lost"] = snap.rist.lost;
-  rist["reordered"] = snap.rist.reordered;
-  rist["bandwidth_bps"] = snap.rist.bandwidth_bps;
-  rist["retry_bandwidth_bps"] = snap.rist.retry_bandwidth_bps;
-  json peers = json::array();
-  for (const rist_peer_stat& peer : snap.rist.peers) {
-    json pobj;
-    pobj["id"] = peer.id;
-    pobj["rtt_ms"] = peer.rtt_ms;
-    pobj["avg_rtt_ms"] = peer.avg_rtt_ms;
-    pobj["received"] = peer.received;
-    pobj["received_bytes"] = peer.received_bytes;
-    pobj["bandwidth_bps"] = peer.bandwidth_bps;
-    peers.push_back(std::move(pobj));
-  }
-  rist["peers"] = std::move(peers);
+  json rist = json::parse(rist_stat_json(snap.rist));
   out["rist"] = std::move(rist);
 
   json ts_in;

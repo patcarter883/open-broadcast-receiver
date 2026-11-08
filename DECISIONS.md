@@ -504,3 +504,24 @@ sink undetected for the connect window on every attempt, and it would not fix th
 unreachable in the first place. Lowering the steady-state rate instead of the connect rate: measured-link
 tracking is the reason §21 exists. Dropping the bootstrap and relying on the connect window alone: the buffer
 still fills, so the first publish after a drop lands only if the handshake completes before the buffer is full.
+
+---
+
+## 23. Publish bytes are measured at the destination sink pad, not at the appsrc
+
+**Choice.** `outputs[].bytes_published_total` in `GET /stats` is the sum of buffer sizes seen by a probe on the
+destination element's sink pad (`rtmp2sink`/`srtsink`/`ristsink`), and `frames_published_total` the count of those
+buffers. `bytes_sent` is serialised from the same value as a deprecated alias. The `rist` block carries both
+`*_window` (the last completed ~1 s window) and `*_total` (cumulative since the session's listener started).
+
+**Rationale.** The previous counter summed bytes pushed into the video/audio appsrc, which on a transcode output
+are raw decoded frames: a 30 s AV1→H.264 run reported 328,538,552 bytes against 18,226,344 on the container's
+eth0 and a 17,877,749-byte recording. Sink-pad bytes are the muxed protocol payload, the closest point in the
+process to the wire, and they track the destination's own counter to ~1% (`receiver_e2e_guard`: 475457 against
+470601 received). librist's flow counters are per-interval deltas, so a single reading is neither a window nor a
+total; exposing only one number forced every consumer to guess, and the node agent guessed wrong.
+
+**Rejected.** Reading `rtmp2sink`'s internal written-bytes counter: not exposed as a property. Counting at the
+muxer's src pad: identical for RTMP but skips any byte the sink itself adds or drops, and is upstream of the
+protocol exchange. Reporting only a cumulative RIST figure: the OOB ABR signal and the quality ratio are
+window-scoped, so both shapes are needed.

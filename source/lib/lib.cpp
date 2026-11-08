@@ -1039,3 +1039,56 @@ auto bitrate_change_is_material(int current_kbps, int next_kbps) -> bool
   return delta >= transcode_bitrate_policy::reselect_min_kbps
       && delta >= percent;
 }
+
+auto rist_flow_accumulator::add(const rist_flow_delta& delta,
+                                int64_t now_ms,
+                                int64_t window_ms,
+                                rist_flow_window& out) -> bool
+{
+  if (!m_started) {
+    m_started = true;
+    m_window_start_ms = now_ms;
+  }
+  // Counters that only ever grow fold into both figures. `missing` is librist's
+  // live retransmit-queue depth (it decrements as recovery lands) and `reordered`
+  // is an instant reading, so neither is a count to total: only the window keeps
+  // them, as the latest value.
+  m_window.received += delta.received;
+  m_window.recovered += delta.recovered;
+  m_window.recovered_one_retry += delta.recovered_one_retry;
+  m_window.lost += delta.lost;
+  m_window.missing = delta.missing;
+  m_window.reordered = delta.reordered;
+  if (delta.worst_rtt_ms > m_window.worst_rtt_ms) {
+    m_window.worst_rtt_ms = delta.worst_rtt_ms;
+  }
+  m_total.received += delta.received;
+  m_total.recovered += delta.recovered;
+  m_total.recovered_one_retry += delta.recovered_one_retry;
+  m_total.lost += delta.lost;
+  ++m_samples;
+
+  if (now_ms - m_window_start_ms < window_ms) {
+    return false;
+  }
+  out = rist_flow_window {
+      .window = m_window,
+      .samples = m_samples,
+      .received_total = m_total.received,
+      .recovered_total = m_total.recovered,
+      .recovered_one_retry_total = m_total.recovered_one_retry,
+      .lost_total = m_total.lost};
+  m_window = rist_flow_delta {};
+  m_samples = 0;
+  m_window_start_ms = now_ms;
+  return true;
+}
+
+auto rist_flow_accumulator::reset() -> void
+{
+  m_started = false;
+  m_window_start_ms = 0;
+  m_window = rist_flow_delta {};
+  m_total = rist_flow_delta {};
+  m_samples = 0;
+}

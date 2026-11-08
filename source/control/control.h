@@ -39,6 +39,11 @@ auto parse_start_body(std::string_view body,
 // a live server.
 auto output_stat_json(const output_stat& stat, bool stats_view) -> std::string;
 
+// Serialise the /stats `rist` block. Window fields are the last completed ~1 s
+// window; `_total` fields are cumulative since the session started; the bare
+// names are deprecated aliases of the window fields.
+auto rist_stat_json(const rist_flow_stat& stat) -> std::string;
+
 // The standby/slate snapshot GET /status and GET /stats carry as a top-level
 // `standby` object (CONTRACT §5, schema_version 5). Built from atomics only —
 // the mode controller's counters plus the stage's stats — so reading it never

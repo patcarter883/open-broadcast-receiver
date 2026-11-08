@@ -543,11 +543,11 @@ scenario_2() {
   # stream origin again (mpegtsmux stamps the first packet at 3600 s, so the
   # property to assert is "same origin", not the literal zero).
   local bytes_before bytes_settled pts_first pts_second
-  bytes_before="$(stat_out bytes_sent)"
+  bytes_before="$(stat_out bytes_published_total)"
   pts_first="$(pts_of_feed "$LOG_DIR/s2/feed-first.ts")"
   start_feed "$LOG_DIR/s2" second av
   sleep 1
-  bytes_settled="$(stat_out bytes_sent)"
+  bytes_settled="$(stat_out bytes_published_total)"
   pts_second="$(pts_of_feed "$LOG_DIR/s2/feed-second.ts")"
   local pts_delta=""
   if [[ -n "$pts_first" && -n "$pts_second" ]]; then
@@ -569,7 +569,7 @@ scenario_2() {
   # rewound would show up as a smaller counter on the next sample.
   local mono_ok=1 prev="$bytes_before" cur
   for _ in 1 2 3 4 5 6 7 8; do
-    cur="$(stat_out bytes_sent)"
+    cur="$(stat_out bytes_published_total)"
     [[ "$cur" =~ ^[0-9]+$ ]] || continue
     (( cur < prev )) && mono_ok=0
     prev="$cur"

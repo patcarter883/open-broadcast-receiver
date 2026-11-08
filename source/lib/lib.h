@@ -412,15 +412,73 @@ struct rist_flow_stat
 {
   double quality = 0.0;
   uint32_t rtt_ms = 0;
+  // ~1 s window figures: what the last completed window counted, not a running
+  // total. Difference nothing against these.
+  uint64_t received_window = 0;
+  uint64_t missing = 0;  // live queue depth at window close, not a count
+  uint64_t recovered_window = 0;
+  uint64_t recovered_one_retry_window = 0;
+  uint64_t lost_window = 0;
+  uint64_t reordered = 0;
+  // Cumulative since the session's listener started: every emission's delta
+  // folded in. These are the figures a rate/health consumer differences.
+  uint64_t received_total = 0;
+  uint64_t recovered_total = 0;
+  uint64_t recovered_one_retry_total = 0;
+  uint64_t lost_total = 0;
+  uint64_t bandwidth_bps = 0;
+  uint64_t retry_bandwidth_bps = 0;
+  std::vector<rist_peer_stat> peers;
+};
+
+// One librist receiver_flow emission. librist memsets flow->stats_instant on
+// every emission, so each field is a delta for the interval since the previous
+// one, never a running total.
+struct rist_flow_delta
+{
   uint64_t received = 0;
   uint64_t missing = 0;
   uint64_t recovered = 0;
   uint64_t recovered_one_retry = 0;
   uint64_t lost = 0;
   uint64_t reordered = 0;
-  uint64_t bandwidth_bps = 0;
-  uint64_t retry_bandwidth_bps = 0;
-  std::vector<rist_peer_stat> peers;
+  uint32_t worst_rtt_ms = 0;
+};
+
+// One closed ~1 s window plus the running totals that include it.
+struct rist_flow_window
+{
+  rist_flow_delta window;
+  uint64_t samples = 0;      // emissions folded into this window
+  uint64_t received_total = 0;
+  uint64_t recovered_total = 0;
+  uint64_t recovered_one_retry_total = 0;
+  uint64_t lost_total = 0;
+};
+
+// Folds per-interval emissions into a ~1 s window and into session-cumulative
+// totals. librist emits far more often than 1 Hz (the flow's stats interval is
+// never applied upstream, so the callback runs at the protocol loop's event
+// rate — measured at ~15/s idle, ~150/s under loss), so a single emission is
+// neither a window nor a total and the two figures must be produced separately.
+class rist_flow_accumulator
+{
+public:
+  // Fold one emission. Returns true and fills `out` when this emission closes a
+  // window of at least `window_ms`; false while the window is still open (the
+  // delta is already folded into both the window and the totals).
+  auto add(const rist_flow_delta& delta,
+           int64_t now_ms,
+           int64_t window_ms,
+           rist_flow_window& out) -> bool;
+  auto reset() -> void;
+
+private:
+  bool m_started = false;
+  int64_t m_window_start_ms = 0;
+  rist_flow_delta m_window;
+  rist_flow_delta m_total;
+  uint64_t m_samples = 0;
 };
 
 struct output_stat
@@ -437,7 +495,11 @@ struct output_stat
   uint64_t frames_dropped = 0;
   int64_t connected_s = 0;
   uint64_t reconnects = 0;
-  uint64_t bytes_sent = 0;
+  // Sink truth: cumulative bytes and media buffers handed to the destination's
+  // protocol element. The JSON's deprecated `bytes_sent` is serialised from
+  // bytes_published_total, so the two cannot disagree.
+  uint64_t bytes_published_total = 0;
+  uint64_t frames_published_total = 0;
   uint64_t dropped_bytes = 0;
   bool audio_dropped = false;
   // Buffers the muxer's audio pad received; 0 with audio_dropped=false is an
