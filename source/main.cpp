@@ -455,6 +455,11 @@ auto main(int argc, char** argv) -> int
     }
 
     // ---- construction: ring → decoder → outputs → recorder → RIST ----
+    // A new session starts without the previous session's recorded failure.
+    {
+      std::lock_guard<std::mutex> guard(ctx.state.mutex);
+      ctx.state.last_bus_error.clear();
+    }
     sess.ring = std::make_unique<ts_ring>(
         ts_ring::size_for_bandwidth(cfg.ingest.bandwidth));
 
@@ -467,10 +472,19 @@ auto main(int argc, char** argv) -> int
         [](const output_config& out) -> bool
         { return out.transcode.target != transcode_target::none; });
     if (any_transcode) {
-      sess.dec =
-          std::make_unique<decoder>(*sess.ring, cfg.in_codec, &stderr_log);
-      // A decode-stage failure is contained: copy outputs still run and
-      // transcode outputs idle until the session is restarted.
+      // A codec mismatch is session-fatal: the ingest is not what /start
+      // declared, so no output's assumed codec holds. Other decode failures are
+      // contained -- copy outputs still run and transcode outputs idle until the
+      // session is restarted.
+      sess.dec = std::make_unique<decoder>(
+          *sess.ring, cfg.in_codec, &stderr_log,
+          [&ctx](const std::string& reason) -> void
+          {
+            std::lock_guard<std::mutex> guard(ctx.state.mutex);
+            if (ctx.state.last_bus_error.empty()) {
+              ctx.state.last_bus_error = reason;
+            }
+          });
       sess.dec->start();
     }
 
@@ -512,7 +526,6 @@ auto main(int argc, char** argv) -> int
       ctx.state.cfg = cfg;
       ctx.state.session_id = cfg.session_id;
       ctx.state.started_at = std::chrono::steady_clock::now();
-      ctx.state.last_bus_error.clear();
     }
     ctx.state.rist_bytes.store(0, std::memory_order_relaxed);
     ctx.state.last_payload_ms.store(0, std::memory_order_relaxed);

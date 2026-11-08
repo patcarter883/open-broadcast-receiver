@@ -4,6 +4,7 @@
 #include "fanout/decoder.h"
 
 #include "fanout/decode_health.h"
+#include "fanout/source_codec.h"
 #include "fanout/pts_synth.h"
 
 #include <algorithm>
@@ -80,6 +81,14 @@ static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data
   const bool is_video = name != nullptr && g_str_has_prefix(name, "video/");
 
   if (is_video && vqueue != nullptr) {
+    // The branch's parser is the one the DECLARED codec selects, so a pad of
+    // another codec cannot pass it. Refuse it here, where both values are
+    // known, instead of letting the link fail into a branch that never produces
+    // a frame.
+    if (targets->owner != nullptr && !targets->owner->accept_video_pad(caps)) {
+      gst_caps_unref(caps);
+      return;
+    }
     GstPadLinkReturn lr = GST_PAD_LINK_REFUSED;
     GstPad* sink = gst_element_get_static_pad(vqueue, "sink");
     if (sink != nullptr) {
@@ -359,10 +368,11 @@ auto decoder_template(codec /*in_codec*/,
       branch);
 }
 
-decoder::decoder(ts_ring& ring, codec in_codec, log_fn log)
+decoder::decoder(ts_ring& ring, codec in_codec, log_fn log, fail_fn on_fail)
     : m_ring {ring}
     , m_in_codec {in_codec}
     , m_log {std::move(log)}
+    , m_on_fail {std::move(on_fail)}
 {
 }
 
@@ -512,6 +522,40 @@ auto decoder::observe_source_caps(GstCaps* caps) -> void
   }
   log(std::format("parse out: {} -- {} accepts it\n", stream,
                   decoder_element()));
+}
+
+auto decoder::accept_video_pad(const GstCaps* caps) -> bool
+{
+  if (caps == nullptr || gst_caps_get_size(caps) == 0) {
+    return true;
+  }
+  const std::string actual = describe_caps(caps);
+  const std::string reason = source_codec::mismatch_reason(m_in_codec, actual);
+  if (reason.empty()) {
+    return true;
+  }
+  // One report: every attempt re-exposes the same pad, and the verdict does not
+  // change with the decoder because the parser is chosen from the declared
+  // codec.
+  if (m_codec_mismatch.exchange(true, std::memory_order_relaxed)) {
+    return false;
+  }
+  log(reason + " -- refusing the transcode branch\n");
+  {
+    const std::scoped_lock lock {m_mismatch_mutex};
+    m_mismatch_reason = reason;
+  }
+  m_failed.store(true, std::memory_order_relaxed);
+  if (m_on_fail) {
+    m_on_fail(reason);
+  }
+  return false;
+}
+
+auto decoder::codec_mismatch_reason() const -> std::string
+{
+  const std::scoped_lock lock {m_mismatch_mutex};
+  return m_mismatch_reason;
 }
 
 auto decoder::attach_probes(const char* parser_name, const char* decoder_name)
@@ -716,6 +760,13 @@ auto decoder::check_attempt_health() -> bool
     // Test hook: the same retire-and-rebuild path a real failure takes.
     m_simulate_failure = false;
     return degrade("simulated decoder failure (test hook)");
+  }
+
+  // The ingest is not the declared codec: no attempt in the chain parses it, so
+  // rebuilding would only repeat the same refusal. The stage is already marked
+  // failed with the reason.
+  if (m_codec_mismatch.load(std::memory_order_relaxed)) {
+    return false;
   }
 
   // A refusal recorded by the parser's caps probe is the precise form of what

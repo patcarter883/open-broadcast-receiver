@@ -100,6 +100,65 @@ auto product_encoder() -> const char*
   return has_element("vaav1enc") ? "vaav1enc" : "av1enc";
 }
 
+// Mux `desc` to `path`, returning true only when the pipeline finished with
+// EOS: a fixture that cannot be written fails the test rather than passing
+// silently.
+auto run_mux(const std::string& desc, const std::string& label) -> bool
+{
+  GError* gerr = nullptr;
+  GstElement* p = gst_parse_launch(desc.c_str(), &gerr);
+  if (p == nullptr || gerr != nullptr) {
+    if (gerr != nullptr) {
+      std::fprintf(stderr, "fixture pipeline (%s): %s\n", label.c_str(),
+                   gerr->message);
+      g_error_free(gerr);
+    }
+    return false;
+  }
+  const GstStateChangeReturn scr = gst_element_set_state(p, GST_STATE_PLAYING);
+  bool ok = scr != GST_STATE_CHANGE_FAILURE;
+  if (ok) {
+    GstBus* bus = gst_element_get_bus(p);
+    GstMessage* msg = gst_bus_timed_pop_filtered(
+        bus, 60 * GST_SECOND,
+        static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+    ok = msg != nullptr && GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS;
+    if (msg != nullptr) {
+      if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError* err = nullptr;
+        gchar* dbg = nullptr;
+        gst_message_parse_error(msg, &err, &dbg);
+        std::fprintf(stderr, "fixture mux failed (%s): %s -- %s\n",
+                     label.c_str(), err != nullptr ? err->message : "?",
+                     dbg != nullptr ? dbg : "");
+        if (err != nullptr) {
+          g_error_free(err);
+        }
+        g_free(dbg);
+      }
+      gst_message_unref(msg);
+    }
+    gst_object_unref(bus);
+  }
+  gst_element_set_state(p, GST_STATE_NULL);
+  gst_object_unref(p);
+  return ok;
+}
+
+// An H.264 TS in the shape a conforming encoder sends. The mismatch case only
+// needs a stream of a codec the session did NOT declare.
+auto make_h264_fixture(const std::filesystem::path& path) -> bool
+{
+  const std::string desc = std::format(
+      "videotestsrc num-buffers=90 pattern=smpte ! "
+      "video/x-raw,format=I420,width=640,height=360,framerate=30/1 ! "
+      "x264enc bitrate=2000 key-int-max=30 speed-preset=ultrafast ! "
+      "h264parse ! video/x-h264,stream-format=byte-stream ! "
+      "mpegtsmux alignment=7 ! filesink location={}",
+      path.string());
+  return run_mux(desc, "h264");
+}
+
 // Mux `chroma` frames into the TS shape the product's encoder emits: framerate
 // pacing, alignment=7 datagrams, explicit AV1 stream type.
 auto make_fixture(const char* chroma, const std::filesystem::path& path) -> bool
@@ -123,42 +182,7 @@ auto make_fixture(const char* chroma, const std::filesystem::path& path) -> bool
       "mpegtsmux alignment=7 enable-custom-mappings=true ! "
       "filesink location={}",
       chroma, width, height, encoder, enc_args, path.string());
-  GError* gerr = nullptr;
-  GstElement* p = gst_parse_launch(desc.c_str(), &gerr);
-  if (p == nullptr || gerr != nullptr) {
-    if (gerr != nullptr) {
-      std::fprintf(stderr, "fixture pipeline (%s): %s\n", chroma, gerr->message);
-      g_error_free(gerr);
-    }
-    return false;
-  }
-  const GstStateChangeReturn scr = gst_element_set_state(p, GST_STATE_PLAYING);
-  bool ok = scr != GST_STATE_CHANGE_FAILURE;
-  if (ok) {
-    GstBus* bus = gst_element_get_bus(p);
-    GstMessage* msg = gst_bus_timed_pop_filtered(
-        bus, 60 * GST_SECOND,
-        static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
-    ok = msg != nullptr && GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS;
-    if (msg != nullptr) {
-      if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
-        GError* err = nullptr;
-        gchar* dbg = nullptr;
-        gst_message_parse_error(msg, &err, &dbg);
-        std::fprintf(stderr, "fixture mux failed (%s): %s -- %s\n", chroma,
-                     err != nullptr ? err->message : "?", dbg != nullptr ? dbg : "");
-        if (err != nullptr) {
-          g_error_free(err);
-        }
-        g_free(dbg);
-      }
-      gst_message_unref(msg);
-    }
-    gst_object_unref(bus);
-  }
-  gst_element_set_state(p, GST_STATE_NULL);
-  gst_object_unref(p);
-  return ok;
+  return run_mux(desc, chroma);
 }
 
 // The caps the fixture's elementary stream really carries, read off av1parse's
@@ -246,6 +270,7 @@ struct run_result {
   bool failed = false;
   bool fallback = false;
   std::string decoder;
+  std::string mismatch;
   std::vector<std::string> log;
 };
 
@@ -291,11 +316,12 @@ auto feed(ts_ring& ring, const std::vector<std::uint8_t>& bytes) -> void
 
 auto run_bytes(const std::vector<std::uint8_t>& bytes, bool simulate_failure,
                std::chrono::seconds drain = k_drain,
-               bool keep_feeding = false) -> run_result
+               bool keep_feeding = false,
+               codec declared = codec::av1) -> run_result
 {
   run_result result;
   ts_ring ring {ts_ring::size_for_bandwidth(20000)};
-  decoder dec {ring, codec::av1,
+  decoder dec {ring, declared,
                [&result](const std::string& line) -> void
                { result.log.push_back(line); }};
   if (simulate_failure) {
@@ -320,6 +346,7 @@ auto run_bytes(const std::vector<std::uint8_t>& bytes, bool simulate_failure,
   result.frames = dec.frames().head();
   result.failed = dec.failed();
   result.fallback = dec.using_fallback();
+  result.mismatch = dec.codec_mismatch_reason();
   dec.stop();
   result.decoder = dec.decoder_element();
   for (const std::string& line : result.log) {
@@ -538,6 +565,45 @@ auto main(int argc, char** argv) -> int
           "no decoder is retired while nothing has arrived");
     check(count_of(r.log, "[decoder] in=0 chunks") >= 1,
           "the periodic line reports the silence while it lasts");
+  }
+
+  // ---- 8. an ingest of another codec is refused by name -------------------
+  // An AV1 pad linked into the branch built for declared h264 fails
+  // negotiation, and the branch starves while copy outputs report healthy. The
+  // pad's media type is compared with source.codec before the link, so the
+  // refusal names both and the session is failed instead of idling.
+  {
+    if (!has_element("x264enc") || !has_element("h264parse")) {
+      check(false, "x264enc/h264parse are required for the codec-mismatch case");
+    } else {
+      const auto fx_h264 = dir / "h264.ts";
+      if (make_h264_fixture(fx_h264)) {
+        const auto r = run_bytes(read_file(fx_h264), false, k_drain, false,
+                                 codec::av1);
+        check(r.failed, "a declared codec the pad does not carry fails the stage");
+        check(r.frames == 0, "no frame is published from the mismatched pad");
+        check(contains(r.log, "source codec mismatch"),
+              "the mismatch is logged");
+        check(r.mismatch.find("declared av1") != std::string::npos
+                  && r.mismatch.find("video/x-h264") != std::string::npos,
+              "the refusal names the declared codec and the pad's caps, got "
+                  + r.mismatch);
+        check(!contains(r.log, "failed:"),
+              "no decode attempt is spent on a codec the branch cannot parse");
+
+        // The same stream declared as what it carries decodes: the check refuses
+        // a mismatch, not a stream.
+        if (has_element("vah264dec") || has_element("avdec_h264")) {
+          const auto ok = run_bytes(read_file(fx_h264), false, k_drain, false,
+                                    codec::h264);
+          check(!ok.failed && ok.frames > 0,
+                "the same stream decodes when declared as h264, got "
+                    + std::to_string(ok.frames) + " frames");
+        }
+      } else {
+        check(false, "the h264 fixture could not be muxed");
+      }
+    }
   }
 
   std::filesystem::remove_all(dir);
