@@ -32,6 +32,10 @@
 //
 // A decoder failure is contained: the feeder logs and stops producing, the
 // session and copy outputs are unaffected, and transcode outputs simply idle.
+// An ingest that is not the codec /start declared is not a decoder failure and
+// is not retried: the pad is refused the moment tsdemux exposes it, the reason
+// names both codecs, the stage stops and the session carries it as its last
+// error (fanout/source_codec.h).
 // Which decoder: hardware first (the driver is asked to hold on the GPU), with
 // the software decoder for the same codec as the last resort. The parser's
 // output is pinned to the sink caps the decoder declares, so the stream is

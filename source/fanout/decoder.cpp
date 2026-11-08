@@ -764,8 +764,14 @@ auto decoder::check_attempt_health() -> bool
 
   // The ingest is not the declared codec: no attempt in the chain parses it, so
   // rebuilding would only repeat the same refusal. The stage is already marked
-  // failed with the reason.
+  // failed with the reason, and the pipeline is torn down HERE, on the feeder
+  // thread: a demuxer whose video pad was refused still runs, and leaving it
+  // alive would keep a whole TS demux consuming the ring for a branch that can
+  // never produce a frame. It is never torn down from the pad-added callback --
+  // setting a pipeline to NULL from a streaming thread deadlocks. Nothing is
+  // rebuilt, so the caller's sleep is unchanged.
   if (m_codec_mismatch.load(std::memory_order_relaxed)) {
+    destroy_pipeline();
     return false;
   }
 
