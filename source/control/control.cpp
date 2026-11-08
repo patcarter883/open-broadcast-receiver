@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <format>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -106,7 +107,7 @@ auto transcode_field(const std::string& str,
   return target;
 }
 
-// POST /start body — schema_version 3 (TRANSPORT_PROFILE §1.1). outputs[] is
+// POST /start body — schema_version 4 (TRANSPORT_PROFILE §1.1). outputs[] is
 // required but MAY be empty (a link-test / record-only session).
 auto parse_start_body_json(const json& jbody) -> receiver_config
 {
@@ -125,7 +126,8 @@ auto parse_start_body_json(const json& jbody) -> receiver_config
   if (cfg.schema_version != k_schema_version) {
     perr("invalid_schema",
          "schema_version",
-         "unsupported schema_version (expected 3)");
+         std::format("unsupported schema_version (expected {})",
+                     k_schema_version));
   }
 
   cfg.session_id = require_string(jbody, "session_id", "session_id");
