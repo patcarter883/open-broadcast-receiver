@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -145,6 +146,16 @@ private:
   auto log_muxer_input() -> void;
   // Transcode feed accounting: one line every k_feed_stats_period.
   auto report_feed() -> void;
+  // Retires the muxer's audio pad with unlink + EOS once it has carried no
+  // buffers for k_audio_probe_delay after the first video frame.
+  auto retire_empty_audio_pad() -> void;
+  // Blocks until the video appsrc is below `cap`, bounded by k_stall_timeout.
+  // Returns false when the attempt should end (stopping or a stalled sink).
+  auto wait_appsrc_drain(guint64 cap) -> bool;
+  static auto appsrc_drained(GstPad* pad, GstPadProbeInfo* info, gpointer self)
+      -> GstPadProbeReturn;
+  static auto muxer_first_buffer(GstPad* pad, GstPadProbeInfo* info,
+                                 gpointer self) -> GstPadProbeReturn;
   auto build_pipeline(std::string& err) -> bool;
   auto destroy_pipeline() -> void;
   auto set_state(run_state next) -> void;
@@ -175,11 +186,12 @@ private:
 
   std::atomic<run_state> m_state {run_state::starting};
   std::atomic<uint64_t> m_reconnects {0};
-  // Set while the transit appsrc is pinned at its limit; drives the stall
-  // watchdog in feed_transcode.
-  std::chrono::steady_clock::time_point m_stall_since {};
   std::chrono::steady_clock::time_point m_run_started {};
   bool m_audio_probe_done {false};
+  std::atomic_bool m_first_output_logged {false};
+  // When the first decoded frame reached the video appsrc; the audio-pad
+  // deadline is measured from here, not from the attempt's start.
+  std::chrono::steady_clock::time_point m_first_video_push {};
   bool m_muxer_input_logged {false};
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};
@@ -202,10 +214,20 @@ private:
     double read_ms = 0;      // time inside frame_ring::read
     double push_ms = 0;      // time inside gst_app_src_push_buffer
     uint64_t level_peak = 0; // high-water mark of the appsrc level, bytes
+    uint64_t encoder_in = 0; // buffers that arrived at the encoder's sink pad
+    uint64_t muxer_out = 0;  // buffers the muxer emitted
     std::chrono::steady_clock::time_point since {};
   };
   feed_stats m_feed;
-  uint64_t m_push_backoff {};  // consecutive blocked passes (stall watchdog)
+  // Buffers that reached the encoder and that the muxer emitted; the feed
+  // report prints them per period so a pinned appsrc can be attributed to the
+  // encoder or to the muxer/sink.
+  std::atomic<uint64_t> m_encoder_in {0};
+  std::atomic<uint64_t> m_muxer_out {0};
+  // Wakes the feed thread when a buffer leaves the video appsrc (installed as a
+  // probe on its src pad) so backpressure is the pipeline's own pace.
+  std::mutex m_feed_mutex;
+  std::condition_variable m_feed_cv;
 
   // Raw-frame read buffer for the frame_ring cursor (capacity()-sized; the
   // ring insists a read destination hold a whole frame). Sized once in start().
