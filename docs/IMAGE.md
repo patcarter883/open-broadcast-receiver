@@ -107,12 +107,41 @@ that is supplied out of band and never written into the repo:
 
 ```sh
 docker login ghcr.io -u patcarter883     # personal access token, write:packages
+```
+
+The one command that builds **and publishes** the image:
+
+```sh
+make image-push
+```
+
+It runs `packaging/build-image.sh --platform linux/amd64 --pinned --push`,
+which tags `<registry>/<image>:<short-sha>` and `:latest` and pushes both. The
+base is pinned to `docker/base-image.lock`, so re-running it for the same commit
+resolves the same Debian packages instead of whatever `debian:sid` happens to be
+that morning — that is what makes the published artifact reproducible rather
+than merely repeatable.
+
+Verify the push actually landed in the registry (not just in the local daemon):
+
+```sh
+docker buildx imagetools inspect \
+  ghcr.io/patcarter883/open-broadcast-receiver:$(git rev-parse --short HEAD)
+# or, without a login:
+docker manifest inspect ghcr.io/patcarter883/open-broadcast-receiver:latest
+```
+
+Equivalent direct invocation:
+
+```sh
 packaging/build-image.sh --pinned --push
 ```
 
 Komodo's `obr-receiver-build` pushes on every build using the registry account
-in `/etc/komodo/periphery.providers.toml`; the local path above is for building
-and testing an image without going through Komodo.
+in `/etc/komodo/periphery.providers.toml` and tags the same way (`<sha>`,
+`<version>`, `<major>.<minor>`, `<major>`, `latest`), so `make image-push` and a
+Komodo build of the same commit produce the same tag set. The local path exists
+for publishing without going through Komodo.
 
 ## Running the built image locally
 
