@@ -55,7 +55,8 @@ struct sender_peer_stat {
 };
 
 /* All telemetry globals are touched only from the librist worker thread
- * (cb_auth_connect, cb_auth_disconnect, cb_stats), so no locking needed. */
+ * (cb_auth_connect, cb_auth_disconnect, cb_stats, cb_recv_oob), so no locking
+ * needed. */
 static struct sender_peer_stat g_sender_peers[MAX_SENDER_PEERS];
 static uint8_t  g_last_link_quality = 0xFFu;       /* sentinel: forces first emit */
 static uint32_t g_last_rtt          = 0xFFFFFFFFu; /* sentinel: forces first emit */
@@ -63,8 +64,12 @@ static struct rist_ctx  *g_lan_receiver_ctx  = NULL;
 static struct rist_peer *g_lan_receiver_peer = NULL;
 /* Quality of the encoder->rist2rist (input) leg, from RIST_STATS_RECEIVER_FLOW.
  * The sender-peer quality only covers the rist2rist->downstream legs, so loss on
- * the input leg is invisible there; we report the worst of the two. */
+ * the input leg is invisible there; we report the worst of the legs. */
 static double   g_lan_recv_quality  = 100.0;
+/* What the receiver measured on the last leg (rist2rist->receiver), relayed
+ * back over RIST OOB as the same 5-byte wan_telemetry the encoder reads. */
+static double   g_wan_rx_quality    = 100.0;
+static uint32_t g_wan_rx_rtt        = 0;
 
 struct rist_sender_args {
 	char* cname;
@@ -203,10 +208,28 @@ static int cb_auth_disconnect(void *arg, struct rist_peer *peer)
 	return 0;
 }
 
+static void telemetry_emit(void);
+
 static int cb_recv_oob(void *arg, const struct rist_oob_block *oob_block)
 {
 	struct rist_ctx *ctx = (struct rist_ctx *)arg;
 	(void)ctx;
+	/* The receiver sends its own link observation on this channel as the same
+	 * 5-byte wan_telemetry struct the encoder reads. Fold it into what this
+	 * hop reports so the encoder sees loss/rtt on the last leg too. */
+	if (oob_block->payload_len == sizeof(struct wan_telemetry_t)) {
+		struct wan_telemetry_t telemetry;
+		memcpy(&telemetry, oob_block->payload, sizeof(telemetry));
+		double q = telemetry.link_quality;
+		if (q < 0.0)   q = 0.0;
+		if (q > 100.0) q = 100.0;
+		g_wan_rx_quality = q;
+		g_wan_rx_rtt     = ntohl(telemetry.worst_case_rtt);
+		rist_log(&logging_settings, RIST_LOG_DEBUG,
+			"receiver link telemetry: q=%.1f rtt=%u ms\n", q, g_wan_rx_rtt);
+		telemetry_emit();
+		return 0;
+	}
 	int message_len = 0;
 	char *message = oob_process_api_message((int)oob_block->payload_len, (char *)oob_block->payload, &message_len);
 	if (message) {
@@ -245,13 +268,18 @@ static void telemetry_emit(void)
 		                       : (q_sum / (double)n_peers);
 	}
 
-	/* Report the worst of the input (encoder->rist2rist) and output legs, so
-	 * loss on EITHER leg pulls the encoder's WAN quality down. */
-	double q_final = (q_out < g_lan_recv_quality) ? q_out : g_lan_recv_quality;
+	/* Report the worst of all three legs — encoder->rist2rist, each
+	 * rist2rist->downstream sender peer, and the receiver's own report on the
+	 * last leg — so loss anywhere on the path pulls the encoder's WAN quality
+	 * down. RTT is the worst of the sender peers and the receiver's. */
+	double q_final = q_out;
+	if (g_lan_recv_quality < q_final) q_final = g_lan_recv_quality;
+	if (g_wan_rx_quality   < q_final) q_final = g_wan_rx_quality;
 	if (q_final < 0.0)   q_final = 0.0;
 	if (q_final > 100.0) q_final = 100.0;
 	uint8_t  link_quality = (uint8_t)(q_final + 0.5);
 	uint32_t rtt          = max_rtt;
+	if (g_wan_rx_rtt > rtt) rtt = g_wan_rx_rtt;
 
 	int quality_changed = (link_quality != g_last_link_quality);
 	int rtt_changed     = (abs((int)rtt - (int)g_last_rtt) > RTT_HYSTERESIS_MS);
@@ -279,8 +307,8 @@ static void telemetry_emit(void)
 	g_last_rtt          = rtt;
 
 	rist_log(&logging_settings, RIST_LOG_DEBUG,
-		"telemetry: q=%u (out=%.1f in=%.1f) rtt=%u ms peers=%d\n",
-		link_quality, q_out, g_lan_recv_quality, rtt, n_peers);
+		"telemetry: q=%u (out=%.1f in=%.1f rx=%.1f) rtt=%u ms peers=%d\n",
+		link_quality, q_out, g_lan_recv_quality, g_wan_rx_quality, rtt, n_peers);
 }
 
 static void wan_telemetry_update(const struct rist_stats_sender_peer *sp)
