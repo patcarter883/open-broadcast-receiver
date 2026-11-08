@@ -39,10 +39,9 @@
 //                         no branch can take, so it must be linked to the drop
 //                         funnel instead of being left unlinked (which fails
 //                         tsdemux with "streaming stopped, reason=not-linked").
-//   copy-video-only       copy-only tier fed a video-only MPEG-TS clip. The
-//                         audio branch receives nothing, so the 4 s probe
-//                         retires the muxer's capless audio pad and video alone
-//                         publishes.
+//   copy-video-only       copy-only tier fed a video-only MPEG-TS clip. No audio
+//                         pad is announced, so the muxer's audio pad is never
+//                         requested and video alone publishes.
 //
 // Exit status 0 = observed behaviour matched the mode's expectation, 1 = it did
 // not (or the harness could not run). The numbers are always printed.
@@ -58,6 +57,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -146,8 +146,8 @@ struct options
 }
 
 // transcode-av1 is fed an AV1 MPEG-TS that carries no audio, so it takes the
-// same video-only path as transcode-video-only (the audio-pad probe must
-// retire the capless pad).
+// same video-only path as transcode-video-only: no audio pad is announced and
+// none is requested on the muxer.
 [[nodiscard]] auto has_audio(mode m) -> bool
 {
   return m == mode::transcode_av || m == mode::copy_av
@@ -656,6 +656,10 @@ struct instruments
   // Order in which tsdemux exposed its src pads, with each pad's caps name. This
   // is what says whether a run actually exercised the audio-first order.
   std::vector<std::string> demux_pads;
+  // Mux sink pads already carrying a counting probe. The muxer's audio pad is
+  // requested only when the source TS exposes an audio pad, so it can appear
+  // after the pipeline started and has to be picked up then.
+  std::set<std::string> probed_mux_pads;
   std::vector<std::string> bus_events;
   std::vector<std::string> output_log;
 
@@ -782,6 +786,54 @@ auto demux_pad_added_order(GstElement* /*demux*/, GstPad* pad, gpointer data)
   inst->demux_pads.push_back(entry);
 }
 
+// Count what each of the muxer's sink pads receives, once per pad. The audio pad
+// is a request pad the output asks for when the source TS carries audio, so a
+// pad that appears mid-run is picked up by the next call.
+auto attach_mux_sink_probes(instruments& inst) -> void
+{
+  if (inst.pipeline == nullptr) {
+    return;
+  }
+  GstElement* mux = gst_bin_get_by_name(GST_BIN(inst.pipeline), "mux");
+  if (mux == nullptr) {
+    return;
+  }
+  GstIterator* it = gst_element_iterate_sink_pads(mux);
+  GValue item = G_VALUE_INIT;
+  bool done = false;
+  while (!done) {
+    switch (gst_iterator_next(it, &item)) {
+      case GST_ITERATOR_OK: {
+        auto* pad = GST_PAD(g_value_get_object(&item));
+        const std::string pad_name = GST_PAD_NAME(pad) != nullptr
+            ? GST_PAD_NAME(pad)
+            : "?";
+        bool fresh = false;
+        {
+          std::lock_guard<std::mutex> guard(inst.mutex);
+          fresh = inst.probed_mux_pads.insert(pad_name).second;
+        }
+        if (fresh) {
+          gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, &mux_sink_probe,
+                            &inst, nullptr);
+        }
+        g_value_reset(&item);
+        break;
+      }
+      case GST_ITERATOR_RESYNC:
+        gst_iterator_resync(it);
+        break;
+      case GST_ITERATOR_ERROR:
+      case GST_ITERATOR_DONE:
+        done = true;
+        break;
+    }
+  }
+  g_value_unset(&item);
+  gst_iterator_free(it);
+  gst_object_unref(mux);
+}
+
 auto install_instruments(instruments& inst, GstElement* pipeline) -> void
 {
   inst.pipeline = GST_ELEMENT(gst_object_ref(pipeline));
@@ -823,30 +875,13 @@ auto install_instruments(instruments& inst, GstElement* pipeline) -> void
   if (mux == nullptr) {
     return;
   }
-  GstIterator* it = gst_element_iterate_sink_pads(mux);
-  GValue item = G_VALUE_INIT;
-  bool done = false;
-  while (!done) {
-    switch (gst_iterator_next(it, &item)) {
-      case GST_ITERATOR_OK: {
-        auto* pad = GST_PAD(g_value_get_object(&item));
-        gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, &mux_sink_probe,
-                          &inst, nullptr);
-        g_value_reset(&item);
-        break;
-      }
-      case GST_ITERATOR_RESYNC:
-        gst_iterator_resync(it);
-        break;
-      case GST_ITERATOR_ERROR:
-      case GST_ITERATOR_DONE:
-        done = true;
-        break;
-    }
-  }
-  g_value_unset(&item);
-  gst_iterator_free(it);
+  gst_object_unref(mux);
+  attach_mux_sink_probes(inst);
 
+  mux = gst_bin_get_by_name(GST_BIN(inst.pipeline), "mux");
+  if (mux == nullptr) {
+    return;
+  }
   GstPad* src = gst_element_get_static_pad(mux, "src");
   if (src != nullptr) {
     gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &mux_src_probe, &inst,
@@ -1279,6 +1314,9 @@ auto main(int argc, char** argv) -> int
 
     if (now >= next_poll) {
       next_poll = now + std::chrono::milliseconds {500};
+      // Pick up a mux sink pad that did not exist when the run started: the
+      // output requests the audio pad only once the source TS shows audio.
+      attach_mux_sink_probes(inst);
       stat_probe probe = fetch_server_bytes(opts.stat_url);
       if (probe.bytes_in) {
         last_server = probe.bytes_in;
@@ -1550,7 +1588,7 @@ auto main(int argc, char** argv) -> int
   }
   if (opts.run_mode == mode::transcode_video_only && server_grew
       && audio_dropped) {
-    std::printf("audio unlink         the audio-pad probe dropped the capless pad "
+    std::printf("audio pad            never requested: the TS carries no audio, "
                 "and video still published\n");
   }
 

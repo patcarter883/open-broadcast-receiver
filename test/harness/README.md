@@ -1,46 +1,51 @@
-# Local RTMP publish harness
+# Local harnesses
 
-Two harnesses, both publishing to a throwaway local RTMP server:
+Two runners, both publishing to a throwaway local server and both judging the run
+by what the server received.
 
-| harness | what it proves |
+| runner | what it proves |
 | --- | --- |
+| `receiver_e2e_local.sh` | the whole product path: AV1-in-MPEG-TS over RIST → decode → frame ring → transcode → RTMP |
 | `rtmp_publish_harness.sh` | the `output` object publishes, driven in-process with fixtures (no RIST, no decode) |
-| `rist_av1_publish_e2e.sh` | the whole product path: AV1-in-MPEG-TS over RIST → decode → frame ring → transcode → RTMP |
 
-## `rist_av1_publish_e2e.sh` — the end-to-end proof
+## `receiver_e2e_local.sh` — the end-to-end proof
 
-    test/harness/rist_av1_publish_e2e.sh [seconds]
+    test/harness/receiver_e2e_local.sh
 
-It builds a synthetic AV1+AAC MPEG-TS with the encoder's own muxing
+It generates an AV1-in-MPEG-TS fixture with the encoder's own muxing
 (`mpegtsmux alignment=7 enable-custom-mappings=true`, AV1 carried as stream type
-`0x06` with registration `AV1G`), checks that `tsdemux` exposes `video/x-av1` on
-it, starts a local `mediamtx`, starts the receiver binary from this tree, and
-POSTs `/start` with an AV1 source and an RTMP output that transcodes to H.264.
-`test/tools/rist_feed` then sends the TS over a real RIST socket (ADVANCED
-profile, 7×188-byte chunks), so the RIST listener, the decode stage, the frame
-ring and the output are all the product's own code.
+`0x06` with registration `AV1G`), proves `tsdemux` exposes `video/x-av1` on it,
+starts a local `mediamtx`, starts this tree's receiver binary, and POSTs `/start`
+with an AV1 RIST source and an RTMP output that transcodes to H.264.
+`test/tools/rist_feed` sends the TS over a real RIST socket in 7×188-byte
+datagrams, so the RIST listener, the decode stage, the frame ring and the output
+are all the product's own code. Nothing leaves the machine and nothing needs the
+capture box.
 
-Sample run (30 s):
+Sample run (300-frame fixture, 10 s of ingest):
 
 ```
-t    bytes_sent     state        recon  dropped   recorded_bytes
-6s   34080376       running      0      0         0
-12s  169670900      running      0      105       808516
-24s  313669832      running      0      405       2266804
-36s  441003520      running      0      593       3830022
+t    rist_recv ts_in    out_state out_bytes_sent frames_dropped reconnects sink_path:ready  sink_bytes_received
+4    500       947520   running   39654720       0              0          none:false       0
+5    509       1705536  running   94263168       0              0          live/e2e:true    740250
+8    478       3854564  running   252686564      0              0          live/e2e:true    1891712
+12   0         6319432  running   418274632      0              0          live/e2e:true    3097955
 
-bytes_sent: first=34080376 last=441003520 delta=406923144
-recorded:   3830022 bytes   publishing_logged=1   reconnects=0
-last segment: 20261108-191557.mp4 2.465000s h264,1280,720 (aac,48000,2)
-PASS
+[decoder] in=207 chunks/6171 KiB demux=433 decoded=298 sink=298 level=0 KiB dec=vaav1dec fallback=0 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
+sink bytesReceived   740250 -> 3097955 (growth 2357705)
+output state         running in 11 sample(s), reconnects 0
+read back from sink  codec_name=h264 width=1280 height=720 nb_read_frames=92 (905347 B pulled)
+VERDICT: PUBLISHES — 298 frames decoded by vaav1dec, sink received 2357705 B,
+         and a decodable H.264 stream reads back out of the RTMP server
 ```
 
-PASS requires all of: `bytes_sent` grew, the output never reconnected, mediamtx
-logged `is publishing to path 'live/e2e'`, and mediamtx wrote at least 256 KiB
-of media. The last word is the sink's own file, which is probed for an H.264
-video track at the ingest resolution and an AAC 48 kHz stereo track.
+The verdict needs all of: a `running` output, `reconnects 0` (a publish that only
+happened across rebuilt attempts is not a publish), the sink's own counter growing
+by ≥ 32 KiB, and an H.264 stream at the ingest resolution read back out of the
+server. `bytes_sent` is printed but never decides: for a transcode output it counts
+NV12 frames pushed into the appsrc and grows even when nothing reaches RTMP.
 
-Two configuration facts the harness depends on:
+Two configuration facts it depends on:
 
 - **The receiver refuses loopback destinations.** `classify()` treats `127.0.0.0/8`
   as `loopback` regardless of `--egress-allow-private`, so the harness publishes
@@ -49,30 +54,27 @@ Two configuration facts the harness depends on:
 - **The RTMP URL is the app, `key_or_streamid` is the stream.** `url` +
   `key_or_streamid` become rtmp2sink's `application` and `stream`; putting the
   stream name in the URL publishes to an application nothing serves, and the
-  connection then sits idle until the sink's stall watchdog rebuilds it.
+  connection then sits idle until the stall watchdog rebuilds it.
 
-`mediamtx` is used because it is already installed on the build boxes; its
-record directory (`build/e2e/rec/<app>/<stream>/`) is the measured artifact. It
-needs no container and no config beyond the one the harness writes.
+A reused fixture is fed at its own frame count: `make-av1-ts-fixture.sh` writes a
+`<fixture>.meta` sidecar and the harness derives the feed rate from it, so a
+fixture built with `FIXTURE_FRAMES=150` is not fed at half speed.
 
-### Defects this harness found
+### What the e2e run pins down
 
-Both made a healthy-looking pipeline never publish:
-
-- **The audio branch's demux was chained to whichever pad appeared first.** The
-  transcode template wrote `tsdemux name=ad queue name=aq ! aacparse …`. For an
-  AV1+AAC multiplex the demuxer exposes the video pad first, so the video PID
-  occupied the audio chain (`aacparse` then refused it) and the audio pad had no
-  peer at all — `tsdemux` returned `NOT_LINKED` and flvmux never emitted. Fixed by
-  leaving `tsdemux` unchained and linking every pad explicitly in
-  `demux_pad_added`: audio to `aq`, everything else to a `funnel ! fakesink
-  async=false` drop branch.
-- **Decoded frames with no PTS were published at 0.** `vaav1dec` leaves PTS unset
-  for a frame whose PES carried none (and emits no DTS). Publishing those as 0
-  put a frame at the head of the timeline mid-stream, so flvmux/rtmp2sink held
-  the frames after it: the publish ran in ~5 s bursts and the stall watchdog
-  rebuilt the output every cycle. `pts_synth` now gives the destination a
-  monotonic timeline, with a unit test in `test/source/pts_synth_test.cpp`.
+- **Pad order cannot decide routing.** A `tsdemux` pad reaches the branch its caps
+  belong to, linked in `output::demux_pad_added`; a chained template link binds
+  whichever pad arrives first, and an AV1+AAC multiplex announces video first.
+  Any pad no branch claims goes to the `ddrop` funnel, because an unlinked demux
+  pad fails the pipeline with `NOT_LINKED`.
+- **The published timeline is monotonic.** `vaav1dec` leaves PTS unset for a
+  frame whose PES carried none and emits no DTS. Publishing those as 0 puts a
+  frame at the head of the timeline mid-stream, and the destination's muxer then
+  holds every frame after it. `pts_synth` gives the frames a monotonic timeline,
+  covered by `test/source/pts_synth_test.cpp`.
+- **Nothing time-based gates the first frame.** The muxer's audio pad is requested
+  only when the source TS exposes an audio pad, so a video-only ingest publishes on
+  its first encoded frame.
 
 ## `rtmp_publish_harness.sh` — the output object in-process
 
@@ -166,12 +168,12 @@ Against `alfg/nginx-rtmp` on this box, with `vah264enc`:
 
 | mode | result | numbers |
 | --- | --- | --- |
-| `transcode-av` | PASS | 61 frames pushed, 61 video + 90 audio buffers at the muxer, 138 emitted, server +608 689 B; encoder input `video/x-raw,format=NV12`; muxer video `profile=high, chroma-format=4:2:0, bit-depth-luma=8` |
-| `copy-av` | PASS | `fixture pad order video_0_0041 audio_0_0042`; 69 video + 109 audio buffers at the muxer, 90 emitted, server +283 023 B |
-| `copy-audio-first` | PASS | `fixture pad order audio_0_0041 video_0_0042` (audio announced first); 69 video + 109 audio buffers at the muxer, 90 emitted, server +283 029 B |
-| `copy-non-aac` | PASS | `fixture pad order video_0_0041 audio_0_0042`; AC-3 pad sunk, 112 video buffers at the muxer, 87 emitted, server +678 726 B |
-| `copy-video-only` | PASS | `fixture pad order video_0_0041`; 112 video buffers at the muxer, 87 emitted, no audio buffer, server +678 726 B |
-| `transcode-video-only` | PASS | 109 video buffers at the muxer, 132 emitted, server +1 190 073 B, no audio buffer at the muxer |
+| `transcode-av` | PASS | 61 frames pushed, 61 video + 70 audio buffers at the muxer, 178 emitted, server +705 561 B; encoder input `video/x-raw,format=NV12`; muxer video `profile=high, chroma-format=4:2:0, bit-depth-luma=8` |
+| `transcode-video-only` | PASS | 61 frames pushed, 61 video buffers at the muxer, 82 emitted, no audio buffer, server +681 789 B |
+| `copy-av` | PASS | `demux pad order video_0_0041 (video/x-h264), audio_0_0042 (audio/mpeg)`; 69 video + 92 audio buffers at the muxer, 90 emitted, server +283 029 B |
+| `copy-audio-first` | PASS | `demux pad order audio_0_0041 (audio/mpeg), video_0_0042 (video/x-h264)` (audio announced first); 69 video + 91 audio buffers at the muxer, 90 emitted, server +283 032 B |
+| `copy-non-aac` | PASS | `demux pad order video_0_0041 (video/x-h264), audio_0_0042 (audio/x-ac3)`; the AC-3 pad is sunk, 69 video buffers at the muxer, 39 emitted, no audio buffer, server +264 020 B |
+| `copy-video-only` | PASS | `demux pad order video_0_0041 (video/x-h264)`; 68 video buffers at the muxer, 39 emitted, no audio pad requested at all, server +264 023 B |
 
 The H.264 fixtures state `format=NV12` and nothing wider: an unpinned
 `videotestsrc ! x264enc` negotiates High 4:4:4 10-bit on this box, which is not
@@ -188,7 +190,7 @@ audio appsrc: doing nothing yields 0 muxer buffers over the next 4 s, unlinking
 the peer also yields 0, and unlinking then pushing EOS on the muxer's audio sink
 pad yields 273.
 
-No timer is involved in the merged templates: the audio branch ends at
+No timer is involved in either tier's template: the audio branch ends at
 `capsfilter name=acaps` and the muxer's audio pad is requested by
 `output::attach_audio_branch` only when the source TS exposes an audio pad. A
 video-only ingest never gives flvmux a pad to wait on, so video publishes on the
