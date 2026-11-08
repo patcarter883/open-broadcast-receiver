@@ -117,7 +117,7 @@ rm -f "$out"
 # -e: send EOS so the muxer flushes the final PSI/PES before the filesink closes.
 if ! gst-launch-1.0 -e -q \
     videotestsrc num-buffers="$frames" pattern=smpte is-live=false \
-    ! video/x-raw,format=I420,width=1280,height=720,framerate=30/1 \
+    ! video/x-raw,format=I420,width="${FIXTURE_WIDTH:-1280}",height="${FIXTURE_HEIGHT:-720}",framerate=30/1 \
     ! videoconvert \
     ! "$encoder" $enc_args \
     ! av1parse \
