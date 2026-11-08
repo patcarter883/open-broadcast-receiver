@@ -40,6 +40,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     libva2 libva-drm2 mesa-va-drivers \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 10001 -m obr
+# Address-family policy: the node networks carry no IPv6 route, so every
+# getaddrinfo() caller in this image (rtmp2sink included) must rank IPv4 above
+# IPv6 when a name answers both. Without it, the first returned address can be
+# an IPv6 one the container cannot reach, and the publish never connects.
+RUN printf '%s\n' '# IPv4 first: this image runs on nodes without an IPv6 route.' \
+                  'precedence ::ffff:0:0/96 100' > /etc/gai.conf
 COPY --from=build /src/build/open-broadcast-receiver /usr/local/bin/
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

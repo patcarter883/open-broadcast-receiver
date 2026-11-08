@@ -13,6 +13,29 @@ Runtime packages are GStreamer (`good`/`bad`/`ugly`/`libav`) plus
 radeonsi (AMD) driver used by this deployment; Intel `iHD`/`i965` drivers are
 deliberately absent.
 
+## Address family
+
+The image ships `/etc/gai.conf` with:
+
+```
+precedence ::ffff:0:0/96 100
+```
+
+Node networks carry no IPv6 route, so every `getaddrinfo()` caller in the image
+must rank IPv4 above IPv6 for a name that answers both families. Without the
+policy, `GResolver` (what `rtmp2sink`'s `GSocketClient` uses) returns the IPv6
+answer first whenever the container has any IPv6 address configured, and the
+publish attempts an unroutable address. The file is a normal image layer, so it
+survives container start; no per-run DNS flags or `--add-host` pins are needed,
+and no destination address is hardcoded.
+
+Verify from a container built from this image:
+
+```sh
+docker run --rm --entrypoint bash obr-receiver:local -c \
+  'getent ahosts a.rtmp.youtube.com'
+```
+
 ## Build
 
 ```

@@ -30,14 +30,17 @@
 //
 // A decoder failure is contained: the feeder logs and stops producing, the
 // session and copy outputs are unaffected, and transcode outputs simply idle.
-// Where each tsdemux src pad goes. BOTH are required: tsdemux returns
-// GST_FLOW_NOT_LINKED while it has no linked src pad, and the live ingest exposes
-// its audio pad before its video pad -- so a stage that consumes only the video pad
-// dies on its first push and never reaches the video pad at all. The non-video pads
-// are sunk to remove that race (and because this stage does not decode audio).
+// Where each tsdemux src pad goes. Both destinations exist in the bin from
+// build_pipeline(): tsdemux returns GST_FLOW_NOT_LINKED while it has no linked
+// src pad, and the live ingest exposes its AUDIO pad before its video pad, so
+// every non-video pad needs somewhere to go the moment it appears.
+//
+// `other` is a funnel, not a single sink: it accepts one request pad per
+// non-video stream (audio, subtitles, anything else) and the pipeline never has
+// to have an element added to it from a streaming thread.
 struct pad_targets {
   GstElement* video = nullptr;  // transcode branch: queue -> parser -> decoder
-  GstElement* other = nullptr;  // everything else, sunk
+  GstElement* other = nullptr;  // funnel every non-video pad is linked into
 };
 
 class decoder
@@ -70,6 +73,21 @@ public:
   {
     return m_failed.load(std::memory_order_relaxed);
   }
+
+  // One sample of the staged counters and the state the pipeline reached. The
+  // periodic log line renders the same data; this accessor exists so a test can
+  // assert on it instead of parsing text.
+  struct stage_counters {
+    std::uint64_t in_chunks = 0;
+    std::uint64_t demux_buffers = 0;
+    std::uint64_t decoder_buffers = 0;
+    std::uint64_t sink_buffers = 0;
+    GstState state = GST_STATE_VOID_PENDING;
+    bool stalled = false;
+    bool failed = false;
+  };
+
+  [[nodiscard]] auto counters() const -> stage_counters;
 
 private:
   auto worker() -> void;
@@ -107,6 +125,7 @@ private:
   std::atomic<std::uint64_t> m_sink_buffers {0};
   // Set while the decode appsrc sits at its byte limit; the feed thread keeps
   // polling rather than blocking, so this only drives the stall report.
+  std::atomic_bool m_stalled {false};
   std::chrono::steady_clock::time_point m_stall_since {};
 
   GstElement* m_pipeline = nullptr;
