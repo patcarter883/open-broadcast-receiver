@@ -156,7 +156,6 @@ auto classify_drain_hold(std::chrono::milliseconds held, bool published)
   return held > output_timing::connect_timeout
       ? drain_verdict::publish_not_established
       : drain_verdict::keep_waiting;
-
 }
 
 output::output(output_config cfg,
