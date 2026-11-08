@@ -76,5 +76,7 @@ docker buildx build "${args[@]}" "$REPO_ROOT"
 
 if [ "$push" = 0 ] && [ "$PLATFORMS" = "linux/amd64" ]; then
     printf '\nbuild-image: %s\n' "$(docker image inspect --format '{{.Id}}' "$IMAGE:$TAG")"
-    printf 'build-image: tags %s:%s %s:latest\n' "$IMAGE" "$TAG" "$IMAGE"
+    printf 'build-image: tag %s:%s' "$IMAGE" "$TAG"
+    [ "$latest" = 1 ] && printf ' and %s:latest' "$IMAGE"
+    printf '\n'
 fi

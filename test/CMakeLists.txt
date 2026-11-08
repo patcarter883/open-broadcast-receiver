@@ -48,4 +48,16 @@ if(NOT OBR_TESTS_ONLY)
     Threads::Threads)
   target_compile_features(pipeline_build_test PRIVATE cxx_std_20)
   add_test(NAME pipeline_build_test COMMAND pipeline_build_test)
+
+  # decode_file drives the receiver's real decode stage from a local MPEG-TS
+  # fixture. It needs a working VA (or software) decoder and a fixture, so it is
+  # a manual tool, not a ctest entry:
+  #   ./build/test/decode_file /tmp/av1.ts av1
+  add_executable(decode_file tools/decode_file.cpp)
+  target_link_libraries(decode_file PRIVATE
+    fanout_lib
+    PkgConfig::gstreamer
+    PkgConfig::gstreamer-app
+    Threads::Threads)
+  target_compile_features(decode_file PRIVATE cxx_std_20)
 endif()

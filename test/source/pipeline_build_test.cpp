@@ -135,6 +135,11 @@ auto main() -> int
            "decoder NV12 appsink");
     expect(has(av1, "block=false") && !has(av1, "block=true"),
            "decode appsrc never blocks the feed thread");
+    // The drop sink must never be able to hold the pipeline in preroll: a sink
+    // that has no data yet keeps the bin ASYNC forever with no error, which is
+    // exactly how the decode stage produced zero frames.
+    expect(has(av1, "fakesink sync=false async=false"),
+           "decode drop sink does not gate preroll");
     expect(parses(av1), "av1 decoder template parses");
 
     const std::string h264d =
