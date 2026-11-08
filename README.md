@@ -51,6 +51,12 @@ cmake -S . -B build -D CMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
+Container image (tagged with the commit's short SHA plus `:latest`):
+
+```sh
+make image          # see docs/IMAGE.md
+```
+
 No encoder/decoder elements are needed — ever. The receiver validates the
 required mux/sink elements at `POST /start` and returns
 `400 element_unavailable` rather than launching a broken pipeline.

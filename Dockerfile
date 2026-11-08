@@ -14,7 +14,10 @@
 # `enable-custom-mappings`, without which AV1 cannot be muxed into MPEG-TS at all
 # ("custom mappings for which there are no official specifications"). A relaxed
 # floor did not merely tolerate an old version, it hid the gap.
-FROM debian:sid AS build
+# BASE_IMAGE is an override hook only. The default is the floating tag; the
+# reproducible path pins the digest recorded in docker/base-image.lock.
+ARG BASE_IMAGE=debian:sid
+FROM ${BASE_IMAGE} AS build
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential cmake meson ninja-build pkg-config git \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev nlohmann-json3-dev \
@@ -25,7 +28,7 @@ COPY . .
 RUN cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -D BUILD_TESTING=OFF \
     && cmake --build build -j"$(nproc)"
 
-FROM debian:sid
+FROM ${BASE_IMAGE}
 # libva2 + mesa-va-drivers are REQUIRED, not optional: the transcode tier prefers
 # vah264enc/vah265enc/vaav1dec (see transcode_encoder_alternatives), and without
 # the VAAPI *driver* those elements exist but fail to initialise -- the tier then
