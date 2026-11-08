@@ -36,10 +36,18 @@ constexpr int k_publish_burst = 8;
 // preroll, and it is the bound that turns a silently wedged hardware decoder
 // (pipeline parked in ASYNC, no bus error) into a fallback instead of a stall.
 constexpr auto k_attempt_window = std::chrono::seconds(3);
+constexpr auto k_ingest_wait = std::chrono::seconds(10);
 
 auto now_steady() -> std::chrono::steady_clock::time_point
 {
   return std::chrono::steady_clock::now();
+}
+
+auto steady_ns() -> std::int64_t
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             now_steady().time_since_epoch())
+      .count();
 }
 
 auto registry_has_element(const char* name) -> bool
@@ -417,8 +425,10 @@ auto decoder::start_attempt(std::size_t index, std::string& err) -> bool
                   gst_element_state_change_return_get_name(scr),
                   gst_element_state_get_name(pending)));
 
-  m_attempt_start = now_steady();
-  m_attempt_base_decoder = m_decoder_buffers.load(std::memory_order_relaxed);
+  m_attempt_start_ns.store(steady_ns(), std::memory_order_relaxed);
+  m_attempt_base_decoder.store(
+      m_decoder_buffers.load(std::memory_order_relaxed),
+      std::memory_order_relaxed);
   m_stall_since = std::chrono::steady_clock::time_point {};
   return true;
 }
@@ -513,19 +523,36 @@ auto decoder::check_attempt_health() -> bool
   // dead: av1parse on this box posts NOT_NEGOTIATED while the pipeline is still
   // prerolling, so the error can arrive after -- or not at all -- and this
   // window is what still makes the stage recover.
-  if (m_pipeline != nullptr && m_in_chunks.load(std::memory_order_relaxed) > 0
-      && m_attempt_start != std::chrono::steady_clock::time_point {}
-      && now_steady() - m_attempt_start >= k_attempt_window
-      && m_decoder_buffers.load(std::memory_order_relaxed)
-             == m_attempt_base_decoder) {
-    GstState st = GST_STATE_VOID_PENDING;
-    GstState pending = GST_STATE_VOID_PENDING;
-    gst_element_get_state(m_pipeline, &st, &pending, 0);
-    log_stats();
-    return degrade(std::format("no decoded frame in {} s (state={}, pending={})",
-                               k_attempt_window.count(),
-                               gst_element_state_get_name(st),
-                               gst_element_state_get_name(pending)));
+  const auto attempt_start_ns = m_attempt_start_ns.load(std::memory_order_relaxed);
+  const bool fed = m_in_chunks.load(std::memory_order_relaxed) > 0;
+  const auto window = (fed || m_ever_fed.load(std::memory_order_relaxed))
+                          ? k_attempt_window
+                          : k_ingest_wait;
+  if (m_pipeline != nullptr && attempt_start_ns != 0
+      && steady_ns() - attempt_start_ns
+             >= std::chrono::duration_cast<std::chrono::nanoseconds>(window)
+                    .count()) {
+    if (!fed) {
+      GstState st = GST_STATE_VOID_PENDING;
+      GstState pending = GST_STATE_VOID_PENDING;
+      gst_element_get_state(m_pipeline, &st, &pending, 0);
+      log_stats();
+      return degrade(std::format("no TS chunk in {} s (state={}, pending={})",
+                                 k_ingest_wait.count(),
+                                 gst_element_state_get_name(st),
+                                 gst_element_state_get_name(pending)));
+    }
+    if (m_decoder_buffers.load(std::memory_order_relaxed)
+        == m_attempt_base_decoder.load(std::memory_order_relaxed)) {
+      GstState st = GST_STATE_VOID_PENDING;
+      GstState pending = GST_STATE_VOID_PENDING;
+      gst_element_get_state(m_pipeline, &st, &pending, 0);
+      log_stats();
+      return degrade(std::format("no decoded frame in {} s (state={}, pending={})",
+                                 k_attempt_window.count(),
+                                 gst_element_state_get_name(st),
+                                 gst_element_state_get_name(pending)));
+    }
   }
   return false;
 }
@@ -671,6 +698,11 @@ auto decoder::worker() -> void
           log("first TS chunk fed to the decode stage: " + std::to_string(got)
               + " bytes\n");
           announced_first_feed = true;
+          m_ever_fed.store(true, std::memory_order_relaxed);
+          m_attempt_start_ns.store(steady_ns(), std::memory_order_relaxed);
+          m_attempt_base_decoder.store(
+              m_decoder_buffers.load(std::memory_order_relaxed),
+              std::memory_order_relaxed);
         }
         GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
         gst_buffer_fill(gbuf, 0, tsbuf.data(), got);
