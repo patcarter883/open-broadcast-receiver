@@ -169,6 +169,9 @@ private:
   bool m_audio_probe_done {false};
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};
+  // Buffers the muxer's audio pad actually received. Caps on that pad are not
+  // data; a linked pad with no buffers is how flvmux stalls without an error.
+  std::atomic<uint64_t> m_audio_frames {0};
   std::atomic<int64_t> m_running_since_ms {0};  // steady ms; 0 = not running
 
   // Raw-frame read buffer for the frame_ring cursor (capacity()-sized; the
