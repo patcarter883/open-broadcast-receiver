@@ -140,6 +140,9 @@ private:
   // Set the encoded appsrc caps (raw NV12) from a decoded frame's metadata.
   auto set_video_caps(std::size_t frame_bytes,
                       const frame_ring::frame_meta& meta) -> void;
+  // Report the caps arriving at the muxer's video pad, once per attempt:
+  // profile, chroma format and bit depth are what a destination refuses first.
+  auto log_muxer_input() -> void;
   auto build_pipeline(std::string& err) -> bool;
   auto destroy_pipeline() -> void;
   auto set_state(run_state next) -> void;
@@ -175,6 +178,7 @@ private:
   std::chrono::steady_clock::time_point m_stall_since {};
   std::chrono::steady_clock::time_point m_run_started {};
   bool m_audio_probe_done {false};
+  bool m_muxer_input_logged {false};
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};
   // Buffers the muxer's audio pad actually received. Caps on that pad are not

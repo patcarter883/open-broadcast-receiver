@@ -167,16 +167,19 @@ private:
   std::size_t m_attempt = 0;
   std::string m_decoder_name;
   mutable std::mutex m_name_mutex;  // guards m_decoder_name for the accessor
-  // Measured from the first TS chunk, not from pipeline build: the stream can
-  // start seconds after /start, and a window that expires before any data
-  // arrives would call a healthy decoder dead. Both are written by the feed
-  // thread and read by the monitor thread.
+  // Both health clocks are armed by data arriving, never by pipeline build: the
+  // stream can start seconds after /start, and a window that expires before any
+  // data arrives would call a healthy decoder dead. 0 means "not armed yet".
+  // m_attempt_start_ns is the no-decoded-frame clock, armed at the first video
+  // buffer tsdemux hands the branch; m_attempt_feed_start_ns is the
+  // no-video-from-tsdemux clock, armed at the first TS chunk fed to this attempt.
   std::atomic<std::int64_t> m_attempt_start_ns {0};
+  std::atomic<std::int64_t> m_attempt_feed_start_ns {0};
+  // Counter values at the moment the attempt was built, so each clock measures
+  // progress made by THIS attempt rather than by any that preceded it.
+  std::atomic<std::uint64_t> m_attempt_base_in {0};
+  std::atomic<std::uint64_t> m_attempt_base_demux {0};
   std::atomic<std::uint64_t> m_attempt_base_decoder {0};
-  // Whether the stage has ever received a TS chunk. The first wait is longer:
-  // a session's stream legitimately starts seconds after /start, whereas a
-  // retry that has already seen data and gets nothing is a failed attempt.
-  std::atomic<bool> m_ever_fed {false};
   bool m_simulate_failure = false;
 
   // Decode-stage counters, read only by the periodic line: TS chunks pushed into

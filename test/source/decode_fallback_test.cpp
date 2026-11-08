@@ -271,6 +271,9 @@ auto contains(const std::vector<std::string>& lines, const std::string& needle)
 // RIST callback does.
 auto feed(ts_ring& ring, const std::vector<std::uint8_t>& bytes) -> void
 {
+  if (bytes.empty()) {
+    return;
+  }
   const std::size_t datagrams = (bytes.size() + k_datagram - 1) / k_datagram;
   const auto period = std::chrono::duration<double> {
       k_feed_seconds / static_cast<double>(datagrams)};
@@ -287,7 +290,8 @@ auto feed(ts_ring& ring, const std::vector<std::uint8_t>& bytes) -> void
 }
 
 auto run_bytes(const std::vector<std::uint8_t>& bytes, bool simulate_failure,
-               std::chrono::seconds drain = k_drain) -> run_result
+               std::chrono::seconds drain = k_drain,
+               bool keep_feeding = false) -> run_result
 {
   run_result result;
   ts_ring ring {ts_ring::size_for_bandwidth(20000)};
@@ -303,6 +307,15 @@ auto run_bytes(const std::vector<std::uint8_t>& bytes, bool simulate_failure,
     return result;
   }
   feed(ring, bytes);
+  if (keep_feeding) {
+    // A live stream keeps arriving: an attempt that is retired and rebuilt must
+    // be fed again by the same input, which is what makes the chain exhaust.
+    const auto started = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - started < drain) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      feed(ring, bytes);
+    }
+  }
   std::this_thread::sleep_for(drain);
   result.frames = dec.frames().head();
   result.failed = dec.failed();
@@ -481,14 +494,30 @@ auto main(int argc, char** argv) -> int
   // window can retire the attempt. With nothing decodable the stage must end
   // failed rather than retry forever.
   {
-    // Both attempts must exhaust their own window, so the drain outlasts two
-    // of them.
+    // Both attempts must exhaust their own window, so the drain outlasts two of
+    // them, and the junk keeps arriving so the rebuilt attempt is fed too.
     const std::vector<std::uint8_t> junk(16 * 1024, 0x00);
-    const auto r = run_bytes(junk, false, std::chrono::seconds(6));
+    const auto r = run_bytes(junk, false, std::chrono::seconds(14), true);
     check(r.failed, "undecodable input leaves the stage failed");
     check(contains(r.log, "no decoder left for av1"),
           "the chain is exhausted rather than retried forever");
     check(r.frames == 0, "no frames are fabricated from undecodable input");
+  }
+
+  // ---- 6. a stream that has not started yet is not a decoder failure ------
+  // The stream arrives seconds after /start. Neither health clock may run before
+  // data does, or the hardware decoder is retired as "no decoded frame" and the
+  // session silently runs on the software one.
+  {
+    const auto r = run_bytes({}, false, std::chrono::seconds(8));
+    check(!r.failed, "a stage with no TS yet does not fail");
+    check(r.decoder == "vaav1dec" && !r.fallback,
+          "the hardware decoder is still the attempt after 8 s of silence, got "
+              + r.decoder);
+    check(!contains(r.log, "failed:"),
+          "no decoder is retired while nothing has arrived");
+    check(count_of(r.log, "[decoder] in=0 chunks") >= 1,
+          "the periodic line reports the silence while it lasts");
   }
 
   std::filesystem::remove_all(dir);

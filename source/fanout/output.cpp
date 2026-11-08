@@ -238,6 +238,17 @@ auto output_template(output_proto proto,
   const std::string enc = encoder != nullptr ? encoder : "";
   const std::string parse = transcode_target_parser(transcode.target);
 
+  // The encoder is handed 4:2:0 8-bit and nothing else. Every destination this
+  // product serves is 4:2:0, the decode stage publishes NV12, and the two
+  // encoders' sink caps are wide (x264enc lists Y444/I422/I420_10LE, vah264enc
+  // lists the VA memory variants of the same set) -- so an unconstrained link
+  // lets negotiation pick a 4:4:4 or 10-bit layout, and the muxer then carries a
+  // High 4:4:4 10-bit stream that the destination cannot decode. The filter
+  // states the format rather than converting it: a stream that does not satisfy
+  // it fails to negotiate instead of silently changing profile. Placed after the
+  // scaler so the scaler's own output is constrained by it too.
+  constexpr std::string_view k_raw_nv12 = "video/x-raw,format=NV12 ! ";
+
   // An output size is applied to the RAW frames BEFORE the encoder, so the
   // destination receives the size it was promised rather than the ingest size.
   //
@@ -297,15 +308,17 @@ auto output_template(output_proto proto,
           // specified at build time; the feed thread starts audio before video
           // and unlinks the mux's audio pad if it has received nothing, so audio
           // can never gate the first video frame.
-          "{}! queue ! {}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
+          "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
           "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=ad "
           "queue name=aq ! aacparse "
           "! audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
           "codec_data=(buffer)1190 ! mux. "
           "{} name=mux streamable=true "
-          "! rtmp2sink name=osink async-connect=true",
+          "! rtmp2sink name=osink async-connect=true "
+          "funnel name=adrop ! fakesink sync=false async=false",
           k_appsrc,
           scale,
+          k_raw_nv12,
           enc,
           parse,
           vcaps,
@@ -322,11 +335,12 @@ auto output_template(output_proto proto,
       const char* custom = transcode.target == transcode_target::av1
           ? " enable-custom-mappings=true" : "";
       return std::format(
-          "{}! queue ! {}{} name=venc ! {} config-interval=-1 "
+          "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 "
           "! mpegtsmux alignment=7{} "
           "! srtsink name=osink wait-for-connection=false",
           k_appsrc,
           scale,
+          k_raw_nv12,
           enc,
           parse,
           custom);
@@ -335,10 +349,11 @@ auto output_template(output_proto proto,
       const char* custom = transcode.target == transcode_target::av1
           ? " enable-custom-mappings=true" : "";
       return std::format(
-          "{}! queue ! {}{} name=venc ! {} config-interval=-1 "
+          "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 "
           "! mpegtsmux alignment=7{} ! ristsink name=osink",
           k_appsrc,
           scale,
+          k_raw_nv12,
           enc,
           parse,
           custom);
@@ -608,7 +623,7 @@ auto output::build_pipeline(std::string& err) -> bool
   return true;
 }
 
-auto output::demux_pad_added(GstElement* /*demux*/,
+auto output::demux_pad_added(GstElement* demux,
                              GstPad* pad,
                              gpointer self) -> void
 {
@@ -617,6 +632,34 @@ auto output::demux_pad_added(GstElement* /*demux*/,
   const bool is_audio = name != nullptr && g_str_has_prefix(name, "audio");
   g_free(name);
   if (!is_audio) {
+    // The transcode audio branch demuxes the source TS only to copy its AAC. A
+    // stream with no audio still exposes its video pad there, and a tsdemux
+    // whose src pad is left unlinked fails the whole pipeline with
+    // "streaming stopped, reason=not-linked" -- the output then reconnects
+    // forever and nothing publishes. Sink those pads into the drop funnel: the
+    // video is already carried by the frame ring, and the copy path links its
+    // own pads from the template.
+    const char* demux_name = GST_OBJECT_NAME(demux);
+    if (demux_name == nullptr || g_strcmp0(demux_name, "ad") != 0) {
+      return;
+    }
+    GstElement* adrop = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "adrop");
+    if (adrop == nullptr) {
+      return;
+    }
+    GstPad* sink = gst_element_request_pad_simple(adrop, "sink_%u");
+    if (sink != nullptr) {
+      if (!gst_pad_is_linked(sink)) {
+        const GstPadLinkReturn lr = gst_pad_link(pad, sink);
+        if (lr != GST_PAD_LINK_OK) {
+          out->log(std::format("non-audio pad from the audio branch could not "
+                               "be sunk ({}); output runs video-only\n",
+                               gst_pad_link_get_name(lr)));
+        }
+      }
+      gst_object_unref(sink);
+    }
+    gst_object_unref(adrop);
     return;
   }
 
@@ -905,7 +948,13 @@ auto output::run_once() -> bool
           terminal = is_codec_terminal(
               gerr, GST_ELEMENT(GST_MESSAGE_SRC(msg)));
           set_last_error(terminal ? "rtmp_codec_unsupported" : text);
-          log("bus error: " + text + "\n");
+          // The element name is ours (venc/mux/h264parse/...), so naming it is
+          // safe and it is the only way to tell a negotiation failure in the
+          // encoder chain from the sink's transport error.
+          GstObject* src_obj = GST_MESSAGE_SRC(msg);
+          const char* who = (src_obj != nullptr && GST_OBJECT_NAME(src_obj))
+              ? GST_OBJECT_NAME(src_obj) : "?";
+          log(std::format("bus error from {}: {}\n", who, text));
           if (gerr != nullptr) {
             g_error_free(gerr);
           }
@@ -1085,6 +1134,7 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
       set_video_caps(vgot, vmeta);
       video_caps_set = true;
     }
+    log_muxer_input();
     GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, vgot, nullptr);
     gst_buffer_fill(gbuf, 0, m_frame_buf.data(), vgot);
     GST_BUFFER_PTS(gbuf) = static_cast<GstClockTime>(vmeta.pts);
@@ -1100,6 +1150,60 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   }
 
   return !m_stopping.load(std::memory_order_acquire);
+}
+
+auto output::log_muxer_input() -> void
+{
+  if (m_muxer_input_logged || m_pipeline == nullptr) {
+    return;
+  }
+  GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
+  if (mux == nullptr) {
+    return;
+  }
+  std::string rendered;
+  GstIterator* it = gst_element_iterate_sink_pads(mux);
+  GValue item = G_VALUE_INIT;
+  bool done = false;
+  while (!done && rendered.empty()) {
+    switch (gst_iterator_next(it, &item)) {
+      case GST_ITERATOR_OK: {
+        auto* pad = GST_PAD(g_value_get_object(&item));
+        const char* name = GST_PAD_NAME(pad);
+        const bool audio = name != nullptr && g_str_has_prefix(name, "audio");
+        if (!audio) {
+          GstCaps* caps = gst_pad_get_current_caps(pad);
+          if (caps != nullptr) {
+            gchar* text = gst_caps_to_string(caps);
+            if (text != nullptr) {
+              rendered = text;
+              g_free(text);
+            }
+            gst_caps_unref(caps);
+          }
+        }
+        g_value_reset(&item);
+        break;
+      }
+      case GST_ITERATOR_RESYNC:
+        gst_iterator_resync(it);
+        break;
+      case GST_ITERATOR_ERROR:
+      case GST_ITERATOR_DONE:
+        done = true;
+        break;
+    }
+  }
+  g_value_unset(&item);
+  gst_iterator_free(it);
+  gst_object_unref(mux);
+  if (rendered.empty()) {
+    return;
+  }
+  // Profile, chroma format and bit depth are what a destination refuses first,
+  // so they are reported from the pad the muxer actually receives.
+  m_muxer_input_logged = true;
+  log(std::format("output {}: muxer video in: {}\n", m_cfg.id, rendered));
 }
 
 auto output::set_video_caps(std::size_t frame_bytes,

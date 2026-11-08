@@ -193,10 +193,20 @@ entry built in its place, when any of these happens:
 - the pinned caps cannot be met (the parser's caps event, or the demux pad's
   caps, do not intersect the decoder's sink caps) — this is the precise form of
   what the bus only calls `not-negotiated`,
-- the attempt posts a bus **error**, or
-- the attempt produces **no decoded frame within 3 s** of its own start while TS
-  bytes have been fed to it — the bound for a decoder that wedges without saying
-  anything, leaving the pipeline in `ASYNC`.
+- the attempt posts a bus **error**,
+- the attempt is fed TS bytes and its `tsdemux` produces **no video buffer within
+  5 s** of the first fed chunk, or
+- the attempt is handed video buffers and produces **no decoded frame within 5 s**
+  of the first one — the bound for a decoder that wedges without saying anything,
+  leaving the pipeline in `ASYNC`.
+
+Both timed windows are armed by data arriving, never by the pipeline being built.
+A session's stream starts seconds after `/start` (RIST holds the first chunks
+until the listener is up), so a clock started at build would retire a healthy
+hardware decoder before its first buffer and silently run the session on the
+software one. The no-frame clock also covers a first GOP that begins mid-stream:
+`tsdemux` hands over buffers from wherever the listener joined, and the decoder
+cannot emit before the next keyframe.
 
 The failure is logged once, naming the element, the stream's real caps and the
 field the decoder refused:
