@@ -1,6 +1,6 @@
 # Local harnesses
 
-Three runners, all publishing to a throwaway local server and all judging the run
+Four runners, all publishing to a throwaway local server and all judging the run
 by what the server received rather than by the receiver's own counters.
 
 | runner | what it proves |
@@ -8,6 +8,7 @@ by what the server received rather than by the receiver's own counters.
 | `receiver_e2e_local.sh` | the whole product path from an AV1-only TS: RIST → decode → frame ring → transcode → RTMP, with the sink's byte count and a stream read back out of the server |
 | `rist_av1_publish_e2e.sh` | the same path from an AV1+AAC TS, judged by the media the sink recorded |
 | `rtmp_publish_harness.sh` | the `output` object alone, driven in-process per mode (no RIST, no decode) |
+| `standby_fanout_e2e.sh` | the standby slate fan-out: ONE destination connection across slate → live → slate, an encoder restart with a PTS reset, and a video-only ingest |
 
 ## `receiver_e2e_local.sh` — the end-to-end proof
 
@@ -370,3 +371,56 @@ Two things keep 720p at ingest rate:
   transient downstream delay into a permanent deficit: the frames needed to
   catch up are the ones the ring already dropped. The published timeline keeps
   the source PTS; only the sink's own clock sync is gone.
+
+## standby_fanout_e2e.sh — one destination connection across slate and live (plan G1)
+
+Proves the standby fan-out keeps **one** RTMP publish alive across slate → live
+→ slate, across an encoder restart whose timestamps begin at the origin again,
+and for a video-only ingest (the JPEG XS camera-link shape).
+
+    test/harness/standby_fanout_e2e.sh                    # all three scenarios
+    test/harness/standby_fanout_e2e.sh --scenarios "1"    # just the first
+    SINK_HOST=10.50.1.51 test/harness/standby_fanout_e2e.sh
+
+`38 s` to pass, `65 s` to fail (each scenario waits 20 s for the first
+publish), no GPU, no container when `mediamtx` is installed. Ports come from the
+environment (`CTRL_PORT`, `RIST_PORT`, `RTMP_PORT`, `SINK_API_PORT`, +10 per
+scenario); the sink binds `SINK_HOST` because the receiver refuses loopback as
+an egress target.
+
+### Why the assertion is the sink's connection count
+
+`bytesReceived` cannot see a reconnect: a destination that drops at every switch
+and republishes a second later still shows a monotonically growing byte count.
+Every publish prints one `is publishing to path 'live/e2e'` line in the sink log,
+so the harness counts those:
+
+- scenario 1: slate publishes before any RIST media exists; feed → `live`; stop →
+  `slate`; **exactly one** publish line for the whole run, no `closed` line,
+  `reconnects == 0`.
+- scenario 2: feed, stop, then a *second, fresh* encoder (a new `gst-launch`, so
+  its first PTS is the stream origin again — verified with `ffprobe` on the teed
+  TS, `3600003 ms -> 3600003 ms`). One publish line, no disconnect, and the
+  published byte counter never decreases across the switch.
+- scenario 3: no audio in the ingest; the stream still goes live, keeps reaching
+  the sink, and the muxer is not parked on an audio pad that never fills
+  (`audio_frames > 0 || audio_dropped`).
+
+Latency is measured from the receiver's own `last_live_ms_ago` dip, not from the
+encoder's process start: the RIST Advanced profile drains ~1-2 s of buffered
+media after the encoder dies, and `gst-launch` needs ~3 s to produce its first
+frame. Measured here: slate→live `1.2-1.4 s`, live→slate `~1.2 s`.
+
+### Known blocker at the time of writing
+
+Against `fbc4dcf` all three scenarios fail at the first assertion — the slate
+never publishes and the sink records zero publish connections. The muxer's audio
+pad is linked (`audio es_ring present; muxer audio pad linked`) and then never
+receives a buffer (`audio_frames: 0`), so flvmux never reaches PLAYING and
+`rtmp2sink` never sends its publish command; MediaMTX closes the idle connection
+after 10 s and the output reconnects. The cause is the ES audio framing: the
+stage publishes **raw** AAC access units (`aacparse ! audio/mpeg,stream-format=raw`)
+while the copy output's audio `appsrc` declares only `audio/mpeg,mpegversion=4`,
+so the output's own `aacparse` tries to sniff ADTS on each raw frame, never sets
+src caps and emits nothing. See the fix note in the task report; until it lands
+this harness is a failing test that describes the product, not a regression.
