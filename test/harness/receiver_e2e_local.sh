@@ -45,6 +45,7 @@ BIN="${BIN:-${REPO_ROOT}/build/open-broadcast-receiver}"
 FEED="${FEED:-${REPO_ROOT}/build/test/rist_feed}"
 BUILD_DIR="${REPO_ROOT}/build"
 FIXTURE="${FIXTURE:-${BUILD_DIR}/fixtures/e2e-av1.ts}"
+FIXTURE_FRAMES_GIVEN="${FIXTURE_FRAMES:+1}"
 FIXTURE_FRAMES="${FIXTURE_FRAMES:-300}"        # 10 s at 30 fps
 FIXTURE_FPS=30
 CTRL_PORT="${CTRL_PORT:-18180}"
@@ -127,12 +128,23 @@ if [[ ! -s "${FIXTURE}" ]]; then
 else
   echo "reusing ${FIXTURE}"
 fi
+# A reused fixture must be fed at its own frame count, not this script's
+# default: the feed rate below is derived from frames/fps, and a fixture with
+# half the assumed frames would be fed at half speed. An explicit
+# FIXTURE_FRAMES still wins.
+if [[ -z "${FIXTURE_FRAMES_GIVEN}" && -s "${FIXTURE}.meta" ]]; then
+  meta_frames=$(sed -n 's/^frames=//p' "${FIXTURE}.meta")
+  [[ -n "${meta_frames}" ]] && FIXTURE_FRAMES="${meta_frames}"
+fi
 fixture_bytes=$(wc -c < "${FIXTURE}")
 echo "fixture: ${FIXTURE} (${fixture_bytes} bytes, ${FIXTURE_FRAMES} frames @ ${FIXTURE_FPS} fps)"
 
 # ---- fixture proof ---------------------------------------------------------
 {
   echo "--- ffprobe -show_streams ${FIXTURE} ---"
+  echo "(ffprobe reports bin_data: FFmpeg's MPEG-TS demuxer has no mapping for"
+  echo " AV1's private stream_type 0x06/AV1G, so it keeps the tag but not the"
+  echo " codec. The gate below is tsdemux, which is the receiver's own demuxer.)"
   ffprobe -v error \
     -show_entries stream=index,codec_name,codec_type,profile,width,height,r_frame_rate \
     -of default=noprint_wrappers=1 "${FIXTURE}"
@@ -225,6 +237,7 @@ rtsp: no
 hls: no
 webrtc: no
 srt: no
+moq: no
 rtmp: yes
 rtmpAddress: ${SINK_HOST}:${RTMP_PORT}
 rtmpEncryption: "no"
