@@ -11,6 +11,11 @@ add_executable(ring_test source/ring_test.cpp)
 target_link_libraries(ring_test PRIVATE ring_lib Threads::Threads)
 target_compile_features(ring_test PRIVATE cxx_std_20)
 
+add_executable(pts_synth_test source/pts_synth_test.cpp)
+target_link_libraries(pts_synth_test PRIVATE Threads::Threads)
+target_include_directories(pts_synth_test PRIVATE ${CMAKE_SOURCE_DIR}/source)
+target_compile_features(pts_synth_test PRIVATE cxx_std_20)
+
 add_executable(frame_ring_test source/frame_ring_test.cpp)
 target_link_libraries(frame_ring_test PRIVATE ring_lib Threads::Threads)
 target_compile_features(frame_ring_test PRIVATE cxx_std_20)
@@ -36,6 +41,7 @@ target_link_libraries(control_json_test PRIVATE control_lib Threads::Threads)
 target_compile_features(control_json_test PRIVATE cxx_std_20)
 
 add_test(NAME ring_test COMMAND ring_test)
+add_test(NAME pts_synth_test COMMAND pts_synth_test)
 add_test(NAME frame_ring_test COMMAND frame_ring_test)
 add_test(NAME decode_health_test COMMAND decode_health_test)
 add_test(NAME validate_test COMMAND validate_test)
@@ -89,10 +95,11 @@ if(NOT OBR_TESTS_ONLY)
     TIMEOUT 180)
 
   # rist_feed reads an MPEG-TS byte stream on stdin and sends it to a RIST
-  # listener in 7x188-byte datagrams, so the local e2e harness can drive the
-  # receiver over its real ingest instead of a stub. Not a CTest by itself.
+  # listener in 7x188-byte datagrams (ADVANCED profile, SOURCE timing), so the
+  # local e2e harness can drive the receiver over its real ingest instead of a
+  # stub. Not a CTest by itself.
   add_executable(rist_feed tools/rist_feed.cpp)
-  target_link_libraries(rist_feed PRIVATE ristnet)
+  target_link_libraries(rist_feed PRIVATE ristnet Threads::Threads)
   target_compile_features(rist_feed PRIVATE cxx_std_20)
 
   # Local RTMP publish harness: drives the real output pipeline against a local

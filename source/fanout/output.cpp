@@ -323,7 +323,14 @@ auto output_template(output_proto proto,
       // first encoded frame with no timeout involved.
       return std::format(
           "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
+          // The audio branch demuxes the whole carried TS, so it sees the video
+          // PID too. tsdemux is deliberately left unchained: its pads are
+          // sometimes-pads and a chained link binds whichever pad appears
+          // first -- for an AV1+AAC multiplex that is the video pad, which then
+          // occupies the audio chain and starves the muxer. demux_pad_added
+          // links the audio pad to aq and every other pad to adrop.
           "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=ad "
+          "funnel name=adrop ! fakesink sync=false async=false "
           "queue name=aq ! aacparse ! capsfilter name=acaps "
           "caps=audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
           "codec_data=(buffer)1190 "
@@ -333,8 +340,7 @@ auto output_template(output_proto proto,
           // makes every transient downstream delay a permanent deficit, because
           // the frames needed to catch up have already been dropped by the
           // ring. The media is live, so its pacing comes from ingest.
-          "! rtmp2sink name=osink async-connect=true sync=false "
-          "funnel name=adrop ! fakesink sync=false async=false",
+          "! rtmp2sink name=osink async-connect=true sync=false",
           k_appsrc,
           scale,
           k_raw_nv12,
@@ -522,7 +528,9 @@ auto output::build_pipeline(std::string& err) -> bool
       // Report what was ACTUALLY applied. The bitrate is the one setting whose
       // absence is invisible: the encoder just runs at its auto rate, the output
       // still looks healthy, and the only symptom is the byte rate -- which is
-      // exactly how a silent miss here hides.
+      // exactly how a silent miss here hides. The VA device is reported for the
+      // same reason: libva takes the first render node, and on a multi-GPU host
+      // naming the node is how an operator can tell which card is encoding.
       {
         gint applied_bitrate = -1;
         guint applied_gop = 0;
@@ -532,10 +540,17 @@ auto output::build_pipeline(std::string& err) -> bool
         if (has_property(venc, "key-int-max")) {
           g_object_get(venc, "key-int-max", &applied_gop, nullptr);
         }
+        gchar* va_device = nullptr;
+        if (has_property(venc, "device-path")) {
+          g_object_get(venc, "device-path", &va_device, nullptr);
+        }
         log(std::format(
-            "output {}: encoder {} bitrate={} kbps gop={} (requested {}/{})\n",
+            "output {}: encoder {} bitrate={} kbps gop={} (requested {}/{}) "
+            "hardware-required, va-device={}\n",
             m_cfg.id, chosen_encoder, applied_bitrate, applied_gop,
-            m_cfg.transcode.bitrate_kbps, m_cfg.transcode.gop));
+            m_cfg.transcode.bitrate_kbps, m_cfg.transcode.gop,
+            va_device != nullptr ? va_device : "n/a"));
+        g_free(va_device);
       }
       gst_object_unref(venc);
     }
@@ -651,6 +666,12 @@ auto output::demux_pad_added(GstElement* demux,
   gchar* name = gst_pad_get_name(pad);
   const bool is_audio = name != nullptr && g_str_has_prefix(name, "audio");
   g_free(name);
+
+  // Transcode path: the audio branch demuxes the whole carried TS, so every
+  // non-audio pad it exposes (the video PID) needs somewhere to go. An unlinked
+  // pad makes tsdemux return NOT_LINKED, which stops the audio branch. adrop is
+  // a funnel with async=false so it never holds the bin in ASYNC.
+  GstElement* adrop = gst_bin_get_by_name(GST_BIN(out->m_pipeline), "adrop");
   if (!is_audio) {
     // The transcode audio branch demuxes the source TS only to copy its AAC. A
     // stream with no audio still exposes its video pad there, and a tsdemux
@@ -665,6 +686,9 @@ auto output::demux_pad_added(GstElement* demux,
     }
     out->sink_into_drop(pad);
     return;
+  }
+  if (adrop != nullptr) {
+    gst_object_unref(adrop);
   }
 
   // Transcode path: route the audio pad into the declared audio branch, and
@@ -914,6 +938,7 @@ auto output::run_once() -> bool
   m_run_started = std::chrono::steady_clock::now();
   m_audio_linked.store(false, std::memory_order_relaxed);
   m_first_video_push = std::chrono::steady_clock::time_point {};
+  m_audio_probe_done = false;
   m_first_output_logged.store(false);
   m_feed = feed_stats {};
   m_feed.since = m_run_started;
@@ -1145,6 +1170,70 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   m_feed.level_peak = std::max(m_feed.level_peak, static_cast<uint64_t>(level));
   if (m_feed.since == std::chrono::steady_clock::time_point {}) {
     m_feed.since = std::chrono::steady_clock::now();
+  }
+
+  // Audio-branch observation, once, 4 s after the first frame reached the
+  // encoder: flvmux emits nothing until its audio pad carries data, so a
+  // linked-but-silent audio branch holds the sink in PAUSED with no error
+  // anywhere. Probed from the feed thread because this binary runs no GLib main
+  // loop, so a g_timeout would never fire.
+  if (!m_audio_probe_done && m_audio_appsrc != nullptr
+      && m_first_video_push != std::chrono::steady_clock::time_point {}
+      && std::chrono::steady_clock::now() - m_first_video_push
+          > std::chrono::seconds(4))
+  {
+    m_audio_probe_done = true;
+    GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
+    if (mux != nullptr) {
+      // Judge by the MUXER's pad and by what it has RECEIVED: caps without
+      // buffers is the state in which flvmux waits forever, and that state looks
+      // healthy from every other angle.
+      GstIterator* it = gst_element_iterate_sink_pads(mux);
+      GValue item = G_VALUE_INIT;
+      bool done = false;
+      while (!done) {
+        switch (gst_iterator_next(it, &item)) {
+          case GST_ITERATOR_OK: {
+            auto* candidate = GST_PAD(g_value_get_object(&item));
+            const char* pname = GST_PAD_NAME(candidate);
+            if (pname != nullptr && g_str_has_prefix(pname, "audio") == TRUE) {
+              done = true;
+              if (gst_pad_get_current_caps(candidate) == nullptr
+                  || m_audio_frames.load(std::memory_order_relaxed) == 0)
+              {
+                GstPad* peer = gst_pad_get_peer(candidate);
+                if (peer != nullptr) {
+                  gst_pad_unlink(peer, candidate);
+                  gst_object_unref(peer);
+                }
+                // Unlinking alone leaves flvmux's request pad in its collect
+                // aggregate; without caps it never completes negotiation and
+                // the muxer stays silent. EOS retires the pad.
+                const bool retired =
+                    gst_pad_send_event(candidate, gst_event_new_eos()) == TRUE;
+                m_audio_dropped.store(true, std::memory_order_relaxed);
+                log(std::format("audio pad received no buffers; dropped it so "
+                                "video publishes (eos={})\n",
+                                retired ? "sent" : "refused"));
+              }
+              break;
+            }
+            g_value_reset(&item);
+            break;
+          }
+          case GST_ITERATOR_RESYNC:
+            gst_iterator_resync(it);
+            break;
+          case GST_ITERATOR_ERROR:
+          case GST_ITERATOR_DONE:
+            done = true;
+            break;
+        }
+      }
+      g_value_unset(&item);
+      gst_iterator_free(it);
+      gst_object_unref(mux);
+    }
   }
 
   if (level >= cap)

@@ -196,8 +196,14 @@ private:
   std::atomic_bool m_audio_linked {false};
   std::atomic_bool m_first_output_logged {false};
   // When the first decoded frame reached the video appsrc; the "first published
-  // frame" latency line is measured from here, not from the attempt's start.
+  // frame" latency line and the audio-branch probe both measure from here, not
+  // from the attempt's start. The output is built before any RIST payload
+  // exists, so a pipeline-start clock retires a perfectly good audio branch
+  // before its first buffer can arrive.
   std::chrono::steady_clock::time_point m_first_video_push {};
+  // One audio-branch observation per attempt: a linked pad that never receives
+  // a buffer is how flvmux stalls with no error anywhere.
+  bool m_audio_probe_done {false};
   bool m_muxer_input_logged {false};
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};

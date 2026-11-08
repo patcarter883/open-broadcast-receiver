@@ -16,6 +16,7 @@
 #include <gst/gst.h>
 
 #include "fanout/frame_ring.h"
+#include "fanout/pts_synth.h"
 #include "fanout/ring.h"
 #include "lib/lib.h"
 
@@ -216,6 +217,9 @@ private:
   // needed to keep tsdemux flowing.
   pad_targets m_pad_targets;
   GstBus* m_bus = nullptr;
+  // Monotonic timeline for the frames this stage publishes; survives decoder
+  // rebuilds so a re-attempt never rewinds the destination's clock.
+  pts_synth m_pts;
 };
 
 // Build the gst_parse_launch template for the decode stage. `source_parser`
