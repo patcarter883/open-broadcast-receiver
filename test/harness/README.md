@@ -111,6 +111,27 @@ backpressure wait (a muxer that is not collecting is what backfills the
 appsrc), and its deadline is 500 ms after the first video frame reaches the
 encoder.
 
+## Which code was measured
+
+A verdict is about the commit the binary was linked against. The binary prints it
+(`build commit   <sha>`), and the script refuses to run at all when any file under
+`source/`, `test/source/` or the two `CMakeLists.txt` is newer than the executable
+— it exits 2 with both timestamps instead. A stale binary produces numbers that
+look exactly like a live regression (the pre-fix sources stall the muxer after
+three buffers, server delta 576 B), and nothing in its report says which code it
+measured.
+
+## Sustained, not just started
+
+The 32 KiB floor proves media left the box, not that it kept leaving it: the
+harness stops feeding as soon as the floor is met, so a publisher that emits a
+burst and then goes quiet would look identical to a healthy one. For
+`transcode-video-only` the sustained case was measured separately by running the
+binary for 30 s with `--duration 30` against a stat endpoint pinned at
+`<bytes_in>0</bytes_in>` (so the early exit never triggers): the sink's counter
+climbed 1.2 MB per 4 s without a gap for the whole run — 873 video buffers at the
+muxer, 907 emitted, ~2.4 Mbit/s against a 2 Mbit/s target.
+
 ## Notes
 
 - No `decodebin`, no `ristsink`: the fixtures come from `videotestsrc` /

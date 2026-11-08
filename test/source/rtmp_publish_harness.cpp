@@ -69,6 +69,13 @@
 #include "fanout/ring.h"
 #include "lib/lib.h"
 
+// The commit this binary was linked against (test/CMakeLists.txt). A verdict is
+// about that commit only: a stale binary has reported a stall the current
+// sources do not produce.
+#ifndef OBR_SOURCE_COMMIT
+#define OBR_SOURCE_COMMIT "unknown"
+#endif
+
 namespace
 {
 // ---------------------------------------------------------------------------
@@ -970,6 +977,7 @@ auto main(int argc, char** argv) -> int
               }};
 
   std::printf("=== RTMP publish harness: mode=%s ===\n", mode_name(opts.run_mode));
+  std::printf("build commit   %s\n", OBR_SOURCE_COMMIT);
   std::printf("publish        %s\n", url.c_str());
   std::printf("server stat    %s\n", opts.stat_url.c_str());
   std::printf("server baseline bytes_in %lld\n", *baseline.bytes_in);

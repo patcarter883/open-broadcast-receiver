@@ -40,6 +40,23 @@ done
 command -v docker >/dev/null 2>&1 || { echo "docker is not available" >&2; exit 2; }
 [[ -x "$HARNESS_BIN" ]] || { echo "harness binary not built: $HARNESS_BIN" >&2; exit 2; }
 
+# A verdict is only meaningful for the code the binary was linked against. A
+# binary older than its sources measures a commit nobody is running, and its
+# numbers cannot be told apart from a live regression. Refuse to run it.
+# Only compiled sources are compared: a CMakeLists edit that changes nothing the
+# harness links would otherwise block every run, because a build cannot refresh
+# a binary it does not relink.
+newer_source="$(find "$REPO_ROOT/source" "$REPO_ROOT/test/source" \
+                     -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) \
+                     -newer "$HARNESS_BIN" -print -quit 2>/dev/null)"
+if [[ -n "$newer_source" ]]; then
+  echo "harness binary is older than the sources it must exercise:" >&2
+  echo "  binary  ${HARNESS_BIN} ($(date -r "$HARNESS_BIN" '+%F %T'))" >&2
+  echo "  newer   ${newer_source} ($(date -r "$newer_source" '+%F %T'))" >&2
+  echo "rebuild it first: cmake --build $(dirname "$(dirname "$HARNESS_BIN")")" >&2
+  exit 2
+fi
+
 mkdir -p "$LOG_DIR"
 
 cleanup() {
@@ -51,6 +68,11 @@ trap cleanup EXIT INT TERM
 
 echo "=== starting RTMP sink ==="
 echo "image      ${IMAGE}"
+# The binary's own stamp names the commit it was linked against; this names the
+# tree being measured, so a mismatch is visible in the report.
+source_commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+source_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo -)"
+echo "source     ${source_commit} on ${source_branch}"
 echo "container  ${CONTAINER}"
 echo "command    docker run -d --rm --name ${CONTAINER} \\"
 echo "             -p ${RTMP_PORT}:1935 -p ${STAT_PORT}:8080 \\"
