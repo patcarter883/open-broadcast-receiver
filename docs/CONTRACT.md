@@ -414,8 +414,8 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
   },
   "ts_in": { "bytes_total": 238100000 },
   "outputs": [
-    { "id": "yt", "state": "running", "bytes_sent": 912345678, "dropped_bytes": 0, "reconnects": 0 },
-    { "id": "fb", "state": "running", "bytes_sent": 909000000, "dropped_bytes": 0, "reconnects": 0, "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } }
+    { "id": "yt", "state": "running", "bytes_sent": 912345678, "bytes_pushed": 1179648000, "dropped_bytes": 0, "reconnects": 0 },
+    { "id": "fb", "state": "running", "bytes_sent": 909000000, "bytes_pushed": 914408192, "dropped_bytes": 0, "reconnects": 0, "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } }
   ],
   "recording": { "active": true, "bytes": 912345678, "dropped_bytes": 0 }
 }
@@ -430,6 +430,12 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
 - `ring_size_bytes`: the fan-out ring chosen at `/start` — `clamp(10 s × ingest.bandwidth, 16 MiB, 256 MiB)`.
 - `outputs[].dropped_bytes`: ring drop-oldest accounting for that consumer (slow-output back-pressure never
   reaches ingest). `recording` appears when a recorder exists.
+- `outputs[].bytes_sent`: bytes the destination sink took on its sink pad — post-muxer container payload, the
+  counter that tracks the publish socket's egress (and therefore the interface's tx). For a transcode output it is
+  **far smaller** than the decoded-frame volume; it never includes raw frames or ingest bytes.
+- `outputs[].bytes_pushed`: bytes pushed into that output's appsrc(s) — raw decoded frames for a transcode output,
+  compressed access units for a copy output. It is a feed-diagnostic superset of `bytes_sent`, not an egress
+  counter; the two are reported under distinct names and must never be conflated.
 - `ts_in.bytes_total`: total ingest payload bytes (the agent derives bitrate from deltas).
 
 ---

@@ -21,6 +21,11 @@ set -- --bind 0.0.0.0 --rist-port 5000
 [ -n "${OBR_RECORD_DIR:-}" ]   && set -- "$@" --record-dir "$OBR_RECORD_DIR"
 [ -n "${OBR_IDLE_TIMEOUT:-}" ] && set -- "$@" --idle-timeout "$OBR_IDLE_TIMEOUT"
 [ -n "${OBR_EGRESS_DENY:-}" ]  && set -- "$@" --egress-deny "$OBR_EGRESS_DENY"
+# SSRF hygiene blocks RFC1918/ULA destinations unless the operator opts in. An
+# on-prem node publishes to a LAN ingest, so the backplane sets
+# OBR_EGRESS_ALLOW_PRIVATE=1 for those deployments; loopback, link-local and
+# metadata addresses stay blocked regardless.
+[ -n "${OBR_EGRESS_ALLOW_PRIVATE:-}" ] && set -- "$@" --egress-allow-private
 # Enhanced FLV (eflvmux) is opt-in because it is the newer muxer: flvmux is the
 # battle-tested path, so the receiver must not switch muxers for an operator who
 # did not ask. An h265 target on rtmp/rtmps is REFUSED without this, and YouTube

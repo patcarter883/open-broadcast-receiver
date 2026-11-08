@@ -35,6 +35,7 @@ auto make_stat() -> output_stat
   stat.connected_s = 12;
   stat.reconnects = 2;
   stat.bytes_sent = 1234;
+  stat.bytes_pushed = 98765;
   stat.dropped_bytes = 5;
   stat.audio_dropped = false;
   stat.audio_frames = 3392;
@@ -64,6 +65,8 @@ auto main() -> int
     expect(stats["transcode"]["codec"] == "h264", "stats codec is h264");
     expect(stats["bytes_sent"] == 1234 && stats["dropped_bytes"] == 5,
            "stats keeps byte counters");
+    expect(stats["bytes_pushed"] == 98765,
+           "stats reports appsrc pushes separately from socket egress");
     expect(!stats.contains("type"), "stats omits type");
   }
 

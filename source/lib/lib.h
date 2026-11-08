@@ -438,6 +438,9 @@ struct output_stat
   int64_t connected_s = 0;
   uint64_t reconnects = 0;
   uint64_t bytes_sent = 0;
+  // appsrc-push total: raw decoded frames (transcode) or AUs (copy). It is a
+  // superset of bytes_sent and never the socket counter.
+  uint64_t bytes_pushed = 0;
   uint64_t dropped_bytes = 0;
   bool audio_dropped = false;
   // Buffers the muxer's audio pad received; 0 with audio_dropped=false is an

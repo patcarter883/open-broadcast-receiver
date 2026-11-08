@@ -177,6 +177,13 @@ public:
   {
     return m_bytes_sent.load(std::memory_order_relaxed);
   }
+  // Bytes pushed into the output's appsrc(s): every decoded frame (raw, before
+  // encode) or transcoded/copied AU handed to the pipeline. Superset of what
+  // leaves the box and useful only for feed diagnostics; never socket egress.
+  [[nodiscard]] auto bytes_pushed() const -> uint64_t
+  {
+    return m_bytes_pushed.load(std::memory_order_relaxed);
+  }
   [[nodiscard]] auto dropped_bytes() const -> uint64_t
   {
     return (m_consumer >= 0) ? m_ring.dropped_bytes(m_consumer) : 0;
@@ -229,7 +236,7 @@ public:
   // attempts (caller owns the reference). The local RTMP harness
   // (test/source/rtmp_publish_harness.cpp) uses it to probe the muxer's pads and
   // read element state: only what the muxer emitted and what the server received
-  // show that an output publishes, while bytes_sent counts pushes into the
+  // show that an output publishes, while bytes_pushed counts pushes into the
   // appsrc and can read healthy with nothing leaving the box.
   [[nodiscard]] auto pipeline() const -> GstElement*;
 
@@ -370,6 +377,9 @@ private:
   // Set when the muxer's audio pad has been reported with the caps it received,
   // so the report names the negotiated format (raw + codec_data) once.
   std::atomic_bool m_muxer_audio_logged {false};
+  std::atomic<uint64_t> m_bytes_pushed {0};
+  // Bytes the destination sink has taken on its sink pad: post-muxer container
+  // payload, the count that tracks the socket's own egress.
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};
   // Buffers the muxer's audio pad actually received. Caps on that pad are not

@@ -184,7 +184,10 @@ docker run --rm --network obr-sessions --name obr-<session_id> \
     ghcr.io/patcarter883/open-broadcast-receiver:latest
 ```
 
-The `OBR_*` environment is mapped to CLI flags by `docker/entrypoint.sh`.
+The `OBR_*` environment is mapped to CLI flags by `docker/entrypoint.sh`. An
+on-prem deployment whose destination is an RFC1918/ULA address sets
+`OBR_EGRESS_ALLOW_PRIVATE=1` (→ `--egress-allow-private`); loopback,
+link-local and cloud-metadata targets stay refused either way.
 
 ## Who needs registry auth
 

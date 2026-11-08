@@ -9,11 +9,12 @@
 // platform: the ingest side is replaced by fixtures this binary generates with
 // GStreamer, and the destination is rtmp://127.0.0.1:11935/live/test.
 //
-// Why the server's counter and not output::bytes_sent(): bytes_sent counts
+// Why the server's counter and not output::bytes_sent(): bytes_pushed counts
 // pushes into the appsrc, so it reads healthy while nothing leaves the box —
-// publish accepted, egress flat, no GStreamer error. The muxer's sink pads are
-// probed for the same reason: an appsrc can be caps'd and accepting buffers
-// while the branch downstream of it is stalled.
+// publish accepted, egress flat, no GStreamer error. bytes_sent is the sink
+// pad's byte total and the harness asserts it tracks the server's own count;
+// the muxer's sink pads are probed for the same reason an appsrc can be caps'd
+// and accepting buffers while the branch downstream of it is stalled.
 //
 // Modes (all use the production templates; nothing here rebuilds a pipeline by
 // hand):
@@ -57,6 +58,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1735,6 +1737,9 @@ auto main(int argc, char** argv) -> int
   const std::string last_error = out.last_error();
   const std::string encoder = out.encoder_name();
   const std::uint64_t bytes_sent = out.bytes_sent();
+  const std::uint64_t bytes_pushed = out.bytes_pushed();
+  const long long server_delta =
+      (last_server ? *last_server : 0) - *baseline.bytes_in;
   const int64_t reconnects = static_cast<int64_t>(out.reconnects());
   const char* state_name = out.state_name();
   // Decode-stage provenance, sampled while the stage is still running.
@@ -1758,6 +1763,26 @@ auto main(int argc, char** argv) -> int
   }
   bool ok = server_grew;
   std::string mode_failure;
+  // bytes_sent has to be socket egress. The RTMP server's own byte count is the
+  // external truth: the two count the same container payload, so they agree to
+  // within protocol framing. bytes_pushed (raw decoded frames on a transcode
+  // run) must stay above it, which is what proves the two are not conflated.
+  if (ok && server_delta > 0) {
+    const double rel = std::abs(static_cast<double>(bytes_sent)
+                                - static_cast<double>(server_delta))
+        / static_cast<double>(server_delta);
+    if (bytes_sent == 0 || rel > 0.10) {
+      ok = false;
+      mode_failure = std::format(
+          "bytes_sent {} does not track the server's {} bytes_in ({:.1f}% off)",
+          bytes_sent, server_delta, rel * 100.0);
+    } else if (bytes_pushed < bytes_sent) {
+      ok = false;
+      mode_failure = std::format(
+          "bytes_pushed {} is below socket egress {} on this output",
+          bytes_pushed, bytes_sent);
+    }
+  }
   if (ok && server_grew && has_audio(opts.run_mode) && mux_audio_final == 0) {
     ok = false;
     mode_failure = "audio never reached the muxer";
@@ -1916,9 +1941,6 @@ auto main(int argc, char** argv) -> int
     dec.reset();
   }
 
-  const long long server_delta =
-      (last_server ? *last_server : 0) - *baseline.bytes_in;
-
   std::printf("\n");
   std::printf("encoder              %s\n",
               encoder.empty() ? "(copy-only)" : encoder.c_str());
@@ -1982,8 +2004,10 @@ auto main(int argc, char** argv) -> int
     std::printf("reconnect attempts   %llu\n",
                 static_cast<unsigned long long>(reconnects_during));
   }
-  std::printf("output bytes_sent    %llu  (appsrc pushes, not evidence)\n",
+  std::printf("output bytes_sent    %llu  (sink pad egress)\n",
               static_cast<unsigned long long>(bytes_sent));
+  std::printf("output bytes_pushed  %llu  (appsrc pushes, not evidence)\n",
+              static_cast<unsigned long long>(bytes_pushed));
   std::printf("audio pad            dropped=%s caps=%s\n",
               audio_dropped ? "yes" : "no",
               audio_caps.empty() ? "(none)" : audio_caps.c_str());

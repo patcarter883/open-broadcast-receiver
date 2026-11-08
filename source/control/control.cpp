@@ -393,6 +393,7 @@ auto output_stat_json(const output_stat& stat, bool stats_view) -> std::string
     obj["audio_frames"] = stat.audio_frames;
   } else {
     obj["bytes_sent"] = stat.bytes_sent;
+    obj["bytes_pushed"] = stat.bytes_pushed;
     obj["dropped_bytes"] = stat.dropped_bytes;
     obj["reconnects"] = stat.reconnects;
   }

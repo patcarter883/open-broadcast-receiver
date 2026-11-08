@@ -129,6 +129,21 @@ auto count_buffer_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer dat
   return GST_PAD_PROBE_PASS;
 }
 
+// Sums the payload of every buffer crossing a pad. Installed on the
+// destination sink's sink pad, this is the socket-egress counter: those are the
+// bytes the sink is handed, after the muxer (so container framing, not raw
+// decoded frames) and before the protocol's own chunk/TCP overhead.
+auto count_bytes_probe(GstPad* /*pad*/, GstPadProbeInfo* info, gpointer data)
+    -> GstPadProbeReturn
+{
+  if (GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info); buf != nullptr) {
+    static_cast<std::atomic<uint64_t>*>(data)->fetch_add(
+        static_cast<uint64_t>(gst_buffer_get_size(buf)),
+        std::memory_order_relaxed);
+  }
+  return GST_PAD_PROBE_PASS;
+}
+
 }  // namespace
 
 
@@ -982,6 +997,8 @@ auto output::build_pipeline(std::string& err) -> bool
   if (GstPad* pad = gst_element_get_static_pad(sink, "sink"); pad != nullptr) {
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, &count_buffer_probe,
                       &m_sink_in, nullptr);
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, &count_bytes_probe,
+                      &m_bytes_sent, nullptr);
     gst_object_unref(pad);
   }
   gst_object_unref(sink);
@@ -1545,7 +1562,7 @@ auto output::run_once() -> bool
       set_last_error("appsrc rejected buffer (pipeline flushing)");
       return true;
     }
-    m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
+    m_bytes_pushed.fetch_add(got, std::memory_order_relaxed);
   }
   return true;  // stopping
 }
@@ -1861,7 +1878,7 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
         {
           break;
         }
-        m_bytes_sent.fetch_add(agot, std::memory_order_relaxed);
+        m_bytes_pushed.fetch_add(agot, std::memory_order_relaxed);
       }
     }
   }
@@ -1899,7 +1916,7 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
       return false;
     }
     ++m_feed.pushed;
-    m_bytes_sent.fetch_add(vgot, std::memory_order_relaxed);
+    m_bytes_pushed.fetch_add(vgot, std::memory_order_relaxed);
     if (m_first_video_push == std::chrono::steady_clock::time_point {}) {
       m_first_video_push = std::chrono::steady_clock::now();
     }
@@ -1943,7 +1960,7 @@ auto output::feed_es_audio() -> bool
       set_last_error("audio appsrc rejected buffer (pipeline flushing)");
       return false;
     }
-    m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
+    m_bytes_pushed.fetch_add(got, std::memory_order_relaxed);
   }
 }
 
@@ -1993,7 +2010,7 @@ auto output::feed_es_copy() -> bool
     return false;
   }
   ++m_feed.pushed;
-  m_bytes_sent.fetch_add(got, std::memory_order_relaxed);
+  m_bytes_pushed.fetch_add(got, std::memory_order_relaxed);
   if (m_first_video_push == std::chrono::steady_clock::time_point {}) {
     m_first_video_push = std::chrono::steady_clock::now();
   }

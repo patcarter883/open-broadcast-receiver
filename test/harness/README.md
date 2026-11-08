@@ -62,8 +62,9 @@ VERDICT: PUBLISHES — 298 frames decoded by vaav1dec, sink received 2357705 B,
 The verdict needs all of: a `running` output, `reconnects 0` (a publish that only
 happened across rebuilt attempts is not a publish), the sink's own counter growing
 by ≥ 32 KiB, and an H.264 stream at the ingest resolution read back out of the
-server. `bytes_sent` is printed but never decides: for a transcode output it counts
-NV12 frames pushed into the appsrc and grows even when nothing reaches RTMP.
+server. `bytes_sent` (sink-pad egress) is printed but never decides; on a transcode
+output `bytes_pushed` counts NV12 frames pushed into the appsrc and grows even
+when nothing reaches RTMP.
 
 Two configuration facts it depends on:
 
@@ -152,10 +153,12 @@ locally; the destination is a local nginx-rtmp sink.
     test/harness/rtmp_publish_harness.sh
 
 The point is the verdict rule: **the server's own byte count decides**. The
-receiver's `bytes_sent` counts pushes into the appsrc and has read healthy on a
+receiver's `bytes_pushed` counts pushes into the appsrc and has read healthy on a
 rig while the connection sat idle, so the harness never trusts it. Likewise the
 muxer's sink pads are probed rather than the appsrc's caps, because an appsrc can
 be negotiated and accepting buffers while everything downstream of it is stalled.
+`bytes_sent` is the sink pad's byte total, and the harness asserts it agrees with
+the server's `bytes_in` rather than accepting either number alone.
 
 ## What it drives
 
@@ -237,7 +240,8 @@ Per-run report:
     mux sink audio       same for the audio pad
     mux src emitted      buffers/bytes the muxer actually produced
     server bytes_in      the sink's counter, with baseline and delta
-    output bytes_sent    the appsrc push counter, printed for comparison only
+    output bytes_sent    the sink pad's egress byte total
+    output bytes_pushed  the appsrc push counter, printed for comparison only
 
 When a mode fails, the report also prints every element's state, each mux sink
 pad's caps and link state, the `osrc`/`asrc` caps, all bus ERROR/WARNING/EOS
@@ -375,9 +379,10 @@ All three, from data the receiver does not produce:
 3. 3 s of the published stream are pulled **back out** of the RTMP server with
    `ffmpeg -c copy` and probe as H.264 video with frames in it.
 
-`bytes_sent` is printed but never trusted: for a transcode output it counts the
-NV12 frames pushed into the video `appsrc` (≈230 MB for 10 s of 720p), so it
-grows healthily even when nothing reaches RTMP.
+`bytes_sent` (sink-pad egress) is printed but never trusted on its own: it is
+asserted against the server's counter, while `bytes_pushed` counts the NV12
+frames pushed into the video `appsrc` (≈230 MB for 10 s of 720p) and grows
+healthily even when nothing reaches RTMP.
 
 On failure the verdict names the first stage that stopped — RIST ingest, TS
 ring, decode appsrc, tsdemux, decoder, or the output — with the counters that

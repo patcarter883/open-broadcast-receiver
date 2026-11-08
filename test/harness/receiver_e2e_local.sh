@@ -27,10 +27,10 @@
 #                         (in chunks / demux / decoded / sink / state).
 #   * publish           — the RTMP SERVER's byte counter for the path
 #                         (MediaMTX /v3/paths/list bytesReceived), which cannot
-#                         be inflated by the receiver. This matters: for a
-#                         transcode output `bytes_sent` counts NV12 frames
-#                         pushed into the video appsrc, so it grows even when
-#                         nothing reaches RTMP.
+#                         be inflated by the receiver. This matters: the
+#                         receiver's `bytes_sent` is its sink-pad egress and
+#                         `bytes_pushed` is the NV12 volume fed to the video
+#                         appsrc, which grows even when nothing reaches RTMP.
 #   * stream readback   — the stream is pulled back OUT of the RTMP server and
 #                         probed with `ffprobe -count_packets`: real packet
 #                         counts for h264 video, plus for aac audio when the
