@@ -17,6 +17,10 @@ using json = nlohmann::json;
 
 namespace
 {
+// Longest standby slate caption the wire accepts (schema_version 5). The slate
+// draws it over the picture; anything longer is refused, not truncated.
+constexpr std::size_t k_standby_text_max = 64;
+
 // Thrown by the body parser; carries the CONTRACT error_code + offending field.
 struct parse_error
 {
@@ -85,6 +89,42 @@ auto get_int(const json& obj,
   return val.get<int>();
 }
 
+// Integer with an inclusive bound. A present-but-wrong TYPE is a schema error
+// (the body does not mean what the sender thinks); a wrong VALUE is
+// out_of_range. Both name the field, never the object.
+auto get_bounded_int(const json& obj,
+                     const char* key,
+                     int def,
+                     int lo,
+                     int hi,
+                     const std::string& field_pfx) -> int
+{
+  const int val = get_int(obj, key, def, field_pfx);
+  if (val < lo || val > hi) {
+    perr("out_of_range",
+         field_pfx + "." + key,
+         std::format("must be {}..{}", lo, hi));
+  }
+  return val;
+}
+
+// Booleans are never coerced: `"enabled": "yes"` is a schema error, because
+// "truthy" is how a slate switches on by accident.
+auto get_bool(const json& obj,
+              const char* key,
+              bool def,
+              const std::string& field_pfx) -> bool
+{
+  if (!obj.contains(key)) {
+    return def;
+  }
+  const json& val = obj.at(key);
+  if (!val.is_boolean()) {
+    perr("invalid_schema", field_pfx + "." + key, "must be a boolean");
+  }
+  return val.get<bool>();
+}
+
 auto codec_field(const std::string& str,
                  const std::string& field) -> codec
 {
@@ -107,7 +147,7 @@ auto transcode_field(const std::string& str,
   return target;
 }
 
-// POST /start body — schema_version 4 (TRANSPORT_PROFILE §1.1). outputs[] is
+// POST /start body — schema_version 5 (TRANSPORT_PROFILE §1.1). outputs[] is
 // required but MAY be empty (a link-test / record-only session).
 auto parse_start_body_json(const json& jbody) -> receiver_config
 {
@@ -122,13 +162,23 @@ auto parse_start_body_json(const json& jbody) -> receiver_config
   {
     perr("invalid_schema", "schema_version", "required integer field");
   }
-  cfg.schema_version = jbody.at("schema_version").get<int>();
-  if (cfg.schema_version != k_schema_version) {
+  const int declared_version = jbody.at("schema_version").get<int>();
+  // 4 is still ACCEPTED, transitionally: the encoder lives in a DIFFERENT
+  // repository (open-broadcast-encoder) that has not been updated yet, so
+  // refusing 4 here would break every running session. There is no difference
+  // between 4 and 5 other than the additions below; a v4 body cannot express
+  // `standby`, so its standby block is read with `enabled` forced false (see
+  // below). Remove this acceptance once the encoder sends 5.
+  if (declared_version != k_schema_version && declared_version != 4) {
     perr("invalid_schema",
          "schema_version",
          std::format("unsupported schema_version (expected {})",
                      k_schema_version));
   }
+  // Whatever the body declared, the parsed config IS the shape this build
+  // implements, so downstream validation (and /start idempotency) compares
+  // like with like: a v4 body and the equivalent v5 body are the same session.
+  cfg.schema_version = k_schema_version;
 
   cfg.session_id = require_string(jbody, "session_id", "session_id");
 
@@ -156,9 +206,72 @@ auto parse_start_body_json(const json& jbody) -> receiver_config
   if (!jbody.contains("source") || !jbody.at("source").is_object()) {
     perr("invalid_schema", "source", "required object");
   }
-  cfg.in_codec = codec_field(
-      require_string(jbody.at("source"), "codec", "source.codec"),
-      "source.codec");
+  const json& source_json = jbody.at("source");
+  cfg.in_codec =
+      codec_field(require_string(source_json, "codec", "source.codec"),
+                  "source.codec");
+  // schema_version 5: the arriving picture. 0 = unknown (absent), which is what
+  // a standby source has to be told rather than guess.
+  cfg.source.width =
+      get_bounded_int(source_json, "width", 0, 0, 8192, "source");
+  cfg.source.height =
+      get_bounded_int(source_json, "height", 0, 0, 8192, "source");
+  cfg.source.fps = get_bounded_int(source_json, "fps", 0, 0, 240, "source");
+
+  // schema_version 5: the optional standby/slate source. Every member is
+  // optional and keeps its default when absent.
+  if (jbody.contains("standby")) {
+    const json& sb_json = jbody.at("standby");
+    if (!sb_json.is_object()) {
+      perr("invalid_schema", "standby", "must be an object");
+    }
+    cfg.standby.enabled =
+        get_bool(sb_json, "enabled", cfg.standby.enabled, "standby");
+    cfg.standby.width =
+        get_bounded_int(sb_json, "width", cfg.standby.width, 0, 8192, "standby");
+    cfg.standby.height = get_bounded_int(
+        sb_json, "height", cfg.standby.height, 0, 8192, "standby");
+    cfg.standby.fps =
+        get_bounded_int(sb_json, "fps", cfg.standby.fps, 0, 240, "standby");
+    cfg.standby.bitrate_kbps = get_bounded_int(
+        sb_json, "bitrate_kbps", cfg.standby.bitrate_kbps, 100, 50000, "standby");
+    cfg.standby.max_live_gap_s = get_bounded_int(
+        sb_json, "max_live_gap_s", cfg.standby.max_live_gap_s, 0, 86400,
+        "standby");
+    cfg.standby.live_gap_ms = get_bounded_int(
+        sb_json, "live_gap_ms", cfg.standby.live_gap_ms, 100, 60000, "standby");
+    cfg.standby.live_hold_ms = get_bounded_int(
+        sb_json, "live_hold_ms", cfg.standby.live_hold_ms, 0, 10000, "standby");
+    cfg.standby.max_gap_ms = get_bounded_int(
+        sb_json, "max_gap_ms", cfg.standby.max_gap_ms, 100, 60000, "standby");
+    cfg.standby.brand_image =
+        get_string(sb_json, "brand_image", cfg.standby.brand_image, "standby");
+    if (!cfg.standby.brand_image.empty()
+        && cfg.standby.brand_image.front() != '/')
+    {
+      // A relative path would resolve against the container's working
+      // directory, i.e. a different file at every launch. Absolute or nothing.
+      perr("invalid_schema",
+           "standby.brand_image",
+           "must be empty or an absolute path");
+    }
+    cfg.standby.text = get_string(sb_json, "text", cfg.standby.text, "standby");
+    if (cfg.standby.text.size() > k_standby_text_max) {
+      // The slate draws this over the picture; a longer string cannot be
+      // rendered, so it is refused rather than truncated to something else.
+      perr("out_of_range",
+           "standby.text",
+           std::format("must be at most {} characters", k_standby_text_max));
+    }
+  }
+
+  // A body that declares 4 cannot express standby, so its slate is off whatever
+  // the block said. This is the ONLY difference between 4 and 5 (see above), and
+  // the whole point of the transitional acceptance: an old encoder keeps working
+  // and never switches a slate on air.
+  if (declared_version == 4) {
+    cfg.standby.enabled = false;
+  }
 
   if (!jbody.contains("outputs") || !jbody.at("outputs").is_array()) {
     perr("invalid_schema", "outputs", "required array (may be empty)");

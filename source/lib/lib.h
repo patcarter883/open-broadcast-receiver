@@ -173,15 +173,56 @@ struct receiver_defaults
 };
 
 // ---------------------------------------------------------------------------
-// Configuration (schema_version 3 — TRANSPORT_PROFILE §1.1; v3 adds the
-// optional outputs[].transcode object)
+// Configuration (schema_version 5 — TRANSPORT_PROFILE §1.1; v3 adds the
+// optional outputs[].transcode object, v4 its `scale`, v5 `standby` + source
+// geometry)
 // ---------------------------------------------------------------------------
 
 // 4: outputs[].transcode gains `scale`, and `codec` gains "av1". Both change what
 // a body MEANS, so an older receiver must reject the body rather than ignore the
 // parts it does not know -- a silently dropped upscale is worse than a refusal.
-inline constexpr int k_schema_version = 4;
+//
+// 5: the optional top-level `standby` object (the slate/standby source) and the
+// optional source geometry (source.width/height/fps). Also purely additive.
+inline constexpr int k_schema_version = 5;
 inline constexpr std::size_t k_max_outputs = 8;
+
+// The arriving picture's geometry (schema_version 5). /start carried
+// source.codec only; a standby source/slate has to match the live picture, so
+// its size and rate now cross the wire. 0 = unknown (the encoder did not say),
+// never a guessed value -- a slate that assumes 1080p on a 720p session is a
+// visible defect, so "unknown" must stay expressible.
+struct source_geometry
+{
+  int width = 0;
+  int height = 0;
+  int fps = 0;
+  auto operator==(const source_geometry&) const -> bool = default;
+};
+
+// Standby/slate source (schema_version 5). When `enabled`, the receiver holds a
+// slate on air for the whole fan-out while no live media is arriving, so a
+// destination connection is never starved into a reconnect. Every field is
+// optional on the wire and carries the default below.
+//
+// It is part of the WIRE config (receiver_config), so it participates in the
+// /start idempotency comparison: re-posting the same body with the same standby
+// block is a no-op, and changing only the slate is a differing body (409).
+struct standby_config
+{
+  bool enabled = false;
+  int width = 0;              // 0 = unknown
+  int height = 0;
+  int fps = 0;
+  int bitrate_kbps = 1500;
+  int max_live_gap_s = 1800;
+  int live_gap_ms = 1500;
+  int live_hold_ms = 500;
+  int max_gap_ms = 1000;
+  std::string brand_image;    // absolute path inside the container; empty = none
+  std::string text = "stream standby";
+  auto operator==(const standby_config&) const -> bool = default;
+};
 
 struct ingest_config
 {
@@ -234,6 +275,11 @@ struct receiver_config
   std::string session_id;
   ingest_config ingest;
   codec in_codec = codec::h264;  // the codec arriving over RIST (source.codec hint)
+  // The rest of the `source` object (schema_version 5). `codec` stays in
+  // in_codec because every decode/fan-out call site already reads it there;
+  // this carries the geometry the slate has to match.
+  source_geometry source;
+  standby_config standby;        // schema_version 5; disabled by default
   std::vector<output_config> outputs;
   auto operator==(const receiver_config&) const -> bool = default;
 };

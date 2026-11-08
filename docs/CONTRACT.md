@@ -1,9 +1,14 @@
 # CONTRACT.md — encoder ⇄ receiver control & telemetry contract
 
-Date: 2026-10-03 (schema_version 3 — opt-in transcode tier)
-Status: FINAL for v3. This is the shared source of truth both repos implement. The receiver implements the **server**
+Date: 2026-11-08 (schema_version 5 — standby/slate source + source geometry)
+Status: FINAL for v5. This is the shared source of truth both repos implement. The receiver implements the **server**
 side, the encoder implements the **client** side. Any change is additive and bumps nothing unless `schema_version` is
 incremented.
+
+> **v5 additions (2026-11-08).** A `standby` object at the top level of `POST /start` (a slate/source the receiver
+> can hold on air when live media is absent; **disabled unless asked for**) and `source.width`/`height`/`fps`
+> (the arriving picture's geometry; `0` = unknown). Both are optional and additive: a v3/v4 body's meaning is
+> unchanged. **v4 is still accepted, transitionally** — see §1.
 
 > **v3 role (2026-10-03).** The receiver is still a **copy-only restreamer by default**: one incoming RIST/TS stream
 > fans out to up to 8 RTMP/RTMPS/SRT/RIST outputs simultaneously — per-output remux (`flvmux` for rtmp/rtmps, TS
@@ -29,9 +34,13 @@ The media plane (RIST/UDP, MPEG-TS) is described in GSTREAMER.md.
 - Protocol: **HTTP/1.1**. Server: `httplib::Server` (cpp-httplib) in the receiver. Client: `httplib::Client`
   in the encoder.
 - Content type: `application/json` for all request and response bodies (except `GET /healthz` response, also JSON).
-- Every request and response body includes `"schema_version": 3` (integer). The receiver MUST reject a request whose
-  `schema_version` it does not support with **400 `invalid_schema`**. A v1 **or v2** body is rejected — there is no
-  compatibility shim; encoder and receiver ship together.
+- Every request and response body carries `"schema_version"` (integer); this build speaks **5** and echoes 5.
+- A request whose `schema_version` the receiver does not support is rejected with **400 `invalid_schema`**.
+  **`4` is accepted transitionally** (2026-11-08): the encoder lives in a *different* repository
+  (`open-broadcast-encoder`) that still sends 4, so refusing it would break every running session. A v4 body
+  cannot express `standby`, so it is read with `standby.enabled = false` whatever the body says; there is **no
+  other difference between 4 and 5**. This acceptance is to be **removed** once the encoder sends 5. A v1/v2/v3
+  body is still rejected — there is no compatibility shim for those.
 - Default bind: receiver `--control-port` (default **8080**) on **`127.0.0.1`** (changed 2026-07-18, FIXPLAN M1.1).
   A non-loopback `--bind` with an **empty token refuses to start** unless the explicit `--allow-unauthenticated`
   flag is passed; no-auth mode logs a prominent warning at every startup. Optional TLS via
@@ -89,11 +98,13 @@ idempotency is judged on the effective config.
 ### Request body
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 5,
   "session_id": "uuid-or-monotonic-string",
   "ingest": { "bandwidth": 8000, "buffer_min": 1000, "buffer_max": 5000,
               "rtt_min": 40, "rtt_max": 500, "reorder_buffer": 30 },
-  "source": { "codec": "h264" },
+  "source": { "codec": "h264", "width": 1920, "height": 1080, "fps": 60 },
+  "standby": { "enabled": true, "bitrate_kbps": 1500,
+               "brand_image": "/usr/share/obr/brand.png", "text": "stream standby" },
   "outputs": [
     { "id": "yt",  "type": "rtmp",  "url": "rtmp://a.rtmp.youtube.com/live2", "key_or_streamid": "…" },
     { "id": "fb",  "type": "rtmps", "url": "rtmps://live-api-s.facebook.com:443/rtmp", "key_or_streamid": "…",
@@ -108,11 +119,42 @@ idempotency is judged on the effective config.
 Top level:
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
-| `schema_version` | int | yes | must equal 3 |
+| `schema_version` | int | yes | must equal **5**; **4 is accepted transitionally** (§1) and forces `standby.enabled = false` |
 | `session_id` | string | yes | opaque; echoed back; used for idempotency/stop matching |
 | `ingest` | object | no | RIST listener config; CLI recovery flags are authoritative over it |
-| `source` | object | yes | the codec arriving over RIST (hint; see below) |
+| `source` | object | yes | the codec (and, from v5, the geometry) arriving over RIST — see below |
+| `standby` | object | no | v5 slate/standby source; **absent ⇒ disabled**. Part of the wire config, so it counts for idempotency — see below |
 | `outputs` | array | yes (**MAY be empty**) | empty ⇒ the receiver terminates the RIST stream and (if `--record-dir`) records; a legal "link test / record only" session |
+
+`source` (`codec` is required; the v5 geometry members are optional):
+| Field | Type | Default | Bounds | Notes |
+|-------|------|---------|--------|-------|
+| `codec` | enum codec | — | `h264`/`h265`/`av1` | **required**; the arriving elementary stream |
+| `width` | int | 0 | 0–8192 | arriving picture width in pixels; **0 = unknown** (the encoder did not say) |
+| `height` | int | 0 | 0–8192 | arriving picture height; **0 = unknown** |
+| `fps` | int | 0 | 0–240 | arriving frame rate; **0 = unknown** |
+
+`0` means "unknown" and is deliberately expressible: a slate that assumes 1080p on a 720p session would be a
+visible defect, so the receiver is told the geometry or told nothing — it never guesses.
+
+`standby` (every member optional; v5. This is the slate source the receiver holds on air when the live feed is
+absent or not yet arriving, so a destination connection is never starved into a reconnect):
+| Field | Type | Default | Bounds | Notes |
+|-------|------|---------|--------|-------|
+| `enabled` | bool | `false` | — | must be a JSON boolean; `"yes"`/`1` are **400 `invalid_schema`**, never coerced |
+| `width` | int | 0 | 0–8192 | slate picture width; `0` = follow `source.width` (unknown stays unknown) |
+| `height` | int | 0 | 0–8192 | slate picture height; `0` = follow `source.height` |
+| `fps` | int | 0 | 0–240 | slate frame rate; `0` = follow `source.fps` |
+| `bitrate_kbps` | int (kbps) | 1500 | 100–50000 | encoder target for the slate |
+| `max_live_gap_s` | int (s) | 1800 | 0–86400 | longest live gap tolerated before the session is judged dead (0 = no limit) |
+| `live_gap_ms` | int (ms) | 1500 | 100–60000 | absence of payload for this long starts the switch-away from live |
+| `live_hold_ms` | int (ms) | 500 | 0–10000 | how long live must return and hold before switching back off the slate |
+| `max_gap_ms` | int (ms) | 1000 | 100–60000 | longest single gap the slate output may itself leave uncovered |
+| `brand_image` | string | `""` | empty **or absolute** path | path **inside the receiver container** (e.g. `/usr/share/obr/brand.png`); a relative path is **400 `invalid_schema`** (`standby.brand_image`) |
+| `text` | string | `"stream standby"` | ≤ 64 chars | caption drawn on the slate; longer ⇒ **400 `out_of_range`** |
+
+The object is part of the **wire config**: it participates in `/start` idempotency, so re-posting the same body is a
+no-op and changing only the slate is a **different** body (⇒ **409 `already_running`** while a session runs).
 
 `outputs[]`:
 | Field | Type | Required | Notes |
@@ -173,9 +215,14 @@ and never restart anything.
 The PSK travels via the librist settings struct — never inside any URL.
 
 ### Validation (receiver, before anything launches)
-- `schema_version != 3` ⇒ **400 `invalid_schema`** (a v2 body is rejected here).
+- `schema_version` other than **5** (or the transitional **4**, §1) ⇒ **400 `invalid_schema`**. A v1/v2/v3 body is
+  rejected here. When a body declares 4, `standby.enabled` is forced `false` before anything is built.
 - Any `ingest.*` numeric out of bounds ⇒ **400 `out_of_range`** naming the field; bad `rist_listen` scheme ⇒
   **400 `bad_url`**.
+- Any `standby.*` numeric out of bounds (§4 table) ⇒ **400 `out_of_range`** naming the field (e.g.
+  `standby.bitrate_kbps`); a wrong **type** (e.g. `"enabled": "yes"`, `"bitrate_kbps": "2000"`) ⇒ **400
+  `invalid_schema`** naming the field; a relative `standby.brand_image` ⇒ **400 `invalid_schema`**. The same
+  split applies to `source.width`/`height`/`fps`.
 - Unknown `source.codec` / `outputs[].type` / `outputs[].transcode.codec` ⇒ **400 `bad_enum`** naming the field
   (`transcode.codec` accepts only `h264`/`h265`; `"av1"` is `bad_enum`).
 - **Egress validation (SSRF/rebinding resistance):** every output host is resolved and vetted — loopback,
@@ -210,7 +257,7 @@ The PSK travels via the librist settings struct — never inside any URL.
 ```json
 {
   "ok": true,
-  "schema_version": 3,
+  "schema_version": 5,
   "session_id": "uuid-or-monotonic-string",
   "state": "running",
   "outputs": [ { "id": "yt", "type": "rtmp" }, { "id": "fb", "type": "rtmps" }, { "id": "cli", "type": "srt" } ]
@@ -221,16 +268,16 @@ The echo carries **id and type only** — URLs and keys are never echoed.
 ### Error responses
 - **400** invalid input:
   ```json
-  { "ok": false, "schema_version": 3, "error_code": "invalid_schema|bad_url|bad_enum|out_of_range|forbidden_destination|element_unavailable|transcode_unavailable|rtmp_codec_unsupported", "message": "human readable", "field": "outputs[1].transcode.codec" }
+  { "ok": false, "schema_version": 5, "error_code": "invalid_schema|bad_url|bad_enum|out_of_range|forbidden_destination|element_unavailable|transcode_unavailable|rtmp_codec_unsupported", "message": "human readable", "field": "outputs[1].transcode.codec" }
   ```
 - **401** unauthenticated: `{ "ok": false, "error_code": "unauthorized" }` (no schema parsing required).
 - **409** already running:
   ```json
-  { "ok": false, "schema_version": 3, "error_code": "already_running", "session_id": "<current session_id>" }
+  { "ok": false, "schema_version": 5, "error_code": "already_running", "session_id": "<current session_id>" }
   ```
 - **500** pipeline launch failure:
   ```json
-  { "ok": false, "schema_version": 3, "error_code": "pipeline_launch_failed", "message": "<error>" }
+  { "ok": false, "schema_version": 5, "error_code": "pipeline_launch_failed", "message": "<error>" }
   ```
 
 ---
@@ -263,7 +310,7 @@ place; `0` still means the encoder's own default. The wire contract is unchanged
 
 ### Request body
 ```json
-{ "schema_version": 3, "session_id": "uuid-or-monotonic-string" }
+{ "schema_version": 5, "session_id": "uuid-or-monotonic-string" }
 ```
 Both fields are optional on `/stop` (it is intentionally lenient so a stuck encoder can always halt the stream): an
 absent or malformed body is treated as an **unconditional stop**, and `schema_version` is **not** enforced here (unlike
@@ -273,7 +320,7 @@ no-op returning 200.
 
 ### Response 200
 ```json
-{ "ok": true, "schema_version": 3, "state": "stopped" }
+{ "ok": true, "schema_version": 5, "state": "stopped" }
 ```
 
 ---
@@ -285,7 +332,7 @@ Poll for health/state, decoupled from RIST. Recommended encoder poll interval **
 ### Response 200
 ```json
 {
-  "ok": true, "schema_version": 3, "state": "running", "session_id": "s_9f2c", "uptime_s": 1234,
+  "ok": true, "schema_version": 5, "state": "running", "session_id": "s_9f2c", "uptime_s": 1234,
   "telemetry": { "link_quality": 92, "worst_case_rtt_ms": 140 },
   "outputs": [
     { "id": "yt",  "type": "rtmp",  "state": "running", "connected_s": 1230, "reconnects": 0, "audio_dropped": false },
@@ -300,6 +347,15 @@ Poll for health/state, decoupled from RIST. Recommended encoder poll interval **
   target `codec`, the chosen `encoder` element name (e.g. `"vah264enc"`; may be `""` before the first pipeline build)
   and `frames_dropped` (whole-frame drop-oldest on the shared decode frame ring for that output); **copy-only outputs
   omit it entirely**. It never echoes the source codec or any secret.
+- **`standby` object (documented ahead of implementation — the receiver does not emit it yet).** `GET /status` will
+  carry a top-level `standby` object once the standby source lands, with these members so a panel can show why a
+  slate is or is not on air: `{ "enabled": true, "mode": "live|slate|switching", "switches": 3,
+  "last_live_ms_ago": 812, "caps_ok": true, "stage_rebuilds": 0, "degraded": false }` —
+  `mode` is the source currently feeding the fan-out, `switches` a monotonic count of live⇄slate transitions,
+  `last_live_ms_ago` the age of the last live payload, `caps_ok` whether the slate output negotiated its declared
+  caps, `stage_rebuilds` how many times the slate stage had to be rebuilt, and `degraded` whether the slate is
+  running below its requested geometry/bitrate. Nothing in this document depends on its presence yet; `enabled`
+  echoes the `standby.enabled` the running session was started with.
 - Session `state` ∈ `"running"`, `"stopped"`, `"error"`. It stays `running` while **any** output runs or the
   session is intact with zero outputs; **per-output failure is never session-fatal**. `error` is reserved for
   session-level failures (`idle_timeout`, listener death), reported with `last_bus_error` until the next `/start`.
@@ -310,7 +366,7 @@ Poll for health/state, decoupled from RIST. Recommended encoder poll interval **
   panel/agent on top of `reconnects`/`last_error`.
 - A reconnecting output **rejoins live**: the gap is absent from the platform-side VOD; backlog is never replayed.
 - `telemetry` **mirrors the 5-byte RIST-OOB `wan_telemetry`** (§8). When stopped, `telemetry` MAY be absent.
-- When stopped: `{ "ok": true, "schema_version": 3, "state": "stopped", "session_id": null, "outputs": [] }`.
+- When stopped: `{ "ok": true, "schema_version": 5, "state": "stopped", "session_id": null, "outputs": [] }`.
 
 ---
 
@@ -322,7 +378,7 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
 ### Response 200 (shape)
 ```json
 {
-  "ok": true, "schema_version": 3, "session_id": "s_9f2c", "ts": 1789620000123,
+  "ok": true, "schema_version": 5, "session_id": "s_9f2c", "ts": 1789620000123,
   "ring_size_bytes": 16777216,
   "rist": {
     "quality": 97.4, "rtt_ms": 41, "received": 182034, "missing": 210, "recovered": 208,
