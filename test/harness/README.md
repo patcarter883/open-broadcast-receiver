@@ -1,12 +1,13 @@
 # Local harnesses
 
-Two runners, both publishing to a throwaway local server and both judging the run
-by what the server received.
+Three runners, all publishing to a throwaway local server and all judging the run
+by what the server received rather than by the receiver's own counters.
 
 | runner | what it proves |
 | --- | --- |
-| `receiver_e2e_local.sh` | the whole product path: AV1-in-MPEG-TS over RIST → decode → frame ring → transcode → RTMP |
-| `rtmp_publish_harness.sh` | the `output` object publishes, driven in-process with fixtures (no RIST, no decode) |
+| `receiver_e2e_local.sh` | the whole product path from an AV1-only TS: RIST → decode → frame ring → transcode → RTMP, with the sink's byte count and a stream read back out of the server |
+| `rist_av1_publish_e2e.sh` | the same path from an AV1+AAC TS, judged by the media the sink recorded |
+| `rtmp_publish_harness.sh` | the `output` object alone, driven in-process per mode (no RIST, no decode) |
 
 ## `receiver_e2e_local.sh` — the end-to-end proof
 
@@ -75,6 +76,18 @@ fixture built with `FIXTURE_FRAMES=150` is not fed at half speed.
 - **Nothing time-based gates the first frame.** The muxer's audio pad is requested
   only when the source TS exposes an audio pad, so a video-only ingest publishes on
   its first encoded frame.
+
+## `rist_av1_publish_e2e.sh` — the same path with audio, judged by the recording
+
+    test/harness/rist_av1_publish_e2e.sh [seconds]
+
+The fixture is an AV1+AAC multiplex, so this run also exercises the audio branch
+through a real RIST ingest: the muxer's audio pad is requested because the TS
+announces one, and the recorded file carries both tracks. `mediamtx`'s record
+directory (`build/e2e/rec/<app>/<stream>/`) is the measurement, probed for an
+H.264 video track at the ingest resolution and an AAC 48 kHz stereo track. PASS
+also requires the output never to have reconnected and the sink to have logged
+`is publishing to path '<app>/<key>'`.
 
 ## `rtmp_publish_harness.sh` — the output object in-process
 

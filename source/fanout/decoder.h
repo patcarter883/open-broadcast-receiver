@@ -62,9 +62,13 @@ class decoder
 {
 public:
   using log_fn = std::function<void(const std::string&)>;
+  // Reported once with a bounded reason when the stage is finished for good
+  // (no decoder left, or the ingest is not the declared codec). The session
+  // records it so /status names why transcode outputs are idle.
+  using fail_fn = std::function<void(const std::string&)>;
 
   // `ring` must outlive this object (owned by main alongside the session).
-  decoder(ts_ring& ring, codec in_codec, log_fn log);
+  decoder(ts_ring& ring, codec in_codec, log_fn log, fail_fn on_fail = {});
   ~decoder();
   decoder(const decoder&) = delete;
   auto operator=(const decoder&) -> decoder& = delete;
@@ -128,6 +132,17 @@ public:
   // rebuild. Called from a streaming thread.
   auto observe_source_caps(GstCaps* caps) -> void;
 
+  // Called from the demuxer's pad-added handler for a video pad, before the
+  // branch is linked. False means the pad is not the codec /start declared:
+  // the stage is marked failed, the reason is logged with both values, and the
+  // pad is left unlinked so the branch does not spend an attempt on a stream it
+  // cannot parse. Called from a streaming thread.
+  auto accept_video_pad(const GstCaps* caps) -> bool;
+
+  // The bounded reason `accept_video_pad` refused the ingest, empty when it did
+  // not. Copied under the same lock the writer holds.
+  [[nodiscard]] auto codec_mismatch_reason() const -> std::string;
+
 private:
   auto worker() -> void;
   auto build_pipeline(std::string& err, const std::string& decoder_name) -> bool;
@@ -153,6 +168,14 @@ private:
   ts_ring& m_ring;
   codec m_in_codec;
   log_fn m_log;
+  fail_fn m_on_fail;
+
+  // Set once when the demuxer exposes a video pad the declared codec does not
+  // describe. The attempt is not rebuilt: no decoder in the chain can parse
+  // another codec.
+  std::atomic_bool m_codec_mismatch {false};
+  mutable std::mutex m_mismatch_mutex;
+  std::string m_mismatch_reason;
 
   // Owned ring. Sized at the minimum capacity to bound every consumer's
   // read buffer (frame_ring::read requires a capacity()-sized destination);

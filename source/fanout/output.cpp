@@ -533,7 +533,9 @@ auto output::build_pipeline(std::string& err) -> bool
       // Report what was ACTUALLY applied. The bitrate is the one setting whose
       // absence is invisible: the encoder just runs at its auto rate, the output
       // still looks healthy, and the only symptom is the byte rate -- which is
-      // exactly how a silent miss here hides.
+      // exactly how a silent miss here hides. The VA device is reported for the
+      // same reason: libva takes the first render node, and on a multi-GPU host
+      // naming the node is how an operator can tell which card is encoding.
       {
         gint applied_bitrate = -1;
         guint applied_gop = 0;
@@ -543,10 +545,17 @@ auto output::build_pipeline(std::string& err) -> bool
         if (has_property(venc, "key-int-max")) {
           g_object_get(venc, "key-int-max", &applied_gop, nullptr);
         }
+        gchar* va_device = nullptr;
+        if (has_property(venc, "device-path")) {
+          g_object_get(venc, "device-path", &va_device, nullptr);
+        }
         log(std::format(
-            "output {}: encoder {} bitrate={} kbps gop={} (requested {}/{})\n",
+            "output {}: encoder {} bitrate={} kbps gop={} (requested {}/{}) "
+            "hardware-required, va-device={}\n",
             m_cfg.id, chosen_encoder, applied_bitrate, applied_gop,
-            m_cfg.transcode.bitrate_kbps, m_cfg.transcode.gop));
+            m_cfg.transcode.bitrate_kbps, m_cfg.transcode.gop,
+            va_device != nullptr ? va_device : "n/a"));
+        g_free(va_device);
       }
       gst_object_unref(venc);
     }
@@ -985,6 +994,7 @@ auto output::run_once() -> bool
   m_run_started = std::chrono::steady_clock::now();
   m_audio_linked.store(false, std::memory_order_relaxed);
   m_first_video_push = std::chrono::steady_clock::time_point {};
+  m_audio_probe_done = false;
   m_first_output_logged.store(false);
   m_feed = feed_stats {};
   m_feed.since = m_run_started;

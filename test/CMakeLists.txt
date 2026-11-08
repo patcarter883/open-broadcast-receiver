@@ -36,6 +36,10 @@ add_executable(transcode_select_test source/transcode_select_test.cpp)
 target_link_libraries(transcode_select_test PRIVATE receiver_lib Threads::Threads)
 target_compile_features(transcode_select_test PRIVATE cxx_std_20)
 
+add_executable(source_codec_test source/source_codec_test.cpp)
+target_link_libraries(source_codec_test PRIVATE receiver_lib Threads::Threads)
+target_compile_features(source_codec_test PRIVATE cxx_std_20)
+
 add_executable(control_json_test source/control_json_test.cpp)
 target_link_libraries(control_json_test PRIVATE control_lib Threads::Threads)
 target_compile_features(control_json_test PRIVATE cxx_std_20)
@@ -47,6 +51,7 @@ add_test(NAME decode_health_test COMMAND decode_health_test)
 add_test(NAME validate_test COMMAND validate_test)
 add_test(NAME start_parse_test COMMAND start_parse_test)
 add_test(NAME transcode_select_test COMMAND transcode_select_test)
+add_test(NAME source_codec_test COMMAND source_codec_test)
 add_test(NAME control_json_test COMMAND control_json_test)
 
 # GStreamer pipeline-string tests need the media stack, so they are only added
@@ -95,8 +100,9 @@ if(NOT OBR_TESTS_ONLY)
     TIMEOUT 180)
 
   # rist_feed reads an MPEG-TS byte stream on stdin and sends it to a RIST
-  # listener in 7x188-byte datagrams, so the local e2e harness can drive the
-  # receiver over its real ingest instead of a stub. Not a CTest by itself.
+  # listener in 7x188-byte datagrams (ADVANCED profile, SOURCE timing), so the
+  # local e2e harness can drive the receiver over its real ingest instead of a
+  # stub. Not a CTest by itself.
   add_executable(rist_feed tools/rist_feed.cpp)
   target_link_libraries(rist_feed PRIVATE ristnet Threads::Threads)
   target_compile_features(rist_feed PRIVATE cxx_std_20)
