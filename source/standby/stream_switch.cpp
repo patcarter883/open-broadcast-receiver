@@ -3,6 +3,7 @@
 
 #include "standby/stream_switch.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <format>
@@ -423,13 +424,32 @@ auto stream_switch::attach(GstElement* pipeline, const switch_config& cfg)
   gst_caps_unref(slate_caps);
 
   m_cfg = cfg;
+  m_deadline_ms = cfg.deadline_ms > 0 ? cfg.deadline_ms : 2000;
+  m_gate = cfg.gate;
   m_sel = sel;
   m_live_pad = live;
   m_slate_pad = slate;
   m_src_pad = src;
 
+  // A freshly built selector is on sink_0, whatever the old pipeline left in
+  // the gate. The video switch owns the reset so both switches start from the
+  // same truth; the audio switch only reads it.
+  if (m_gate != nullptr) {
+    if (!m_cfg.audio) {
+      m_gate->video_on_live.store(true, std::memory_order_release);
+    } else {
+      std::lock_guard<std::mutex> gate_guard(m_gate->mutex);
+      m_gate->audio = this;
+    }
+  }
+
+  // Only the live branch is probed. The slate branch may be moved at any
+  // buffer because its ES is all-intra (render.cpp), and a probe on the
+  // deselected slate pad could never fire anyway: an input-selector returns a
+  // flow error for the pads it is not presenting, which stops the slate appsrc
+  // until that pad is selected again.
   m_live_probe = gst_pad_add_probe(live, GST_PAD_PROBE_TYPE_BUFFER,
-                                   &stream_switch::live_probe_cb, this, nullptr);
+                                   &stream_switch::branch_probe_cb, this, nullptr);
   m_src_probe = gst_pad_add_probe(
       src, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, &stream_switch::src_probe_cb,
       this, nullptr);
@@ -453,6 +473,8 @@ auto stream_switch::attach(GstElement* pipeline, const switch_config& cfg)
     note("standby switch: live (immediate)");
   } else if (first == transition::waiting) {
     note("standby switch: waiting for a live keyframe");
+  } else if (first == transition::waiting_slate) {
+    note("standby switch: waiting for the video switch");
   }
   return true;
 }
@@ -511,12 +533,121 @@ auto stream_switch::detach() -> void
       m_sel = nullptr;
     }
     m_pending_live.store(false, std::memory_order_release);
+    m_pending_slate.store(false, std::memory_order_release);
     m_slate_active.store(false, std::memory_order_release);
+    m_deadline_reported = false;
+    if (m_gate != nullptr && m_cfg.audio) {
+      std::lock_guard<std::mutex> gate_guard(m_gate->mutex);
+      if (m_gate->audio == this) {
+        m_gate->audio = nullptr;
+      }
+    }
+    m_gate.reset();
   }
   {
     std::lock_guard<std::mutex> caps_guard(m_caps_mutex);
     gst_caps_replace(&m_last_caps, nullptr);
   }
+}
+
+auto stream_switch::flip_locked(bool to_live) -> void
+{
+  g_object_set(m_sel, "active-pad", to_live ? m_live_pad : m_slate_pad,
+               nullptr);
+  m_slate_active.store(!to_live, std::memory_order_release);
+  m_pending_live.store(false, std::memory_order_release);
+  m_pending_slate.store(false, std::memory_order_release);
+  m_deadline_reported = false;
+  if (!m_cfg.audio && m_gate != nullptr) {
+    m_gate->video_on_live.store(to_live, std::memory_order_release);
+  }
+}
+
+auto stream_switch::follow_audio(bool to_live) -> void
+{
+  if (m_gate == nullptr) {
+    return;
+  }
+  stream_switch* follower = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(m_gate->mutex);
+    follower = m_gate->audio;
+  }
+  if (follower != nullptr) {
+    follower->video_crossed(to_live);
+  }
+}
+
+auto stream_switch::video_crossed(bool to_live) -> void
+{
+  bool flipped = false;
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    if (m_sel == nullptr || m_cfg.audio == false) {
+      return;
+    }
+    // The operator may have asked for the other direction while the video was
+    // waiting; the request wins, and the audio waits for that switch instead.
+    if (m_desired_slate == to_live) {
+      return;
+    }
+    if (m_slate_active.load(std::memory_order_acquire) == !to_live) {
+      m_pending_live.store(false, std::memory_order_release);
+      m_pending_slate.store(false, std::memory_order_release);
+      m_deadline_reported = false;
+      return;  // already there
+    }
+    flip_locked(to_live);
+    flipped = true;
+  }
+  if (flipped) {
+    note(to_live ? "standby switch: live (followed the video)"
+                 : "standby switch: slate (followed the video)");
+  }
+}
+
+auto stream_switch::arm_deadline_locked() -> void
+{
+  m_pending_since = std::chrono::steady_clock::now();
+  m_deadline_reported = false;
+}
+
+auto stream_switch::check_deadline_locked() -> std::string
+{
+  const bool live_pending = m_pending_live.load(std::memory_order_acquire);
+  const bool slate_pending = m_pending_slate.load(std::memory_order_acquire);
+  if (!live_pending && !slate_pending) {
+    m_deadline_reported = false;
+    return {};
+  }
+  if (m_deadline_reported) {
+    return {};
+  }
+  if (std::chrono::steady_clock::now() - m_pending_since
+      < std::chrono::milliseconds(m_deadline_ms)) {
+    return {};
+  }
+  m_deadline_reported = true;
+  m_degraded.store(true, std::memory_order_release);
+  m_deadline_reports.fetch_add(1, std::memory_order_relaxed);
+  const char* target = live_pending ? "live" : "slate";
+  const char* reason = m_cfg.audio || !live_pending
+      ? "the video switch has not crossed"
+      : "no live keyframe arrived";
+  return std::format(
+      "standby switch: DEGRADED -- {} switch pending after {} ms ({}); the "
+      "outputs stay on {}",
+      target, m_deadline_ms, reason,
+      m_slate_active.load(std::memory_order_acquire) ? "the slate" : "live");
+}
+
+auto stream_switch::audio_gate_open_locked() const -> bool
+{
+  if (m_gate == nullptr) {
+    return true;  // nothing to order against
+  }
+  return m_gate->video_on_live.load(std::memory_order_acquire)
+         == !m_desired_slate;
 }
 
 auto stream_switch::apply_desired_locked() -> transition
@@ -529,32 +660,55 @@ auto stream_switch::apply_desired_locked() -> transition
     if (m_slate_active.load(std::memory_order_acquire)) {
       return transition::none;
     }
-    g_object_set(m_sel, "active-pad", m_slate_pad, nullptr);
-    m_slate_active.store(true, std::memory_order_release);
+    if (m_cfg.audio && !audio_gate_open_locked()) {
+      // The audio only follows: it is moved when the video switch crosses.
+      if (m_pending_slate.load(std::memory_order_acquire)) {
+        return transition::none;
+      }
+      m_pending_slate.store(true, std::memory_order_release);
+      arm_deadline_locked();
+      return transition::waiting_slate;
+    }
+    // The slate ES is all-intra (render.cpp pins a keyframe on every frame), so
+    // every access unit of the loop is an independent one and the pad can be
+    // activated at whatever point the loop has reached: the first buffer the
+    // downstream sees is decodable. That also keeps standby instant instead of
+    // holding the operator for up to a loop waiting for the next IDR.
+    flip_locked(false);
     return transition::to_slate;
   }
-  if (!m_cfg.wait_for_keyframe || m_cfg.audio) {
-    // Audio frames are independent and every all-transcode session re-encodes
-    // the frame it receives, so neither waits: flip at the buffer boundary.
+  m_pending_slate.store(false, std::memory_order_release);
+  if (!m_slate_active.load(std::memory_order_acquire)) {
     m_pending_live.store(false, std::memory_order_release);
-    if (!m_slate_active.load(std::memory_order_acquire)) {
-      return transition::none;
-    }
-    g_object_set(m_sel, "active-pad", m_live_pad, nullptr);
-    m_slate_active.store(false, std::memory_order_release);
-    return transition::to_live;
+    return transition::none;
   }
-  // Keyframe-gated: ask for live, but leave the slate where it is until the
-  // live branch presents a keyframe.
-  if (m_slate_active.load(std::memory_order_acquire)) {
+  if (m_cfg.audio) {
+    // Audio follows the video switch: it may cross only after the video has.
+    if (audio_gate_open_locked()) {
+      flip_locked(true);
+      return transition::to_live;
+    }
     if (m_pending_live.load(std::memory_order_acquire)) {
       return transition::none;
     }
     m_pending_live.store(true, std::memory_order_release);
+    arm_deadline_locked();
     return transition::waiting;
   }
-  m_pending_live.store(false, std::memory_order_release);
-  return transition::none;
+  if (!m_cfg.wait_for_keyframe) {
+    // Every output re-encodes from the decoded frame it receives, so a mid-GOP
+    // join costs nothing and the switch does not wait for a buffer.
+    flip_locked(true);
+    return transition::to_live;
+  }
+  // Keyframe-gated: ask for live, but leave the slate where it is until the
+  // live branch presents a keyframe.
+  if (m_pending_live.load(std::memory_order_acquire)) {
+    return transition::none;
+  }
+  m_pending_live.store(true, std::memory_order_release);
+  arm_deadline_locked();
+  return transition::waiting;
 }
 
 auto stream_switch::set_slate(bool slate) -> void
@@ -568,11 +722,38 @@ auto stream_switch::set_slate(bool slate) -> void
   // Logged outside the lock: a caller's log callback must never be able to
   // deadlock the streaming path.
   if (result == transition::to_slate) {
+    if (!m_cfg.audio) {
+      follow_audio(false);
+    }
     note("standby switch: slate");
   } else if (result == transition::to_live) {
+    if (!m_cfg.audio) {
+      follow_audio(true);
+    }
     note("standby switch: live (immediate)");
   } else if (result == transition::waiting) {
     note("standby switch: waiting for a live keyframe");
+  } else if (result == transition::waiting_slate) {
+    note("standby switch: waiting for the video switch");
+  }
+}
+
+auto stream_switch::tick() -> void
+{
+  if (!m_attached.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (!m_pending_live.load(std::memory_order_acquire)
+      && !m_pending_slate.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::string message;
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    message = check_deadline_locked();
+  }
+  if (!message.empty()) {
+    note(message);
   }
 }
 
@@ -612,13 +793,39 @@ auto stream_switch::maybe_switch_to_live(GstBuffer* buf) -> void
     // The buffer is AU aligned (alignment=au) and this probe runs before the
     // selector's chain function, so activating the live pad here makes THIS
     // keyframe the first live buffer downstream. Never mid-AU.
-    g_object_set(m_sel, "active-pad", m_live_pad, nullptr);
-    m_pending_live.store(false, std::memory_order_release);
-    m_slate_active.store(false, std::memory_order_release);
+    flip_locked(true);
     switched = true;
   }
   if (switched) {
+    // The audio follows only now: the video selector is on live, and the
+    // follower is moved outside this switch's mutex.
+    follow_audio(true);
     note("standby switch: live (keyframe)");
+  }
+}
+
+auto stream_switch::on_branch_buffer(GstPad* pad, GstBuffer* buf) -> void
+{
+  if (buf == nullptr) {
+    return;
+  }
+  const bool buffer_is_live = pad == m_live_pad;
+  if (!m_cfg.audio && buffer_is_live) {
+    maybe_switch_to_live(buf);
+  }
+  // Audio switches are driven by the video switch's event, not by their own
+  // buffers; the only thing a buffer adds is a chance to notice the deadline.
+  if (!m_pending_live.load(std::memory_order_acquire)
+      && !m_pending_slate.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::string message;
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    message = check_deadline_locked();
+  }
+  if (!message.empty()) {
+    note(message);
   }
 }
 
@@ -640,11 +847,11 @@ auto stream_switch::note_caps(GstCaps* caps) -> void
   m_caps_changes.fetch_add(1, std::memory_order_relaxed);
 }
 
-auto stream_switch::live_probe_cb(GstPad* /*pad*/, GstPadProbeInfo* info,
-                                  gpointer user) -> GstPadProbeReturn
+auto stream_switch::branch_probe_cb(GstPad* pad, GstPadProbeInfo* info,
+                                    gpointer user) -> GstPadProbeReturn
 {
   auto* self = static_cast<stream_switch*>(user);
-  self->maybe_switch_to_live(GST_PAD_PROBE_INFO_BUFFER(info));
+  self->on_branch_buffer(pad, GST_PAD_PROBE_INFO_BUFFER(info));
   return GST_PAD_PROBE_OK;
 }
 

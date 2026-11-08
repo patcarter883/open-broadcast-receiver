@@ -71,6 +71,10 @@ struct stage_stats
   std::uint64_t switches = 0;  // set_slate() calls that changed the request
   std::uint64_t rebuilds = 0;
   bool caps_ok = true;      // the two video branches carry identical caps
+  // A switch waited longer than its deadline for a keyframe (or for the video
+  // switch, for audio). The selector is still on the old branch; the panel
+  // should say so rather than report the request as applied.
+  bool switch_degraded = false;
   std::uint64_t aus_in = 0;   // AUs handed to a selector's src pad
   std::uint64_t aus_out = 0;  // AUs published into an ES ring
 };
@@ -237,6 +241,7 @@ private:
   std::unique_ptr<class adts_looper> m_alooper;
   std::atomic<bool> m_slate_ready {false};
 
+  std::shared_ptr<switch_gate> m_gate;
   stream_switch m_vswitch;
   stream_switch m_aswitch;
 

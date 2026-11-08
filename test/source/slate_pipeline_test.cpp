@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -113,6 +114,8 @@ auto test_plan() -> void
   expect(v.find("textoverlay text=\"stream standby\" font-desc=\"Sans 48\"") != std::string::npos,
          "caption");
   expect(v.find("vah264enc bitrate=1500") != std::string::npos, "h264 encoder");
+  expect(v.find("key-int-max=1") != std::string::npos,
+         "the slate is all-intra: every AU is independently decodable");
   expect(v.find("h264parse config-interval=-1") != std::string::npos,
          "h264 parse with SPS/PPS on every keyframe");
   expect(v.find("video/x-h264,stream-format=byte-stream,alignment=au") != std::string::npos,
@@ -173,6 +176,8 @@ auto test_plan() -> void
     expect(plan->video_pipeline.find("av1enc target-bitrate=1500") != std::string::npos,
            "av1encoder and its bitrate property");
     expect(plan->video_pipeline.find("av1parse") != std::string::npos, "av1 parser");
+    expect(plan->video_pipeline.find("keyframe-max-dist=1") != std::string::npos,
+           "av1 slate is all-intra too (aom spells it keyframe-max-dist)");
     // av1parse has no config-interval; asking for one would fail the parse.
     expect(plan->video_pipeline.find("config-interval") == std::string::npos,
            "av1 does not ask for config-interval");
@@ -304,6 +309,18 @@ auto test_render() -> void
                                    data.data() + aus.front().first,
                                    aus.front().second),
            "the first AU is an IDR: the loop restarts there");
+    // The slate is joined wherever the loop happens to be when standby is
+    // pressed, so every AU has to stand on its own, not just the first.
+    std::size_t non_keyframes = 0;
+    for (const auto& span : aus) {
+      if (!standby::au_is_keyframe(standby::es_codec::h264,
+                                   data.data() + span.first, span.second)) {
+        ++non_keyframes;
+      }
+    }
+    expect(non_keyframes == 0,
+           std::format("every slate AU is an IDR ({} of {} are not)",
+                       non_keyframes, aus.size()).c_str());
   }
 
   // Audio must parse as ADTS frames -- a file aacparse cannot read is a slate

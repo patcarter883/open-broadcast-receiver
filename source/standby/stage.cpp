@@ -331,6 +331,7 @@ auto stage::stats() const -> stage_stats
   s.switches = m_switches.load(std::memory_order_relaxed);
   s.rebuilds = m_rebuilds.load(std::memory_order_relaxed);
   s.caps_ok = m_caps_ok.load(std::memory_order_acquire);
+  s.switch_degraded = m_vswitch.degraded() || m_aswitch.degraded();
   s.aus_in = m_aus_in.load(std::memory_order_relaxed);
   s.aus_out = m_aus_out.load(std::memory_order_relaxed);
   return s;
@@ -621,18 +622,24 @@ auto stage::attach_switches() -> bool
   if (m_cfg.slate_video_es.empty()) {
     return true;  // no selectors were built
   }
+  // One gate per session: the audio switch learns from it what the video
+  // selector has actually done, so the two can never cross out of order.
+  m_gate = std::make_shared<switch_gate>();
+
   switch_config video;
   video.audio = false;
   // A copy destination joins the live stream at whatever frame it gets: a
   // mid-GOP join is a frozen picture until the next IDR. A session where every
   // output transcodes does not care, so it flips at once.
   video.wait_for_keyframe = m_cfg.any_copy_output;
+  video.gate = m_gate;
   video.live_caps = m_video_caps;
   video.slate_caps = m_video_caps;
 
   switch_config audio;
   audio.audio = true;
   audio.wait_for_keyframe = false;
+  audio.gate = m_gate;
   audio.live_caps = m_audio_caps;
   audio.slate_caps = m_audio_caps;
 
@@ -756,6 +763,11 @@ auto stage::feed_loop() -> void
   constexpr auto k_read_timeout = std::chrono::milliseconds {50};
 
   while (!m_feed_stopping.load(std::memory_order_acquire)) {
+    // A branch that has gone silent produces no buffer probes, so a switch
+    // waiting for it is also given a deadline check here. Both calls return
+    // immediately when nothing is pending.
+    m_vswitch.tick();
+    m_aswitch.tick();
     if (m_dsrc == nullptr || m_cfg.input == nullptr || m_consumer < 0) {
       std::this_thread::sleep_for(k_idle_sleep);
       continue;
