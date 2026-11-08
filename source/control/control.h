@@ -5,6 +5,7 @@
 #define OPEN_BROADCAST_RECEIVER_SOURCE_CONTROL_CONTROL_H
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -37,6 +38,37 @@ auto parse_start_body(std::string_view body,
 // entirely. Exposed so the per-output serialisation is unit-testable without
 // a live server.
 auto output_stat_json(const output_stat& stat, bool stats_view) -> std::string;
+
+// The standby/slate snapshot GET /status and GET /stats carry as a top-level
+// `standby` object (CONTRACT §5, schema_version 5). Built from atomics only —
+// the mode controller's counters plus the stage's stats — so reading it never
+// takes a pipeline lock.
+//
+// `enabled` echoes the standby.enabled the RUNNING session was started with;
+// `mode` is the source actually feeding the fan-out ("live" | "slate" |
+// "switching", the last while the stage has not reached the request yet — a
+// copy output's keyframe wait); `switches` counts live⇄slate transitions;
+// `last_live_ms_ago` is the age of the last live payload; `caps_ok` says the
+// slate branch negotiated the same caps as live; `stage_rebuilds` counts stage
+// rebuilds; and `degraded` is the reason the slate is running below its
+// request (a render failure, "geometry defaulted", "stage failed to start"),
+// or an empty string when it is healthy.
+struct standby_stat
+{
+  bool enabled = false;
+  std::string mode = "live";
+  std::uint64_t switches = 0;
+  std::int64_t last_live_ms_ago = 0;
+  bool caps_ok = true;
+  std::uint64_t stage_rebuilds = 0;
+  std::string degraded;
+};
+
+// Serialise the standby snapshot. Both views carry the same members: the
+// object is small and a panel should not have to branch on which endpoint it
+// called (a test pins that, so the two cannot silently diverge).
+auto standby_stat_json(const standby_stat& stat, bool stats_view) -> std::string;
+
 class control_server
 {
 public:
@@ -56,6 +88,8 @@ public:
                                      int& http_status)>;
   // Snapshot of per-output + RIST + recording counters, built from atomics.
   using stats_fn = std::function<session_stats()>;
+  // Snapshot of the standby/slate state (schema_version 5), atomics only.
+  using standby_fn = std::function<standby_stat()>;
 
   explicit control_server(app_context& ctx);
   ~control_server();
@@ -64,8 +98,8 @@ public:
   control_server(control_server&&) = delete;
   auto operator=(control_server&&) -> control_server& = delete;
 
-  auto set_handlers(start_fn on_start, stop_fn on_stop, stats_fn get_stats)
-      -> void;
+  auto set_handlers(start_fn on_start, stop_fn on_stop, stats_fn get_stats,
+                    standby_fn get_standby = {}) -> void;
 
   // Bind + start serving on a background thread. Returns false if the bind
   // fails (port in use / not permitted).
@@ -77,6 +111,8 @@ private:
   auto setup_routes() -> void;
   auto build_status_json() const -> std::string;
   auto build_stats_json() const -> std::string;
+  // The standby object (serialised), from the atomics-only snapshot callback.
+  auto standby_object() const -> std::string;
 
   app_context& m_ctx;
   httplib::Server m_srv;
@@ -84,6 +120,7 @@ private:
   start_fn m_on_start;
   stop_fn m_on_stop;
   stats_fn m_get_stats;
+  standby_fn m_get_standby;
   std::atomic_bool m_serving {false};
 };
 

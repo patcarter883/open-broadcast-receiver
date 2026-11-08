@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -29,6 +30,9 @@
 #include "fanout/ring.h"
 #include "lib/lib.h"
 #include "receive/receive.h"
+#include "standby/controller.h"
+#include "standby/render.h"
+#include "standby/stage.h"
 
 namespace
 {
@@ -133,21 +137,33 @@ auto steady_ms() -> int64_t
 }
 
 // The live fan-out session: ring + consumers. Owned by main, guarded by the
-// lifecycle mutex. Construction: ring → decoder (only for a transcode session)
-// → outputs → recorder → RIST last (data only flows once every consumer
-// exists). The decoder owns the frame_ring that transcode outputs pull from;
-// copy outputs and the recorder stay on the ts_ring. Teardown REVERSE of data
-// flow: RIST first (joins librist workers ⇒ producer can no longer touch the
-// ring), then ring close (wakes consumers), then the decoder (stops feeding,
-// closes the frame_ring), outputs/recorder, then the ring itself.
-// (TRANSPORT_PROFILE §3.6's teardown note, tightened for memory safety —
-// recorded in DECISIONS.md.)
+// lifecycle mutex. Construction: ring → standby (slate + ES rings + stage) →
+// decoder (only for a transcode session) → outputs → recorder → RIST last (data
+// only flows once every consumer exists). The decoder owns the frame_ring that
+// transcode outputs pull from; copy outputs and the recorder stay on the
+// ts_ring. With standby enabled the stage is the ONE demux: it publishes
+// compressed AUs into es_video/es_audio, and the decoder and every output read
+// those instead of the ts_ring (fanout/output.h's es_sources).
+// Teardown REVERSE of data flow: RIST first (joins librist workers ⇒ producer
+// can no longer touch the ring), then the mode controller (it is the only
+// caller of stage::set_slate), then the stage, then ring close (wakes
+// consumers), then the decoder (stops feeding, closes the frame_ring),
+// outputs/recorder, then the rings themselves — the ES rings must outlive every
+// consumer of them. (TRANSPORT_PROFILE §3.6's teardown note, tightened for
+// memory safety — recorded in DECISIONS.md.)
 struct session
 {
   std::unique_ptr<ts_ring> ring;
+  std::unique_ptr<es_ring> es_video;  // standby only: the stage's AU rings
+  std::unique_ptr<es_ring> es_audio;
+  std::unique_ptr<standby::stage> stg;  // standby only: the one demux
+  std::unique_ptr<standby::standby_controller> ctl;  // standby only: live⇄slate
   std::unique_ptr<decoder> dec;  // non-null only when transcode is requested
   std::vector<std::unique_ptr<output>> outputs;
   std::unique_ptr<recorder> rec;
+  // Why the slate is running below what was asked (render failure reason or
+  // "geometry defaulted"). Empty is healthy; /status echoes it verbatim.
+  std::string standby_degraded;
 };
 }  // namespace
 
@@ -351,8 +367,26 @@ auto main(int argc, char** argv) -> int
   auto teardown = [&ctx, &sess]() -> void
   {
     ctx.receive->stop();  // joins librist workers: producer is now quiescent
+    // The controller goes before the stage: it is the only caller of
+    // stage::set_slate(), so joining it first makes the stage's desired mode
+    // final before the stage tears its switches down.
+    if (sess.ctl) {
+      sess.ctl->stop();
+      sess.ctl.reset();
+    }
+    if (sess.stg) {
+      sess.stg->stop();
+    }
     if (sess.ring) {
       sess.ring->close();  // wake all blocked consumers
+    }
+    // The ES rings are closed, not destroyed: every consumer below still holds
+    // a pointer and must be woken out of its read() before the rings go.
+    if (sess.es_video) {
+      sess.es_video->close();
+    }
+    if (sess.es_audio) {
+      sess.es_audio->close();
     }
     if (sess.dec) {
       sess.dec->stop();  // stop feeding + close the frame_ring
@@ -366,7 +400,11 @@ auto main(int argc, char** argv) -> int
       sess.rec.reset();
     }
     sess.dec.reset();
+    sess.stg.reset();
+    sess.es_video.reset();  // no consumer exists any more at this point
+    sess.es_audio.reset();
     sess.ring.reset();
+    sess.standby_degraded.clear();
   };
 
   const auto do_start = [&ctx, &lifecycle, &sess, &teardown, &egress, &opts,
@@ -464,6 +502,130 @@ auto main(int argc, char** argv) -> int
     sess.ring = std::make_unique<ts_ring>(
         ts_ring::size_for_bandwidth(cfg.ingest.bandwidth));
 
+    // ---- standby (plan D2/D3) -------------------------------------------
+    // With standby DISABLED this whole block is skipped and the construction
+    // path below is exactly today's: no stage, no ES rings, the decoder and
+    // every output read the ts_ring.
+    //
+    // With it enabled the shared stage becomes the session's ONE demux and
+    // publishes compressed AUs into two ES rings that the decoder and every
+    // output consume. The slate is rendered here, on the /start path, bounded
+    // (<=5 s per pipeline) and non-fatal: a failed render still brings the
+    // session up, live-only, with the reason in /status.standby.degraded.
+    es_sources es {};
+    if (cfg.standby.enabled) {
+      const int ring_kbps =
+          std::max(cfg.standby.bitrate_kbps, cfg.ingest.bandwidth);
+      sess.es_video =
+          std::make_unique<es_ring>(es_ring::size_for_bps(ring_kbps));
+      sess.es_audio =
+          std::make_unique<es_ring>(es_ring::size_for_bps(ring_kbps));
+
+      // The slate must match the picture the destinations already negotiated.
+      // A 0 anywhere means "unknown": the standby block falls back to the
+      // declared source geometry, and only when THAT is unknown too does the
+      // slate default to 1080p30 — recorded as degraded, because a slate at a
+      // guessed geometry is a caps mismatch the stage will refuse to switch to.
+      int sw = cfg.standby.width > 0 ? cfg.standby.width : cfg.source.width;
+      int sh = cfg.standby.height > 0 ? cfg.standby.height : cfg.source.height;
+      int sfps = cfg.standby.fps > 0 ? cfg.standby.fps : cfg.source.fps;
+      if (sw <= 0 || sh <= 0 || sfps <= 0) {
+        sw = 1920;
+        sh = 1080;
+        sfps = 30;
+        sess.standby_degraded = "geometry defaulted";
+        stderr_log("standby: session geometry unknown; the slate defaults to "
+                   "1920x1080@30 (degraded)\n");
+      }
+
+      standby::slate_request req;
+      req.codec = to_string(cfg.in_codec);
+      req.width = sw;
+      req.height = sh;
+      req.fps = sfps;
+      req.bitrate_kbps = cfg.standby.bitrate_kbps;
+      req.brand_path = cfg.standby.brand_image;
+      req.text = cfg.standby.text;
+      // One cache directory for every session on this host: the render is
+      // keyed by geometry/text/branding, so a restart of the same body and a
+      // second session with the same slate reuse the cached ES files instead
+      // of re-encoding them on the /start path.
+      {
+        std::error_code ec;
+        const auto dir = std::filesystem::temp_directory_path(ec)
+            / "open-broadcast-slate";
+        req.out_dir = dir.string();
+      }
+      // The shipped mark is optional: the image may not be installed on a
+      // minimal host, and a missing file must cost the slate its logo, never
+      // the render.
+      {
+        constexpr std::string_view k_logo =
+            "/usr/share/open-broadcast/logo.png";
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(k_logo, ec)) {
+          req.logo_path = std::string {k_logo};
+        }
+      }
+
+      std::string render_err;
+      const auto assets = standby::render_slate(req, render_err);
+      if (!assets) {
+        sess.standby_degraded =
+            render_err.empty() ? "slate render failed" : render_err;
+        stderr_log("standby: slate render failed (" + sess.standby_degraded
+                   + "); the session runs without a slate\n");
+      }
+
+      standby::stage_config scfg;
+      scfg.in_codec = to_string(cfg.in_codec);
+      scfg.width = sw;
+      scfg.height = sh;
+      scfg.fps = sfps;
+      if (assets) {
+        scfg.slate_video_es = assets->video_path;
+        scfg.slate_audio_es = assets->audio_path;
+      }
+      // A mid-GOP join only matters to a destination that copies the stream;
+      // only then does the stage's video switch wait for a keyframe.
+      scfg.any_copy_output = std::any_of(
+          cfg.outputs.begin(),
+          cfg.outputs.end(),
+          [](const output_config& out) -> bool
+          { return out.transcode.target == transcode_target::none; });
+      scfg.live_gap_ms = cfg.standby.live_gap_ms;
+      scfg.live_hold_ms = cfg.standby.live_hold_ms;
+      scfg.max_gap_ms = cfg.standby.max_gap_ms;
+      scfg.video_ring = sess.es_video.get();
+      scfg.audio_ring = sess.es_audio.get();
+      scfg.input = sess.ring.get();
+
+      sess.stg = std::make_unique<standby::stage>(&stderr_log);
+      if (!sess.stg->start(scfg)) {
+        // The stage is the ES rings' only producer: without it every output
+        // would starve on an empty ring. Fall back to today's path (drop the
+        // rings so the outputs and the decoder read the ts_ring) and say so.
+        stderr_log("standby: the shared stage failed to start; the session "
+                   "falls back to the transport-stream path\n");
+        sess.stg.reset();
+        sess.es_video.reset();
+        sess.es_audio.reset();
+        if (sess.standby_degraded.empty()) {
+          sess.standby_degraded = "stage failed to start";
+        }
+      } else {
+        es.video = sess.es_video.get();
+        // The audio ring is always offered: whether the ingest actually carries
+        // audio is only known once the demuxer sees a pad (the stage publishes
+        // nothing into it otherwise), and a slate session's audio branch must
+        // stay negotiated for the live switch to be seamless. An output whose
+        // ring stays empty simply feeds no audio, exactly as today's ts path
+        // does for a video-only source.
+        es.audio = sess.es_audio.get();
+        es.video_codec = cfg.in_codec;
+      }
+    }
+
     // The shared decode stage is built ONLY when an output opts into the
     // transcode tier; a copy-only session constructs nothing here and the
     // default tier is byte-identical to before.
@@ -485,7 +647,10 @@ auto main(int argc, char** argv) -> int
             if (ctx.state.last_bus_error.empty()) {
               ctx.state.last_bus_error = reason;
             }
-          });
+          },
+          // Standby: the video AUs the stage already demuxed and parsed. Null
+          // is the ts_ring path, unchanged.
+          es.video);
       sess.dec->start();
     }
 
@@ -510,7 +675,8 @@ auto main(int argc, char** argv) -> int
           *sess.ring,
           sess.dec ? &sess.dec->frames() : nullptr,
           &stderr_log,
-          repin);
+          repin,
+          es);
       out->start();
       sess.outputs.push_back(std::move(out));
     }
@@ -547,6 +713,24 @@ auto main(int argc, char** argv) -> int
     ctx.state.rist_bytes.store(0, std::memory_order_relaxed);
     ctx.state.last_payload_ms.store(0, std::memory_order_relaxed);
     ctx.state.is_running.store(true, std::memory_order_release);
+
+    // The slate/live decision, last: it samples last_payload_ms, which is
+    // cleared above, and drives only stage::set_slate(). The stage already put
+    // the slate on air in start() when it has one, so the controller's opening
+    // state is the same slate -- by construction, not by a race.
+    if (cfg.standby.enabled && sess.stg) {
+      const bool slate_ready = sess.stg->stats().slate_active;
+      standby::stage* stg = sess.stg.get();
+      sess.ctl = std::make_unique<standby::standby_controller>(
+          ctx.state.last_payload_ms,
+          cfg.standby.live_gap_ms,
+          cfg.standby.live_hold_ms,
+          [stg](bool slate) -> void { stg->set_slate(slate); },
+          slate_ready,
+          &stderr_log);
+      sess.ctl->start();
+    }
+
     http_status = 200;
     return true;
   };
@@ -624,7 +808,50 @@ auto main(int argc, char** argv) -> int
     return snap;
   };
 
-  control.set_handlers(do_start, do_stop, get_stats);
+  // Standby snapshot for /status + /stats (CONTRACT §5). Atomics only: the
+  // mode controller's counters and the stage's stats. `lifecycle` keeps the
+  // stage/controller from being torn down under the read; no pipeline lock and
+  // no GStreamer call is made, so a cadence-critical poll cannot stall a feed.
+  const auto get_standby = [&ctx, &lifecycle, &sess]() -> standby_stat
+  {
+    standby_stat snap;
+    std::lock_guard<std::mutex> life(lifecycle);
+    if (!ctx.state.is_running.load(std::memory_order_acquire)) {
+      return snap;  // stopped: enabled=false, mode=live, zeroed counters
+    }
+    {
+      std::lock_guard<std::mutex> guard(ctx.state.mutex);
+      snap.enabled = ctx.state.cfg.standby.enabled;
+    }
+    if (!snap.enabled) {
+      return snap;  // standby off: today's answer, and no slate machinery
+    }
+    snap.degraded = sess.standby_degraded;
+    if (!sess.stg) {
+      return snap;  // enabled but the stage never came up: live, degraded why
+    }
+    const standby::stage_stats st = sess.stg->stats();
+    snap.caps_ok = st.caps_ok;
+    snap.stage_rebuilds = st.rebuilds;
+    if (sess.ctl) {
+      snap.switches = sess.ctl->switches();
+      snap.last_live_ms_ago = sess.ctl->last_live_ms_ago();
+      // Where the fan-out is ACTUALLY fed: the stage's selector position. While
+      // the request and the position disagree the switch is mid-flight (a copy
+      // output's keyframe wait), which is the "switching" the panel shows.
+      const bool want_slate = sess.ctl->slate();
+      if (want_slate == st.slate_active) {
+        snap.mode = st.slate_active ? "slate" : "live";
+      } else {
+        snap.mode = "switching";
+      }
+    } else {
+      snap.mode = st.slate_active ? "slate" : "live";
+    }
+    return snap;
+  };
+
+  control.set_handlers(do_start, do_stop, get_stats, get_standby);
 
   if (!control.listen(bind_host, control_port)) {
     std::cerr << "FATAL: failed to bind control server to " << bind_host << ":"
@@ -641,32 +868,60 @@ auto main(int argc, char** argv) -> int
             << "outputs[]. Ctrl-C to quit." << std::endl;
 
   // --- idle-timeout watchdog (§1.5) -----------------------------------------
+  // The policy lives in standby::should_end_session so the two cases cannot
+  // drift apart: with standby OFF this is today's --idle-timeout (no RIST
+  // payload), and with standby ON it is max_live_gap_s of no LIVE media — a
+  // slate-running session must not be killed for "no payload", because a slate
+  // session with no payload is exactly what it is for.
   std::atomic_bool shutting_down {false};
   std::thread watchdog(
       [&]() -> void
       {
         while (!shutting_down.load(std::memory_order_acquire)) {
           std::this_thread::sleep_for(k_watchdog_tick);
-          if (opts.idle_timeout_s <= 0
-              || !ctx.state.is_running.load(std::memory_order_acquire))
-          {
+          if (!ctx.state.is_running.load(std::memory_order_acquire)) {
             continue;
           }
-          const int64_t last =
+          standby::session_end_policy policy;
+          std::int64_t started_ms = 0;
+          {
+            std::lock_guard<std::mutex> guard(ctx.state.mutex);
+            policy.standby_enabled = ctx.state.cfg.standby.enabled;
+            policy.max_live_gap_s = ctx.state.cfg.standby.max_live_gap_s;
+            started_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             ctx.state.started_at.time_since_epoch())
+                             .count();
+          }
+          policy.idle_timeout_s = opts.idle_timeout_s;
+          if (!policy.standby_enabled && policy.idle_timeout_s <= 0) {
+            continue;  // the watchdog is off
+          }
+          std::int64_t last =
               ctx.state.last_payload_ms.load(std::memory_order_relaxed);
           if (last == 0) {
-            continue;  // no payload yet: the pre-start TTL is the agent's job
+            if (!policy.standby_enabled) {
+              continue;  // no payload yet: the pre-start TTL is the agent's job
+            }
+            // Standby ON: a session that has never seen live media still has a
+            // live-gap budget, measured from the session start.
+            last = started_ms;
           }
-          if (steady_ms() - last
-              > static_cast<int64_t>(opts.idle_timeout_s) * 1000)
+          if (last == 0
+              || !standby::should_end_session(steady_ms(), last, policy)) {
+            continue;
+          }
           {
             std::lock_guard<std::mutex> life(lifecycle);
             if (!ctx.state.is_running.load(std::memory_order_acquire)) {
               continue;
             }
-            stderr_log("idle-timeout: no RIST payload for "
-                       + std::to_string(opts.idle_timeout_s)
-                       + " s; stopping session\n");
+            const std::string budget =
+                policy.standby_enabled
+                    ? std::to_string(policy.max_live_gap_s)
+                          + " s without live media (standby max_live_gap_s)"
+                    : std::to_string(policy.idle_timeout_s)
+                          + " s without RIST payload (--idle-timeout)";
+            stderr_log("idle-timeout: " + budget + "; stopping session\n");
             ctx.state.is_running.store(false, std::memory_order_release);
             teardown();
             std::lock_guard<std::mutex> guard(ctx.state.mutex);

@@ -252,3 +252,16 @@ if(NOT OBR_TESTS_ONLY)
   add_test(NAME stage_test COMMAND stage_test)
   set_tests_properties(stage_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
+
+# controller_test (plan D1). The mode controller is pure C++ -- no GStreamer, no
+# pipeline -- so the decision logic (hysteresis, the session-end policy) is
+# asserted in the fast lane with an explicit clock. The .cpp is compiled into
+# the test directly, exactly like es_ring_test and timeline_test, so the
+# tests-only lane needs no extra library target.
+add_executable(controller_test
+  source/controller_test.cpp
+  ${CMAKE_SOURCE_DIR}/source/standby/controller.cpp)
+target_include_directories(controller_test PRIVATE ${CMAKE_SOURCE_DIR}/source)
+target_link_libraries(controller_test PRIVATE Threads::Threads)
+target_compile_features(controller_test PRIVATE cxx_std_20)
+add_test(NAME controller_test COMMAND controller_test)
