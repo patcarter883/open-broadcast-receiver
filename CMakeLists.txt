@@ -39,6 +39,10 @@ if(OBR_TESTS_ONLY)
   target_include_directories(ring_lib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/source)
   target_compile_features(ring_lib PUBLIC cxx_std_20)
 
+  # Headers only in this lane: the AU splitter is pure, the GStreamer half of
+  # the slate is not compiled.
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/standby)
+
   include(CTest)
   add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/test)
   return()
@@ -59,6 +63,7 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/lib)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/fanout)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/receive)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/control)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/standby)
 
 include(CTest)
 if(BUILD_TESTING)

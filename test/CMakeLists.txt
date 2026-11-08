@@ -189,3 +189,27 @@ add_executable(timeline_test
 target_include_directories(timeline_test PRIVATE ${CMAKE_SOURCE_DIR}/source)
 target_compile_features(timeline_test PRIVATE cxx_std_20)
 add_test(NAME timeline_test COMMAND timeline_test)
+
+# Standby slate (plan B1/B2).
+#
+# es_looper_test is pure: it pins the access-unit boundaries both framings
+# produce, and a mid-AU splice is the one slate failure that reaches air as
+# corruption. It runs in both lanes -- in the tests-only lane standby_lib is the
+# headers alone, and the GStreamer half of es_looper.h is not declared.
+add_executable(es_looper_test source/es_looper_test.cpp)
+target_link_libraries(es_looper_test PRIVATE standby_lib Threads::Threads)
+target_compile_features(es_looper_test PRIVATE cxx_std_20)
+add_test(NAME es_looper_test COMMAND es_looper_test)
+
+# slate_pipeline_test asserts the built pipeline strings, and (when a software
+# h264 encoder is installed) renders one real slate: it needs the media stack.
+if(NOT OBR_TESTS_ONLY)
+  add_executable(slate_pipeline_test source/slate_pipeline_test.cpp)
+  target_link_libraries(slate_pipeline_test PRIVATE
+    standby_lib
+    PkgConfig::gstreamer
+    Threads::Threads)
+  target_compile_features(slate_pipeline_test PRIVATE cxx_std_20)
+  add_test(NAME slate_pipeline_test COMMAND slate_pipeline_test)
+  set_tests_properties(slate_pipeline_test PROPERTIES TIMEOUT 120)
+endif()
