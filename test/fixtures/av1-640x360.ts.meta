@@ -1,0 +1,6 @@
+encoder=vaav1enc
+frames=90
+fps=30
+width=640
+height=360
+bytes=451388
