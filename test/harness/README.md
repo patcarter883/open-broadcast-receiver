@@ -45,25 +45,31 @@ do not), and it is what the harness reads.
 | `transcode-av` | NV12 frames + AAC-in-MPEG-TS | publishes |
 | `transcode-av1` | AV1-in-MPEG-TS on the ts_ring, decoded by the receiver's own decode stage into the frame ring (`--fixture`, `FIXTURE=`) | publishes, with `vaav1dec` having produced frames |
 | `transcode-video-only` | NV12 frames, no audio at all | publishes once the 4 s probe retires the capless audio pad (unlink + EOS) |
-| `copy-av` | H.264+AAC MPEG-TS | publishes |
-| `copy-video-only` | H.264-only MPEG-TS | does **not** publish (the copy template has no timeout unlink, so flvmux waits for audio forever) |
+| `copy-av` | H.264+AAC MPEG-TS, video stream first in the PMT | publishes |
+| `copy-audio-first` | the same clip with the audio stream first in the PMT, so `tsdemux` announces the audio pad before the video pad | publishes, audio as AAC on the muxer's audio pad and H.264 as AVC on its video pad |
+| `copy-non-aac` | H.264 with AC-3 audio: an audio pad no branch can carry | publishes video-only; the AC-3 pad is sunk by the drop funnel, `audio_dropped: true` |
+| `copy-video-only` | H.264-only MPEG-TS | publishes video-only, after the 4 s probe retires the silent audio pad |
 
-`copy-video-only` is a test of a known gap, not a flake: it passes when the
-server receives nothing and the muxer's source pad stays at zero.
+Every mode must publish; the server's counter decides. `copy-audio-first` is the
+one that would catch a pad-order regression: the branch a demuxer pad reaches is
+decided from that pad's caps, so arrival order cannot put audio into `h264parse`.
 
 ## PASS rule
 
 A mode passes when the server's `bytes_in` grew by at least 32 KiB after at least
-2 s of feeding, matching the mode's expectation, and -- when it published -- when
-the caps that reached the muxer's video pad are H.264 4:2:0 8-bit and the
-encoder's sink pad is `video/x-raw, format=NV12`. Those caps are read from the
-running pipeline, not from the template, so a negotiation that stopped pinning
-the format fails the mode instead of silently publishing High 4:4:4 10-bit. The floor exists because
+2 s of feeding, the caps that reached the muxer's video pad are H.264 4:2:0
+8-bit, and the encoder's sink pad is `video/x-raw, format=NV12`. Those caps are
+read from the running pipeline, not from the template, so a negotiation that
+stopped pinning the format fails the mode instead of silently publishing High
+4:4:4 10-bit. The floor exists because
 nginx-rtmp counts the RTMP handshake and the connect/publish commands (~3 KB): a
 publisher that connects and then sends nothing would otherwise look healthy —
 exactly the shape of the live-rig failure. The video-only mode additionally
 requires that no audio buffer reached the muxer, and the audio modes that at
-least one did.
+least one did. The copy modes additionally require the muxer's video pad caps to
+be `video/x-h264, stream-format=avc` and its audio pad caps to be
+`audio/mpeg, ..., stream-format=raw`: only `h264parse` and `aacparse` produce
+those, so the caps name the branch each stream reached.
 
 Per-run report:
 
@@ -85,8 +91,10 @@ Against `alfg/nginx-rtmp` on this box, with `vah264enc`:
 | mode | result | numbers |
 | --- | --- | --- |
 | `transcode-av` | PASS | 61 frames pushed, 61 video + 90 audio buffers at the muxer, 138 emitted, server +608 689 B; encoder input `video/x-raw,format=NV12`; muxer video `profile=high, chroma-format=4:2:0, bit-depth-luma=8` |
-| `copy-av` | PASS | 69 video + 109 audio buffers at the muxer, 90 emitted, server +283 032 B |
-| `copy-video-only` | PASS (expected stall) | 53 video buffers at the muxer, 0 emitted, server +288 B (handshake only) |
+| `copy-av` | PASS | `fixture pad order video_0_0041 audio_0_0042`; 69 video + 109 audio buffers at the muxer, 90 emitted, server +283 023 B |
+| `copy-audio-first` | PASS | `fixture pad order audio_0_0041 video_0_0042` (audio announced first); 69 video + 109 audio buffers at the muxer, 90 emitted, server +283 029 B |
+| `copy-non-aac` | PASS | `fixture pad order video_0_0041 audio_0_0042`; AC-3 pad sunk, 112 video buffers at the muxer, 87 emitted, server +678 726 B |
+| `copy-video-only` | PASS | `fixture pad order video_0_0041`; 112 video buffers at the muxer, 87 emitted, no audio buffer, server +678 726 B |
 | `transcode-video-only` | PASS | 109 video buffers at the muxer, 132 emitted, server +1 190 073 B, no audio buffer at the muxer |
 
 The H.264 fixtures state `format=NV12` and nothing wider: an unpinned
@@ -97,16 +105,16 @@ what the encoder sends (4:2:0 8-bit) and not what any destination decodes.
 
 flvmux keeps a linked request pad in its collect-pad aggregate even after its
 peer is unlinked. With no caps on that pad the muxer never completes
-negotiation and emits nothing, so video backs up through the queue into
-`vah264enc` and then into the 4 MB appsrc, and the stall watchdog rebuilds the
-attempt every 4 s. Isolated on the same flvmux/vah264enc chain with a starved
-audio appsrc: doing nothing yields 0 muxer buffers over the next 4 s, unlinking
-the peer also yields 0, and unlinking then pushing EOS on the muxer's audio sink
-pad yields 273.
+negotiation and emits nothing, so video backs up into the 4 MB appsrc (transcode:
+through `vah264enc` first), and a copy-only output simply never prerolls.
+Isolated on the same flvmux/vah264enc chain with a starved audio appsrc: doing
+nothing yields 0 muxer buffers over the next 4 s, unlinking the peer also yields
+0, and unlinking then pushing EOS on the muxer's audio sink pad yields 273.
 
-`output::feed_transcode`'s 4 s probe therefore sends `gst_event_new_eos()` on
-the muxer's audio sink pad after the unlink, logs whether the EOS was accepted,
-and only then reports the pad dropped.
+`output::probe_muxer_audio`, run 4 s into every RTMP attempt from both feed paths
+(copy and transcode), therefore sends `gst_event_new_eos()` on the muxer's audio
+sink pad after the unlink, logs whether the EOS was accepted, and only then
+reports the pad dropped.
 
 ## Notes
 

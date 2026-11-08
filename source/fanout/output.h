@@ -137,6 +137,23 @@ private:
   // Transcode feed step (video from frame_ring, AAC audio from ts_ring).
   // Returns false when the attempt should end (appsrc flushing / stopping).
   auto feed_transcode(bool& video_caps_set) -> bool;
+  // What a demuxer's src pad carries, decided from its caps at announce time.
+  enum class pad_role : std::uint8_t
+  {
+    h264_video,
+    aac_audio,
+    other_audio,
+    unsupported
+  };
+  static auto pad_role_of(GstPad* pad) -> pad_role;
+  // Link `pad` to `element_name`'s static pad (or requested pad when the name
+  // ends in %u). Returns true only when this call made the link.
+  auto link_pad_to(GstPad* pad, const char* element_name, const char* pad_name)
+      -> bool;
+  // Unlink + EOS the muxer's audio pad once, 4 s into an attempt, when it has
+  // received no buffer: flvmux emits nothing while that pad is silent and
+  // capless, and unlink alone leaves it in the collect aggregate.
+  auto probe_muxer_audio() -> void;
   // Set the encoded appsrc caps (raw NV12) from a decoded frame's metadata.
   auto set_video_caps(std::size_t frame_bytes,
                       const frame_ring::frame_meta& meta) -> void;

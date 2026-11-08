@@ -13,14 +13,15 @@
 # Env overrides: HARNESS_BIN, MODES, RTMP_PORT, STAT_PORT, IMAGE, LOG_DIR,
 # FIXTURE (AV1-in-MPEG-TS clip required by the transcode-av1 mode; generate it
 # with `make fixture`).
-# Exit status: 0 when every mode behaved as its expectation says, 1 otherwise,
+# Exit status: 0 when every mode published (judged by the sink's own bytes_in),
+# 1 otherwise,
 # 2 when the harness could not be run at all (no docker, no sink, no binary).
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HARNESS_BIN="${HARNESS_BIN:-${REPO_ROOT}/build/test/rtmp_publish_harness}"
-MODES="${MODES:-transcode-av transcode-video-only copy-av copy-video-only}"
+MODES="${MODES:-transcode-av transcode-video-only copy-av copy-audio-first copy-non-aac copy-video-only}"
 RTMP_PORT="${RTMP_PORT:-11935}"
 STAT_PORT="${STAT_PORT:-18080}"
 IMAGE="${IMAGE:-alfg/nginx-rtmp:latest}"
@@ -115,7 +116,7 @@ for line in "${results[@]}"; do
 done
 echo "logs       ${LOG_DIR}"
 if [[ "$failures" -ne 0 ]]; then
-  echo "result     ${failures} mode(s) did not match their expectation"
+  echo "result     ${failures} mode(s) did not publish"
   exit 1
 fi
-echo "result     all modes matched their expectation"
+echo "result     all modes published"

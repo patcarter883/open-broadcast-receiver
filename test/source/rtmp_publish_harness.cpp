@@ -27,13 +27,21 @@
 //   transcode-av          h264 transcode, frame ring plus a real AAC-in-MPEG-TS
 //                         clip in the ts_ring (the audio copy branch).
 //   copy-av               copy-only tier (tsparse/tsdemux/flvmux) fed an
-//                         H.264+AAC MPEG-TS clip.
-//   copy-video-only       copy-only tier fed a video-only MPEG-TS clip. Expected
-//                         to STALL: the copy template links its audio pad by
-//                         request pad and has no timeout unlink, so flvmux waits
-//                         for audio forever. The harness asserts that
-//                         expectation, which is what makes it a test of a known
-//                         gap rather than a flaky failure.
+//                         H.264+AAC MPEG-TS clip whose PMT lists the video
+//                         stream first.
+//   copy-audio-first      the same tier fed a clip whose PMT lists the audio
+//                         stream first, so tsdemux announces the audio pad
+//                         before the video pad. The demuxer's pads are linked by
+//                         caps identity, so arrival order cannot decide which
+//                         parser a pad reaches.
+//   copy-non-aac          copy-only tier fed H.264 with AC-3 audio: an audio pad
+//                         no branch can take, so it must be linked to the drop
+//                         funnel instead of being left unlinked (which fails
+//                         tsdemux with "streaming stopped, reason=not-linked").
+//   copy-video-only       copy-only tier fed a video-only MPEG-TS clip. The
+//                         audio branch receives nothing, so the 4 s probe
+//                         retires the muxer's capless audio pad and video alone
+//                         publishes.
 //
 // Exit status 0 = observed behaviour matched the mode's expectation, 1 = it did
 // not (or the harness could not run). The numbers are always printed.
@@ -80,6 +88,8 @@ enum class mode
   transcode_av,
   transcode_av1,
   copy_av,
+  copy_audio_first,
+  copy_non_aac,
   copy_video_only
 };
 
@@ -111,6 +121,10 @@ struct options
       return "transcode-av1";
     case mode::copy_av:
       return "copy-av";
+    case mode::copy_audio_first:
+      return "copy-audio-first";
+    case mode::copy_non_aac:
+      return "copy-non-aac";
     case mode::copy_video_only:
       return "copy-video-only";
   }
@@ -119,13 +133,8 @@ struct options
 
 [[nodiscard]] auto is_copy_mode(mode m) -> bool
 {
-  return m == mode::copy_av || m == mode::copy_video_only;
-}
-
-// What the mode must do for the harness to call the run a pass.
-[[nodiscard]] auto expects_publish(mode m) -> bool
-{
-  return m != mode::copy_video_only;
+  return m == mode::copy_av || m == mode::copy_audio_first
+      || m == mode::copy_non_aac || m == mode::copy_video_only;
 }
 
 // transcode-av1 is fed an AV1 MPEG-TS that carries no audio, so it takes the
@@ -133,7 +142,8 @@ struct options
 // capless audio pad).
 [[nodiscard]] auto has_audio(mode m) -> bool
 {
-  return m == mode::transcode_av || m == mode::copy_av;
+  return m == mode::transcode_av || m == mode::copy_av
+      || m == mode::copy_audio_first;
 }
 
 // Modes whose frame ring is filled by the real decode stage from an AV1
@@ -148,7 +158,7 @@ auto usage(const char* argv0) -> void
   std::fprintf(stderr,
                "usage: %s [--mode transcode-av|transcode-video-only|"
                "transcode-av1|copy-av|"
-               "copy-video-only]\n"
+               "copy-audio-first|copy-non-aac|copy-video-only]\n"
                "          [--host 127.0.0.1] [--port 11935] [--app live] "
                "[--stream test]\n"
                "          [--stat-url http://127.0.0.1:18080/stat] "
@@ -170,6 +180,12 @@ auto usage(const char* argv0) -> void
   }
   if (text == "copy-av") {
     return mode::copy_av;
+  }
+  if (text == "copy-audio-first") {
+    return mode::copy_audio_first;
+  }
+  if (text == "copy-non-aac") {
+    return mode::copy_non_aac;
   }
   if (text == "copy-video-only") {
     return mode::copy_video_only;
@@ -434,7 +450,35 @@ auto make_ts(const std::string& description) -> std::vector<std::uint8_t>
       frames, bitrate_bps));
 }
 
+// mpegtsmux numbers its streams in request-pad order, so the order the two
+// branches are written decides the PMT's stream order — and tsdemux announces
+// its src pads in PMT order. `audio_first` therefore produces a TS whose audio
+// pad exists before its video pad, which is the ordering the copy template must
+// not depend on.
 [[nodiscard]] auto make_h264_aac_ts(int width, int height, int bitrate_kbps,
+                                    int seconds, bool audio_first)
+    -> std::vector<std::uint8_t>
+{
+  const int frames = (48000 / 1024) * seconds;
+  const std::string video = std::format(
+      "videotestsrc is-live=false num-buffers={} ! "
+      "video/x-raw,format=NV12,width={},height={},framerate=30/1 ! "
+      "x264enc tune=zerolatency key-int-max=30 bitrate={} ! "
+      "h264parse config-interval=-1 ! mux. ",
+      seconds * 30, width, height, bitrate_kbps);
+  const std::string audio = std::format(
+      "audiotestsrc is-live=false num-buffers={} wave=sine ! "
+      "audio/x-raw,rate=48000,channels=2 ! avenc_aac bitrate=128000 ! "
+      "aacparse ! mux. ", frames);
+  return make_ts(std::format("{}{}mpegtsmux name=mux alignment=7 ! "
+                             "appsink name=sink sync=false",
+                             audio_first ? audio : video,
+                             audio_first ? video : audio));
+}
+
+// H.264 video with AC-3 audio: an audio ES no RTMP branch can carry, so the
+// demuxer's audio pad has to be sunk rather than left unlinked.
+[[nodiscard]] auto make_h264_ac3_ts(int width, int height, int bitrate_kbps,
                                     int seconds) -> std::vector<std::uint8_t>
 {
   const int frames = (48000 / 1024) * seconds;
@@ -444,8 +488,7 @@ auto make_ts(const std::string& description) -> std::vector<std::uint8_t>
       "x264enc tune=zerolatency key-int-max=30 bitrate={} ! "
       "h264parse config-interval=-1 ! mux. "
       "audiotestsrc is-live=false num-buffers={} wave=sine ! "
-      "audio/x-raw,rate=48000,channels=2 ! avenc_aac bitrate=128000 ! "
-      "aacparse ! mux. "
+      "audio/x-raw,rate=48000,channels=2 ! avenc_ac3 bitrate=128000 ! mux. "
       "mpegtsmux name=mux alignment=7 ! appsink name=sink sync=false",
       seconds * 30, width, height, bitrate_kbps, frames));
 }
@@ -460,6 +503,95 @@ auto make_ts(const std::string& description) -> std::vector<std::uint8_t>
       "h264parse config-interval=-1 ! mpegtsmux alignment=7 ! "
       "appsink name=sink sync=false",
       seconds * 30, width, height, bitrate_kbps));
+}
+
+// The order tsdemux announces its src pads for a TS clip. Pad order is the
+// property the copy template must not depend on, so the harness measures it and
+// names it in the report instead of trusting the fixture's intent.
+auto probe_demux_pad_order(const std::vector<std::uint8_t>& ts)
+    -> std::vector<std::string>
+{
+  struct collector
+  {
+    std::mutex mutex;
+    std::vector<std::string> pads;
+  } seen;
+
+  GError* gerr = nullptr;
+  GstElement* pipeline = gst_parse_launch(
+      "appsrc name=src is-live=false format=time block=true "
+      "caps=video/mpegts,systemstream=true ! tsparse set-timestamps=true "
+      "alignment=7 ! tsdemux name=d d. ! fakesink sync=false async=false",
+      &gerr);
+  if (pipeline == nullptr || gerr != nullptr) {
+    std::fprintf(stderr, "fixture pad-order pipeline failed to parse: %s\n",
+                 gerr != nullptr && gerr->message != nullptr ? gerr->message
+                                                             : "unknown");
+    if (gerr != nullptr) {
+      g_error_free(gerr);
+    }
+    if (pipeline != nullptr) {
+      gst_object_unref(pipeline);
+    }
+    return {};
+  }
+  GstElement* demux = gst_bin_get_by_name(GST_BIN(pipeline), "d");
+  GstElement* src = gst_bin_get_by_name(GST_BIN(pipeline), "src");
+  if (demux != nullptr) {
+    g_signal_connect_data(
+        demux, "pad-added",
+        G_CALLBACK(+[](GstElement*, GstPad* pad, gpointer data) -> void {
+          auto* into = static_cast<collector*>(data);
+          std::lock_guard<std::mutex> guard(into->mutex);
+          into->pads.emplace_back(GST_PAD_NAME(pad));
+        }),
+        &seen, nullptr, GConnectFlags(0));
+  }
+  if (demux == nullptr || src == nullptr
+      || gst_element_set_state(pipeline, GST_STATE_PLAYING)
+          == GST_STATE_CHANGE_FAILURE)
+  {
+    if (demux != nullptr) {
+      gst_object_unref(demux);
+    }
+    if (src != nullptr) {
+      gst_object_unref(src);
+    }
+    gst_object_unref(pipeline);
+    return {};
+  }
+  GstBuffer* buffer = gst_buffer_new_allocate(nullptr, ts.size(), nullptr);
+  GstMapInfo map;
+  if (buffer != nullptr && gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+    std::memcpy(map.data, ts.data(), ts.size());
+    gst_buffer_unmap(buffer, &map);
+    gst_app_src_push_buffer(GST_APP_SRC(src), buffer);
+  }
+  gst_app_src_end_of_stream(GST_APP_SRC(src));
+  GstBus* bus = gst_element_get_bus(pipeline);
+  GstMessage* msg = gst_bus_timed_pop_filtered(
+      bus, 5 * GST_SECOND,
+      (GstMessageType)(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  if (msg != nullptr) {
+    gst_message_unref(msg);
+  }
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  std::vector<std::string> order;
+  {
+    std::lock_guard<std::mutex> guard(seen.mutex);
+    order = seen.pads;
+  }
+  if (demux != nullptr) {
+    gst_object_unref(demux);
+  }
+  if (src != nullptr) {
+    gst_object_unref(src);
+  }
+  if (bus != nullptr) {
+    gst_object_unref(bus);
+  }
+  gst_object_unref(pipeline);
+  return order;
 }
 
 // An AV1-in-MPEG-TS clip produced by test/tools/make-av1-ts-fixture.sh. It is
@@ -878,11 +1010,17 @@ auto main(int argc, char** argv) -> int
       return 1;
     }
   } else if (is_copy_mode(opts.run_mode)) {
-    ts_clip = has_audio(opts.run_mode)
-        ? make_h264_aac_ts(opts.width, opts.height, opts.bitrate_kbps,
-                           fixture_seconds)
-        : make_h264_ts(opts.width, opts.height, opts.bitrate_kbps,
-                       fixture_seconds);
+    if (opts.run_mode == mode::copy_non_aac) {
+      ts_clip = make_h264_ac3_ts(opts.width, opts.height, opts.bitrate_kbps,
+                                 fixture_seconds);
+    } else if (has_audio(opts.run_mode)) {
+      ts_clip = make_h264_aac_ts(opts.width, opts.height, opts.bitrate_kbps,
+                                 fixture_seconds,
+                                 opts.run_mode == mode::copy_audio_first);
+    } else {
+      ts_clip = make_h264_ts(opts.width, opts.height, opts.bitrate_kbps,
+                             fixture_seconds);
+    }
     if (ts_clip.empty()) {
       std::fprintf(stderr, "FAIL: could not generate the MPEG-TS fixture\n");
       return 1;
@@ -914,6 +1052,18 @@ auto main(int argc, char** argv) -> int
                              "fixture\n");
         return 1;
       }
+    }
+  }
+
+  // The order the demuxer announces this clip's pads in, measured on the clip
+  // itself: an "audio-first" mode is only that if the audio pad really comes
+  // first, and the copy template must publish either way.
+  std::vector<std::string> pad_order;
+  if (is_copy_mode(opts.run_mode)) {
+    pad_order = probe_demux_pad_order(ts_clip);
+    if (pad_order.empty()) {
+      std::fprintf(stderr, "FAIL: tsdemux announced no pads for the fixture\n");
+      return 1;
     }
   }
 
@@ -972,6 +1122,13 @@ auto main(int argc, char** argv) -> int
   std::printf("publish        %s\n", url.c_str());
   std::printf("server stat    %s\n", opts.stat_url.c_str());
   std::printf("server baseline bytes_in %lld\n", *baseline.bytes_in);
+  if (!pad_order.empty()) {
+    std::string joined;
+    for (const std::string& name : pad_order) {
+      joined += (joined.empty() ? "" : " ") + name;
+    }
+    std::printf("fixture pad order    %s\n", joined.c_str());
+  }
   std::fflush(stdout);
 
   if (!out.start()) {
@@ -1099,7 +1256,7 @@ auto main(int argc, char** argv) -> int
   // additional assertions about behaviour that "bytes arrived" alone would not
   // pin down. Diagnostics must run while the attempt's pipeline still exists.
   const auto mux_audio_final = inst.mux_audio_buffers.load();
-  bool ok = server_grew == expects_publish(opts.run_mode);
+  bool ok = server_grew;
   std::string mode_failure;
   if (ok && server_grew && has_audio(opts.run_mode) && mux_audio_final == 0) {
     ok = false;
@@ -1149,8 +1306,6 @@ auto main(int argc, char** argv) -> int
   {
     const auto mux_video_final = inst.mux_video_buffers.load();
     std::lock_guard<std::mutex> guard(inst.mutex);
-    // Only a mode that actually published is judged: copy-video-only is pinned
-    // as an expected stall, and its caps say nothing when nothing was muxed.
     if (ok && server_grew && mux_video_final != 0) {
       const bool is_420 = inst.video_caps.find("chroma-format=(string)4:2:0")
           != std::string::npos;
@@ -1159,6 +1314,39 @@ auto main(int argc, char** argv) -> int
       if (!is_420 || !is_8bit) {
         ok = false;
         mode_failure = "muxer video input is not 4:2:0 8-bit";
+      }
+    }
+    // The clip must have the pad order the mode name states, so a "video-first"
+    // mode cannot silently run an audio-first clip and pass on either routing.
+    if (ok && is_copy_mode(opts.run_mode)) {
+      const bool audio_first = pad_order.front().rfind("audio", 0) == 0;
+      const bool want_audio_first = opts.run_mode == mode::copy_audio_first;
+      if (audio_first != want_audio_first) {
+        ok = false;
+        mode_failure = audio_first
+            ? "fixture announces its audio pad first but the mode says video"
+            : "fixture announces its video pad first but the mode says audio";
+      }
+    }
+    // Copy path identity: the video pad is fed by h264parse and the audio pad by
+    // aacparse, so the format each stream carries names the branch it reached.
+    // H.264 arriving as AVC on the video pad and AAC arriving as raw on the
+    // audio pad cannot happen if either stream was linked to the other parser —
+    // order cannot be what decided the routing.
+    if (ok && server_grew && is_copy_mode(opts.run_mode)) {
+      if (inst.video_caps.find("video/x-h264") == std::string::npos
+          || inst.video_caps.find("stream-format=(string)avc")
+              == std::string::npos)
+      {
+        ok = false;
+        mode_failure = "muxer video pad did not receive h264parse output";
+      } else if (mux_audio_final != 0
+                 && (inst.audio_caps.find("audio/mpeg") == std::string::npos
+                     || inst.audio_caps.find("stream-format=(string)raw")
+                         == std::string::npos))
+      {
+        ok = false;
+        mode_failure = "muxer audio pad did not receive aacparse output";
       }
     }
   }
@@ -1277,14 +1465,11 @@ auto main(int argc, char** argv) -> int
   if (!mode_failure.empty()) {
     std::printf("check failed         %s\n", mode_failure.c_str());
   }
-  if (failed && !expects_publish(opts.run_mode)) {
-    std::printf("expected             mode %s must NOT publish; it did\n",
-                mode_name(opts.run_mode));
-  }
-  if (failed && expects_publish(opts.run_mode)) {
-    std::printf("expected             >= %lld new bytes at %s (handshake is "
-                "not proof); server delta %lld\n",
-                k_server_bytes_proof, opts.stat_url.c_str(), server_delta);
+  if (failed) {
+    std::printf("expected             mode %s to publish: >= %lld new bytes "
+                "at %s (handshake is not proof); server delta %lld\n",
+                mode_name(opts.run_mode), k_server_bytes_proof,
+                opts.stat_url.c_str(), server_delta);
   }
   return failed ? 1 : 0;
 }

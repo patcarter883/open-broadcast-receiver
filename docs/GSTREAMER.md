@@ -63,13 +63,22 @@ jitter) before locking this template; the loser gets recorded here as rejected w
 ## 3. RTMP/RTMPS template (per output)
 
 ```
-appsrc name=osrc is-live=true do-timestamp=true format=time block=true max-bytes=4194304
+appsrc name=osrc is-live=true do-timestamp=true format=time block=false max-bytes=4194304
   ! tsparse set-timestamps=true alignment=7
   ! tsdemux name=d
-  d. ! queue ! h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au ! mux.
-  d. ! queue ! aacparse ! audio/mpeg,mpegversion=4,stream-format=raw ! mux.
+  queue name=vq ! h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au ! mux.
+  queue name=aq ! aacparse ! audio/mpeg,mpegversion=4,stream-format=raw ! mux.
   flvmux name=mux streamable=true latency=1000000000 ! rtmp2sink name=osink async-connect=true
+  funnel name=ddrop ! fakesink sync=false async=false
 ```
+
+The two parser branches are not linked from the parse string. `tsdemux` announces its
+src pads in PMT stream order, so a template link would put whichever pad arrives first
+into whichever parser it faces; instead `output::demux_pad_added` links each announced
+pad by its caps — `video/x-h264` to `vq`, MPEG-2/4 audio to `aq`, everything else
+(non-H.264 video, other audio codecs, private/subtitle streams) to the `ddrop` funnel.
+Every announced pad therefore gets a peer, which is what keeps `tsdemux` from failing
+the pipeline with `streaming stopped, reason=not-linked`.
 
 Connection properties set programmatically (never in the parse string): `scheme`, `host`, `port`,
 `application` (URL path), `stream` (the key). Plain rtmp connects to the **pinned IP**; rtmps connects by
@@ -102,9 +111,11 @@ download. A stalling disk makes this consumer take ring drops; it can never touc
 5. A platform ingest closing TCP on a bad stream key is indistinguishable from a transient reset at the sink's
    error surface — which is exactly why the reconnect policy retries everything except
    `rtmp_codec_unsupported` (see CONTRACT §6).
-6. `tsdemux` pads are sometimes-pads; the `d. !` links above are deferred-linked by `gst_parse_launch`. A
-   non-AAC audio pad simply never links (video-only output, `audio_dropped: true`) — tsdemux's flow combiner
-   tolerates the unlinked branch as long as video flows.
+6. `tsdemux` pads are sometimes-pads announced in PMT order, so pad-to-parser routing is done from the pad's
+   caps at announce time (`video/x-h264` → `h264parse`, MPEG-2/4 audio → `aacparse`), and every pad that no
+   branch handles is linked to the drop funnel. A pad left unlinked fails the pipeline with
+   `streaming stopped, reason=not-linked`; a pad handed to the wrong parser fails negotiation. Non-AAC audio
+   and non-H.264 video still publish video-only, with `audio_dropped: true`.
 7. Each pipeline runs its own bus handling on the output object's thread; no shared `GMainLoop` across outputs
    (this is what makes per-output errors local by construction).
 8. The producer (RIST thread) writes the ring even while outputs rebuild — a reconnecting output rejoins live
