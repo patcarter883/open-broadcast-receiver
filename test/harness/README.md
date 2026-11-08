@@ -244,7 +244,9 @@ Nothing leaves the machine, and nothing needs the capture box.
 
 `test/tools/make-av1-ts-fixture.sh` muxes it with the encoder's exact settings
 (`mpegtsmux alignment=7 enable-custom-mappings=true`, `av1parse` pinned to
-`obu-stream,alignment=frame`). The harness then prints, and gates on:
+`obu-stream,alignment=frame`). It writes a `<fixture>.meta` sidecar with the
+frame count, so a reused fixture is fed through RIST at its real rate instead of
+the harness's default frame count. The harness then prints, and gates on:
 
 - the PMT actually present in the file — `stream_type=0x06` with the `AV1G`
   registration descriptor and the `0x80` av1C record;

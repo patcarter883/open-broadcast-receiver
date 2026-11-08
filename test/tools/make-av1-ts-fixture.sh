@@ -133,6 +133,12 @@ size=$(wc -c < "$out")
 echo "fixture: wrote $size bytes"
 [ "$size" -gt 0 ] || { echo "$0: empty fixture" >&2; exit 1; }
 
+# Sidecar so a later consumer (test/harness/receiver_e2e_local.sh) feeds the
+# file at its real frame rate instead of assuming a default frame count.
+printf 'encoder=%s\nframes=%s\nfps=30\nwidth=%s\nheight=%s\nbytes=%s\n' \
+  "$encoder" "$frames" "${FIXTURE_WIDTH:-1280}" "${FIXTURE_HEIGHT:-720}" "$size" \
+  > "$out.meta"
+
 if [ "$verify" -eq 1 ]; then
   # The check a fabricated TS fails: tsdemux must expose a video/x-av1 stream
   # and av1parse must accept it. `num-buffers=1` bounds it; a non-zero exit or
