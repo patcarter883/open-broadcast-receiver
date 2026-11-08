@@ -333,6 +333,11 @@ bool RISTNetReceiver::initReceiver(std::vector<std::string> &rURLList,
             keysize = (mRistReceiverSettings.mPSKKeySize == 256) ? 256 : 128;
         }
         mRistPeerConfig.version = RIST_PEER_CONFIG_VERSION;
+        // The wire profile comes from the peer config, not the context: a
+        // zero-initialised config reads as SIMPLE, so without this the listener
+        // parses advanced/main peers as simple framing and drops the flow.
+        mRistPeerConfig.profile = mRistReceiverSettings.mProfile;
+        mRistPeerConfig.profile_set = 1;
         mRistPeerConfig.virt_dst_port = RIST_DEFAULT_VIRT_DST_PORT;
         mRistPeerConfig.recovery_mode = mRistReceiverSettings.mPeerConfig.recovery_mode;
         mRistPeerConfig.recovery_maxbitrate = mRistReceiverSettings.mPeerConfig.recovery_maxbitrate;
@@ -689,6 +694,11 @@ bool RISTNetSender::initSender(std::vector<std::tuple<std::string,int>> &rPeerLi
             keysize = 128;
         }
         mRistPeerConfig.version = RIST_PEER_CONFIG_VERSION;
+        // The wire profile comes from the peer config, not the context: a
+        // zero-initialised config reads as SIMPLE, so without this the sender
+        // emits simple framing that an advanced peer drops.
+        mRistPeerConfig.profile = mRistSenderSettings.mProfile;
+        mRistPeerConfig.profile_set = 1;
         mRistPeerConfig.virt_dst_port = RIST_DEFAULT_VIRT_DST_PORT;
         mRistPeerConfig.recovery_mode = mRistSenderSettings.mPeerConfig.recovery_mode;
         mRistPeerConfig.recovery_maxbitrate = mRistSenderSettings.mPeerConfig.recovery_maxbitrate;
