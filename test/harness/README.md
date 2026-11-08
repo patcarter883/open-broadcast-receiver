@@ -43,6 +43,7 @@ do not), and it is what the harness reads.
 | mode | ring contents | expectation |
 | --- | --- | --- |
 | `transcode-av` | NV12 frames + AAC-in-MPEG-TS | publishes |
+| `transcode-av1` | AV1-in-MPEG-TS on the ts_ring, decoded by the receiver's own decode stage into the frame ring (`--fixture`, `FIXTURE=`) | publishes, with `vaav1dec` having produced frames |
 | `transcode-video-only` | NV12 frames, no audio at all | publishes once the 4 s probe retires the capless audio pad (unlink + EOS) |
 | `copy-av` | H.264+AAC MPEG-TS | publishes |
 | `copy-video-only` | H.264-only MPEG-TS | does **not** publish (the copy template has no timeout unlink, so flvmux waits for audio forever) |
