@@ -67,3 +67,24 @@ target_link_libraries(standby_lib PUBLIC
 target_include_directories(standby_lib PUBLIC SYSTEM
     ${GSTREAMER_INCLUDE_DIRS}
 )
+
+# The shared restartable stage (plan C4): one demux, two selectors, one
+# re-stamped timeline, and the ES rings every output consumes. GStreamer-only,
+# so it exists only in the full lane; the tests-only lane stays pure.
+target_sources(standby_lib ${warning_guard}
+    PRIVATE
+        stage.h
+        stage.cpp
+)
+
+# stage.cpp publishes into es_ring and reads the session's ts_ring; both live in
+# ring_lib.
+target_link_libraries(standby_lib PUBLIC ring_lib)
+
+# The re-stamper the stage's probes drive. It is pure arithmetic, but the stage
+# is its only runtime caller, so it joins the library in the full lane.
+target_sources(standby_lib ${warning_guard}
+    PRIVATE
+        timeline.h
+        timeline.cpp
+)
