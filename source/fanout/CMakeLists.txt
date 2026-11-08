@@ -56,3 +56,12 @@ target_link_libraries(fanout_lib PRIVATE
 
 target_include_directories(fanout_lib PRIVATE SYSTEM
     ${GSTREAMER_INCLUDE_DIRS})
+
+# ---- Compressed access-unit ring (pure: no GStreamer, like ring_lib) -------
+# Appended to ring_lib so every fan-out consumer sees the same declarations;
+# unit-tested standalone by test/source/es_ring_test.cpp.
+target_sources(ring_lib ${warning_guard}
+  PUBLIC
+    es_ring.h
+    es_ring.cpp
+)

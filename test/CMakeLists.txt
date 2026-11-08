@@ -167,3 +167,25 @@ if(NOT OBR_TESTS_ONLY)
       PROPERTIES TIMEOUT 90)
   endif()
 endif()
+
+# ---- Standby-stage pure logic (no GStreamer) --------------------------------
+# es_ring is the compressed-access-unit sibling of frame_ring; timeline is the
+# re-stamper's arithmetic. Both are compiled into their test executables
+# directly, so the tests-only lane (which declares ring_lib in the top-level
+# CMakeLists) needs no extra library target and the full lane links no duplicate
+# definition.
+
+add_executable(es_ring_test
+  source/es_ring_test.cpp
+  ${CMAKE_SOURCE_DIR}/source/fanout/es_ring.cpp)
+target_include_directories(es_ring_test PRIVATE ${CMAKE_SOURCE_DIR}/source)
+target_link_libraries(es_ring_test PRIVATE Threads::Threads)
+target_compile_features(es_ring_test PRIVATE cxx_std_20)
+add_test(NAME es_ring_test COMMAND es_ring_test)
+
+add_executable(timeline_test
+  source/timeline_test.cpp
+  ${CMAKE_SOURCE_DIR}/source/standby/timeline.cpp)
+target_include_directories(timeline_test PRIVATE ${CMAKE_SOURCE_DIR}/source)
+target_compile_features(timeline_test PRIVATE cxx_std_20)
+add_test(NAME timeline_test COMMAND timeline_test)
