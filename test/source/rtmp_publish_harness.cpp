@@ -46,6 +46,7 @@
 #include <cstring>
 #include <format>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -61,6 +62,7 @@
 
 #include <httplib.h>
 
+#include "fanout/decoder.h"
 #include "fanout/frame_ring.h"
 #include "fanout/output.h"
 #include "fanout/ring.h"
@@ -76,6 +78,7 @@ enum class mode
 {
   transcode_video_only,
   transcode_av,
+  transcode_av1,
   copy_av,
   copy_video_only
 };
@@ -88,6 +91,7 @@ struct options
   std::string app = "live";
   std::string stream = "test";
   std::string stat_url = "http://127.0.0.1:18080/stat";
+  std::string fixture;  // AV1-in-MPEG-TS input for the transcode-av1 mode
   int duration_s = 12;
   int fps = 30;
   int width = 640;
@@ -103,6 +107,8 @@ struct options
       return "transcode-video-only";
     case mode::transcode_av:
       return "transcode-av";
+    case mode::transcode_av1:
+      return "transcode-av1";
     case mode::copy_av:
       return "copy-av";
     case mode::copy_video_only:
@@ -122,20 +128,32 @@ struct options
   return m != mode::copy_video_only;
 }
 
+// transcode-av1 is fed an AV1 MPEG-TS that carries no audio, so it takes the
+// same video-only path as transcode-video-only (the 4 s probe must retire the
+// capless audio pad).
 [[nodiscard]] auto has_audio(mode m) -> bool
 {
   return m == mode::transcode_av || m == mode::copy_av;
 }
 
+// Modes whose frame ring is filled by the real decode stage from an AV1
+// MPEG-TS instead of by synthetic NV12 frames generated in-process.
+[[nodiscard]] auto is_decode_mode(mode m) -> bool
+{
+  return m == mode::transcode_av1;
+}
+
 auto usage(const char* argv0) -> void
 {
   std::fprintf(stderr,
-               "usage: %s [--mode transcode-av|transcode-video-only|copy-av|"
+               "usage: %s [--mode transcode-av|transcode-video-only|"
+               "transcode-av1|copy-av|"
                "copy-video-only]\n"
                "          [--host 127.0.0.1] [--port 11935] [--app live] "
                "[--stream test]\n"
                "          [--stat-url http://127.0.0.1:18080/stat] "
-               "[--duration 12] [--fps 30]\n",
+               "[--duration 12] [--fps 30]\n"
+               "          [--fixture build/av1-fixture.ts]  (transcode-av1)\n",
                argv0);
 }
 
@@ -146,6 +164,9 @@ auto usage(const char* argv0) -> void
   }
   if (text == "transcode-av") {
     return mode::transcode_av;
+  }
+  if (text == "transcode-av1") {
+    return mode::transcode_av1;
   }
   if (text == "copy-av") {
     return mode::copy_av;
@@ -439,6 +460,31 @@ auto make_ts(const std::string& description) -> std::vector<std::uint8_t>
       "h264parse config-interval=-1 ! mpegtsmux alignment=7 ! "
       "appsink name=sink sync=false",
       seconds * 30, width, height, bitrate_kbps));
+}
+
+// An AV1-in-MPEG-TS clip produced by test/tools/make-av1-ts-fixture.sh. It is
+// read as-is: the harness must not mux its own AV1, because a TS without
+// mpegtsmux's enable-custom-mappings carries no AV1 stream type and tsdemux
+// exposes no video pad for it.
+auto read_ts_file(const std::string& path, std::string& err)
+    -> std::vector<std::uint8_t>
+{
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    err = std::format("cannot open {}", path);
+    return {};
+  }
+  std::vector<std::uint8_t> bytes;
+  std::uint8_t chunk[64 * 1024];
+  std::size_t got = 0;
+  while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0) {
+    bytes.insert(bytes.end(), chunk, chunk + got);
+  }
+  std::fclose(file);
+  if (bytes.empty()) {
+    err = std::format("{} is empty", path);
+  }
+  return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +803,8 @@ auto main(int argc, char** argv) -> int
       opts.stream = next();
     } else if (arg == "--stat-url") {
       opts.stat_url = next();
+    } else if (arg == "--fixture") {
+      opts.fixture = next();
     } else if (arg == "--duration") {
       opts.duration_s = std::atoi(next().c_str());
     } else if (arg == "--fps") {
@@ -813,7 +861,23 @@ auto main(int argc, char** argv) -> int
   std::vector<std::uint8_t> ts_clip;
   nv12_clip clip;
   const int fixture_seconds = std::max(opts.duration_s, 6);
-  if (is_copy_mode(opts.run_mode)) {
+  if (is_decode_mode(opts.run_mode)) {
+    // Real ingest shape: an AV1-in-MPEG-TS clip read from disk and fed into a
+    // real ts_ring, exactly as the RIST callback would. The frames that reach
+    // the frame ring are decoded by the receiver's own decode stage.
+    if (opts.fixture.empty()) {
+      std::fprintf(stderr,
+                   "FAIL: mode transcode-av1 needs --fixture <av1.ts> "
+                   "(make fixture)\n");
+      return 1;
+    }
+    std::string err;
+    ts_clip = read_ts_file(opts.fixture, err);
+    if (ts_clip.empty()) {
+      std::fprintf(stderr, "FAIL: %s\n", err.c_str());
+      return 1;
+    }
+  } else if (is_copy_mode(opts.run_mode)) {
     ts_clip = has_audio(opts.run_mode)
         ? make_h264_aac_ts(opts.width, opts.height, opts.bitrate_kbps,
                            fixture_seconds)
@@ -856,11 +920,31 @@ auto main(int argc, char** argv) -> int
   // ---- the real output, configured the way /start configures it ----
   ts_ring ts_ring_instance {ts_ring::size_for_bandwidth(20000)};
   frame_ring frame_ring_instance {frame_ring::k_min_bytes};
-  if (frame_ring_instance.capacity()
-      < static_cast<std::size_t>(opts.width) * opts.height * 3U / 2U) {
+  if (!is_decode_mode(opts.run_mode)
+      && frame_ring_instance.capacity()
+          < static_cast<std::size_t>(opts.width) * opts.height * 3U / 2U) {
     std::fprintf(stderr, "FAIL: frame ring too small for one frame\n");
     return 1;
   }
+
+  // The decode mode uses the receiver's own decode stage as the frame-ring
+  // producer, so the frames that get transcoded are the ones vaav1dec actually
+  // produced from the AV1 MPEG-TS -- not frames this harness synthesised.
+  std::unique_ptr<decoder> dec;
+  if (is_decode_mode(opts.run_mode)) {
+    dec = std::make_unique<decoder>(
+        ts_ring_instance, codec::av1,
+        [](const std::string& line) -> void {
+          std::fputs(line.c_str(), stderr);
+          std::fflush(stderr);
+        });
+    if (!dec->start()) {
+      std::fprintf(stderr, "FAIL: decode stage refused to start\n");
+      return 1;
+    }
+  }
+  frame_ring& frames =
+      dec != nullptr ? dec->frames() : frame_ring_instance;
 
   instruments inst;
   output_config cfg;
@@ -875,7 +959,7 @@ auto main(int argc, char** argv) -> int
   cfg.transcode = transcode;
 
   output out {cfg, ts_ring_instance,
-              is_copy_mode(opts.run_mode) ? nullptr : &frame_ring_instance,
+              is_copy_mode(opts.run_mode) ? nullptr : &frames,
               [&inst](const std::string& line) -> void {
                 {
                   std::lock_guard<std::mutex> guard(inst.mutex);
@@ -919,8 +1003,10 @@ auto main(int argc, char** argv) -> int
     }
 
     // A copy output takes TS bytes; a transcode output takes whole NV12 frames
-    // plus (for the RTMP audio branch) AAC-in-TS on the same ts_ring.
-    if (is_copy_mode(opts.run_mode)) {
+    // plus (for the RTMP audio branch) AAC-in-TS on the same ts_ring. The
+    // transcode-av1 mode is the exception: its frame ring is filled by the real
+    // decode stage, so the harness only feeds TS and never writes a frame.
+    if (is_copy_mode(opts.run_mode) || is_decode_mode(opts.run_mode)) {
       const auto want = static_cast<std::size_t>(
           elapsed / static_cast<double>(fixture_seconds)
           * static_cast<double>(ts_clip.size()));
@@ -999,6 +1085,15 @@ auto main(int argc, char** argv) -> int
   const std::uint64_t bytes_sent = out.bytes_sent();
   const int64_t reconnects = static_cast<int64_t>(out.reconnects());
   const char* state_name = out.state_name();
+  // Decode-stage provenance, sampled while the stage is still running.
+  std::uint64_t decoded_frames = 0;
+  decoder::stage_counters decode_counters {};
+  std::string decode_element;
+  if (dec != nullptr) {
+    decoded_frames = dec->frames().head();
+    decode_counters = dec->counters();
+    decode_element = dec->decoder_element();
+  }
 
   // The publish verdict is the server's counter; the mode checks below are
   // additional assertions about behaviour that "bytes arrived" alone would not
@@ -1014,6 +1109,18 @@ auto main(int argc, char** argv) -> int
     ok = false;
     mode_failure = "audio reached the muxer in a video-only mode";
   }
+  // The decode mode exists to prove the AV1 -> NV12 -> H.264 -> RTMP chain, so
+  // publishing without the decode stage having produced frames would be a pass
+  // for the wrong reason.
+  if (ok && is_decode_mode(opts.run_mode)) {
+    if (decoded_frames == 0) {
+      ok = false;
+      mode_failure = "decode stage published no frame to the frame ring";
+    } else if (decode_counters.failed || decode_counters.stalled) {
+      ok = false;
+      mode_failure = "decode stage reported failed/stalled";
+    }
+  }
 
   // The destinations are 4:2:0 8-bit, so that is what has to reach the muxer. An
   // encoder whose input is left unpinned negotiates whatever its widest sink
@@ -1025,7 +1132,8 @@ auto main(int argc, char** argv) -> int
     GstElement* pipeline = out.pipeline();
     if (pipeline != nullptr) {
       if (opts.run_mode == mode::transcode_av
-          || opts.run_mode == mode::transcode_video_only) {
+          || opts.run_mode == mode::transcode_video_only
+          || opts.run_mode == mode::transcode_av1) {
         encoder_input_caps = element_sink_caps(pipeline, "venc");
       }
       if (!ok) {
@@ -1077,6 +1185,18 @@ auto main(int argc, char** argv) -> int
   }
 
   out.stop();
+  std::vector<std::string> decode_log;
+  if (dec != nullptr) {
+    decode_log.push_back(std::format(
+        "decode element {} demux={} dec={} sink={} state={} stalled={}",
+        decode_element.empty() ? "(none)" : decode_element,
+        decode_counters.demux_buffers, decode_counters.decoder_buffers,
+        decode_counters.sink_buffers,
+        gst_element_state_get_name(decode_counters.state),
+        decode_counters.stalled ? "yes" : "no"));
+    dec->stop();
+    dec.reset();
+  }
 
   const long long server_delta =
       (last_server ? *last_server : 0) - *baseline.bytes_in;
@@ -1088,6 +1208,20 @@ auto main(int argc, char** argv) -> int
               static_cast<long long>(reconnects));
   std::printf("frames pushed        %llu\n",
               static_cast<unsigned long long>(frames_pushed));
+  if (is_decode_mode(opts.run_mode)) {
+    std::printf("decode frames        %llu (ring head, from %s)\n",
+                static_cast<unsigned long long>(decoded_frames),
+                decode_element.empty() ? "(none)" : decode_element.c_str());
+    std::printf("decode counters      demux=%llu dec=%llu sink=%llu "
+                "state=%s stalled=%s failed=%s\n",
+                static_cast<unsigned long long>(decode_counters.demux_buffers),
+                static_cast<unsigned long long>(
+                    decode_counters.decoder_buffers),
+                static_cast<unsigned long long>(decode_counters.sink_buffers),
+                gst_element_state_get_name(decode_counters.state),
+                decode_counters.stalled ? "yes" : "no",
+                decode_counters.failed ? "yes" : "no");
+  }
   std::printf("mux sink video       %llu buffers / %llu bytes\n",
               static_cast<unsigned long long>(
                   inst.mux_video_buffers.load()),
@@ -1130,6 +1264,9 @@ auto main(int argc, char** argv) -> int
   }
 
   // Behaviour the mode exists to pin down, beyond "the server got bytes".
+  for (const auto& line : decode_log) {
+    std::printf("decode stage         %s\n", line.c_str());
+  }
   if (opts.run_mode == mode::transcode_video_only && server_grew
       && audio_dropped) {
     std::printf("audio unlink         the 4 s probe dropped the capless pad "
