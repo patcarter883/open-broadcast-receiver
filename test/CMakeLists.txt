@@ -153,6 +153,13 @@ if(NOT OBR_TESTS_ONLY)
     TIMEOUT 120
     LABELS "e2e;media")
 
+  # The image's entrypoint translates OBR_* into argv. It used to discard "$@"
+  # with a bare `set --`, so a caller could not override a flag, and it had no
+  # mapping for --egress-allow-private, so the shipped image could not publish
+  # to an RFC1918 destination. Exercises the script against a stubbed binary.
+  add_test(NAME entrypoint_args_test
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/harness/entrypoint_args_test.sh)
+
   # Local RTMP publish harness: drives the real output pipeline against a local
   # nginx-rtmp sink and judges it by the server's own byte count. It publishes,
   # so it is built with the full lane but only registered with CTest when a sink
