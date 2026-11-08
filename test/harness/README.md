@@ -242,6 +242,21 @@ muxer, 907 emitted, ~2.4 Mbit/s against a 2 Mbit/s target.
   script removes its own container by name on exit and touches nothing else.
 - Ports are overridable: `RTMP_PORT=21935 STAT_PORT=28080 ...`.
 
+## `image_resolver_proof.sh` — the image's address-family policy
+
+    test/harness/image_resolver_proof.sh [--image obr-receiver:proof]
+
+Not a publishing harness: it proves the runtime image's `/etc/gai.conf`
+(`precedence ::ffff:0:0/96 100`) reorders a dual-stack name, with no
+`--add-host` pin anywhere. It runs the same image twice on an IPv6 network —
+once as built, once with `/etc/gai.conf` emptied — and requires IPv4 first in
+the first run and IPv6 first in the second. The second run is what makes the
+first one meaningful: on a single-stack container glibc has already demoted
+AAAA (rule 3), so the file looks inert and a one-sided check proves nothing
+(DECISIONS §20). The connect step opens a socket to the *first* address the
+resolver returned, as a literal, which is the shape `rtmp2sink` has — one
+address, no happy-eyeballs fallback.
+
 ## Whole-binary e2e: RIST in, RTMP out
 
     test/harness/receiver_e2e_local.sh

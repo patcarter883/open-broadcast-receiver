@@ -3,6 +3,8 @@
 
 #include "fanout/output.h"
 
+#include "fanout/appsrc_cap.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -26,16 +28,11 @@ constexpr std::chrono::seconds k_backoff_cap {30};
 // A connection that survives this long resets the backoff to initial — a
 // mid-event platform blip after hours of streaming restarts fast again.
 constexpr std::chrono::seconds k_stable_after {30};
-// The transcode video appsrc is capped in FRAMES, not bytes: a fixed byte cap
-// is a different amount of slack at every resolution (4 MB is 2.9 frames of
-// 720p NV12 and 7.7 of 360p), so one number cannot mean "a few frames ahead of
-// the encoder" for both. Eight frames holds ~0.27 s of 720p, enough for the
-// feed to stay ahead of an encoder running at ingest rate without adding
-// meaningful latency; the floor keeps small frames from being capped tighter
-// than the element's own default.
-constexpr guint64 k_appsrc_frame_span = 8;
-constexpr guint64 k_appsrc_default_bytes = 4 * 1024 * 1024;
-constexpr guint64 k_appsrc_ceiling_bytes = 64 * 1024 * 1024;
+// The transcode video appsrc is capped in FRAMES, not bytes; the sizing itself
+// is in fanout/appsrc_cap.h so it can be asserted without GStreamer. This is
+// only the pre-caps default the element carries until the first decoded frame
+// says how large a frame is.
+constexpr guint64 k_appsrc_default_bytes = appsrc_cap::k_floor_bytes;
 // How long the transit buffer may stay pinned at its limit before the sink is
 // treated as stalled and the attempt is rebuilt.
 constexpr auto k_stall_timeout = std::chrono::seconds(5);
@@ -1735,11 +1732,10 @@ auto output::set_video_caps(std::size_t frame_bytes,
   gst_caps_unref(caps);
 
   // The cap is now known in frames, so it can be expressed in frames: the
-  // buffer holds k_appsrc_frame_span of them whatever the resolution.
-  const guint64 cap = std::clamp<guint64>(
-      static_cast<guint64>(frame_bytes) * k_appsrc_frame_span,
-      k_appsrc_default_bytes, k_appsrc_ceiling_bytes);
+  // buffer holds appsrc_cap::k_frame_span of them whatever the resolution.
+  const guint64 cap =
+      appsrc_cap::max_bytes(static_cast<std::uint64_t>(frame_bytes));
   gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), cap);
   log(std::format("video appsrc capped at {} KiB ({} frames of {} B)\n",
-                  cap / 1024, k_appsrc_frame_span, frame_bytes));
+                  cap / 1024, appsrc_cap::k_frame_span, frame_bytes));
 }
