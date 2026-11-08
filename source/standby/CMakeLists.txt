@@ -88,3 +88,20 @@ target_sources(standby_lib ${warning_guard}
         timeline.h
         timeline.cpp
 )
+
+# The mode controller (plan D1/D3): WHEN the session is on the slate. Pure C++
+# (no GStreamer) but it joins the library so the receiver's /start path and
+# /status read one implementation. controller_test compiles the .cpp directly,
+# so the tests-only lane needs no extra target.
+target_sources(standby_lib ${warning_guard}
+    PRIVATE
+        controller.h
+        controller.cpp
+)
+
+# The receiver executable builds the shared stage on /start (plan D2/D3) and so
+# needs these symbols. The executable target is declared in the root
+# CMakeLists; fanout_lib is the library every receiver binary already links, so
+# attaching the standby library to it PUBLIC is how main.cpp's `standby/...`
+# includes resolve at link time without a second place to keep in step.
+target_link_libraries(fanout_lib PUBLIC standby_lib)

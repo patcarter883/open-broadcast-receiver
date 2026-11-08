@@ -99,6 +99,68 @@ auto main() -> int
     expect(status["transcode"]["frames_dropped"] == 0, "zero drops default");
   }
 
+  // ---- standby object (plan D3, CONTRACT §5) ------------------------------
+  // An armed slate: every member the plan specifies, same in both views.
+  {
+    standby_stat stat;
+    stat.enabled = true;
+    stat.mode = "slate";
+    stat.switches = 3;
+    stat.last_live_ms_ago = 812;
+    stat.caps_ok = true;
+    stat.stage_rebuilds = 0;
+    stat.degraded = "";
+
+    const json status = json::parse(standby_stat_json(stat, false));
+    const json stats = json::parse(standby_stat_json(stat, true));
+    expect(status["enabled"] == true, "standby.enabled echoes the session");
+    expect(status["mode"] == "slate", "standby.mode names the live source");
+    expect(status["switches"] == 3, "standby.switches counts transitions");
+    expect(status["last_live_ms_ago"] == 812, "standby age of last live");
+    expect(status["caps_ok"] == true, "standby.caps_ok");
+    expect(status["stage_rebuilds"] == 0, "standby.stage_rebuilds");
+    expect(status["degraded"] == "", "healthy standby has an empty degraded");
+    expect(status == stats, "/status and /stats carry the same standby object");
+    expect(status.size() == 7,
+           "the standby object has exactly the plan's members");
+  }
+
+  // A degraded slate carries the reason verbatim (render failure, or the
+  // geometry fallback), and "switching" is expressible as a mode.
+  {
+    standby_stat stat;
+    stat.enabled = true;
+    stat.mode = "switching";
+    stat.caps_ok = false;
+    stat.degraded = "geometry defaulted";
+    const json status = json::parse(standby_stat_json(stat, false));
+    expect(status["mode"] == "switching", "mode can be switching");
+    expect(status["degraded"] == "geometry defaulted",
+           "degraded carries the reason, not a bool");
+    expect(status["caps_ok"] == false,
+           "caps_ok false when the branches differ");
+
+    standby_stat failed;
+    failed.enabled = true;
+    failed.degraded = "no encoder for h264";
+    const json s2 = json::parse(standby_stat_json(failed, true));
+    expect(s2["degraded"] == "no encoder for h264",
+           "a render failure reason survives serialisation");
+    expect(s2["mode"] == "live", "default mode is live");
+  }
+
+  // Standby disabled (or stopped): present, and honest about being off.
+  {
+    const standby_stat stat;
+    const json status = json::parse(standby_stat_json(stat, false));
+    expect(status["enabled"] == false,
+           "disabled standby reports enabled=false");
+    expect(status["mode"] == "live", "disabled standby is live");
+    expect(status["switches"] == 0 && status["stage_rebuilds"] == 0,
+           "disabled standby has zeroed counters");
+    expect(status["degraded"] == "", "disabled standby is not degraded");
+  }
+
   std::puts("control_json_test: ALL OK");
   return 0;
 }

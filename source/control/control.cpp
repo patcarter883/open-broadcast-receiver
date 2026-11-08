@@ -412,6 +412,25 @@ auto output_stat_json(const output_stat& stat, bool stats_view) -> std::string
   return obj.dump();
 }
 
+// The standby object both endpoints carry (CONTRACT §5, schema_version 5).
+// Same members in /status and /stats: the object is small enough that a panel
+// should not have to branch on the endpoint, and `stats_view` exists only to
+// keep the two serialisers' shape parallel with output_stat_json (a test pins
+// that they agree member for member).
+auto standby_stat_json(const standby_stat& stat, bool /*stats_view*/)
+    -> std::string
+{
+  json obj;
+  obj["enabled"] = stat.enabled;
+  obj["mode"] = stat.mode;
+  obj["switches"] = stat.switches;
+  obj["last_live_ms_ago"] = stat.last_live_ms_ago;
+  obj["caps_ok"] = stat.caps_ok;
+  obj["stage_rebuilds"] = stat.stage_rebuilds;
+  obj["degraded"] = stat.degraded;  // "" = healthy, else the reason
+  return obj.dump();
+}
+
 // ---------------------------------------------------------------------------
 // control_server implementations
 // ---------------------------------------------------------------------------
@@ -428,11 +447,22 @@ control_server::~control_server()
 
 auto control_server::set_handlers(start_fn on_start,
                                   stop_fn on_stop,
-                                  stats_fn get_stats) -> void
+                                  stats_fn get_stats,
+                                  standby_fn get_standby) -> void
 {
   m_on_start = std::move(on_start);
   m_on_stop = std::move(on_stop);
   m_get_stats = std::move(get_stats);
+  m_get_standby = std::move(get_standby);
+}
+
+// The standby object, from the session's atomic snapshot. Always present (a
+// stopped session reports enabled=false, mode=live) so a panel never has to
+// feature-detect it.
+auto control_server::standby_object() const -> std::string
+{
+  const standby_stat snap = m_get_standby ? m_get_standby() : standby_stat {};
+  return standby_stat_json(snap, false);
 }
 
 auto control_server::authorized(const httplib::Request& req) const -> bool
@@ -468,6 +498,8 @@ auto control_server::build_status_json() const -> std::string
     out["session_id"] = sid.empty() ? json(nullptr) : json(sid);
     out["outputs"] = json::array();
     out["last_bus_error"] = last_err.empty() ? json(nullptr) : json(last_err);
+    // Still present when stopped: enabled=false, mode=live, zeroed counters.
+    out["standby"] = json::parse(standby_object());
     return out.dump();
   }
 
@@ -506,6 +538,8 @@ auto control_server::build_status_json() const -> std::string
   rec["active"] = snap.recording_active;
   rec["bytes"] = snap.recording_bytes;
   out["recording"] = std::move(rec);
+
+  out["standby"] = json::parse(standby_object());
 
   out["last_bus_error"] = last_err.empty() ? json(nullptr) : json(last_err);
   return out.dump();
@@ -569,6 +603,10 @@ auto control_server::build_stats_json() const -> std::string
     rec["dropped_bytes"] = snap.recording_dropped;
     out["recording"] = std::move(rec);
   }
+
+  // The agent-facing view: same standby object as /status, built from atomics.
+  out["standby"] = json::parse(standby_stat_json(
+      m_get_standby ? m_get_standby() : standby_stat {}, true));
   return out.dump();
 }
 
