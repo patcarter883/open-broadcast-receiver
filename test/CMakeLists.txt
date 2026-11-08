@@ -48,4 +48,32 @@ if(NOT OBR_TESTS_ONLY)
     Threads::Threads)
   target_compile_features(pipeline_build_test PRIVATE cxx_std_20)
   add_test(NAME pipeline_build_test COMMAND pipeline_build_test)
+
+  # Local RTMP publish harness: drives the real output pipeline against a local
+  # nginx-rtmp sink and judges it by the server's own byte count. It publishes,
+  # so it is built with the full lane but only registered with CTest when a sink
+  # is expected to be up (test/harness/rtmp_publish_harness.sh starts one).
+  add_executable(rtmp_publish_harness source/rtmp_publish_harness.cpp)
+  target_link_libraries(rtmp_publish_harness PRIVATE
+    fanout_lib
+    PkgConfig::gstreamer
+    PkgConfig::gstreamer-app
+    PkgConfig::gstreamer-video
+    Threads::Threads)
+  target_compile_features(rtmp_publish_harness PRIVATE cxx_std_20)
+  target_include_directories(rtmp_publish_harness PRIVATE
+    ${CMAKE_SOURCE_DIR}/external)
+
+  option(OBR_RTMP_HARNESS_TESTS
+    "Register the RTMP publish harness with CTest (needs a sink on 11935/18080)"
+    OFF)
+  if(OBR_RTMP_HARNESS_TESTS)
+    add_test(NAME rtmp_publish_transcode_av
+      COMMAND rtmp_publish_harness --mode transcode-av)
+    add_test(NAME rtmp_publish_transcode_video_only
+      COMMAND rtmp_publish_harness --mode transcode-video-only)
+    set_tests_properties(rtmp_publish_transcode_av
+      rtmp_publish_transcode_video_only
+      PROPERTIES TIMEOUT 90)
+  endif()
 endif()
