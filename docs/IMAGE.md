@@ -101,3 +101,41 @@ docker run --rm --network obr-sessions --name obr-<session_id> \
 ```
 
 The `OBR_*` environment is mapped to CLI flags by `docker/entrypoint.sh`.
+
+## Who needs registry auth
+
+There are three separate consumers, and only one of them is Komodo:
+
+| Consumer | Credential source | State |
+| --- | --- | --- |
+| `obr-receiver-build` (Komodo) | `/etc/komodo/periphery.providers.toml` → `[[docker_registry]]` account | works as-is; the build logs in itself and pushes on every build |
+| Host `docker push` / `docker pull` from a shell | `~/.docker/config.json` | **empty by default** — `docker pull` returns `unauthorized` until someone runs `docker login ghcr.io` on that host |
+| Session start on a node | the node agent's `RECEIVER_IMAGE`, pulled with the *host* docker login | tolerates a missing credential (see below) |
+
+A Komodo build therefore does not need a host login: Periphery holds its own
+registry account and pushes with it. The failure mode to watch for is the
+opposite one — a host with no login that is also missing the image locally.
+
+### Session start without registry auth
+
+`node/session.go` pulls before running because `docker run <tag>` never
+re-pulls a tag that is already present, so a node would otherwise serve
+whatever receiver it first cached. The pull is deliberately non-fatal: if the
+registry rejects the host (`unauthorized`) the agent logs it and runs the local
+copy of that tag.
+
+```
+pull ghcr.io/patcarter883/open-broadcast-receiver:latest failed, using the local copy if present: ...
+```
+
+That makes a locally built tag a legitimate interim delivery path:
+
+```sh
+make image                      # -> <image>:<sha> + <image>:latest on this host
+docker run ... ghcr.io/patcarter883/open-broadcast-receiver:latest
+```
+
+It only works while the tag is actually present (`docker images`), and it
+silently pins the node to that copy — the drift is visible in the agent log and
+nowhere else. Log the host in to ghcr when the build host is the node.
+
