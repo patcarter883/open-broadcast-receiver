@@ -250,6 +250,23 @@ if(NOT OBR_TESTS_ONLY)
     Threads::Threads)
   target_compile_features(stage_test PRIVATE cxx_std_20)
   add_test(NAME stage_test COMMAND stage_test)
+
+  # es_audio_framing_test asserts the audio framing contract between the stage
+  # (what it publishes into the audio es_ring) and a standby-enabled output (what
+  # its ES audio appsrc declares). A mismatch starves aacparse and silently stops
+  # every standby RTMP publish; this fails it as a unit test instead.
+  add_executable(es_audio_framing_test source/es_audio_framing_test.cpp)
+  target_link_libraries(es_audio_framing_test PRIVATE
+    standby_lib
+    fanout_lib
+    PkgConfig::gstreamer
+    PkgConfig::gstreamer-app
+    Threads::Threads)
+  target_compile_features(es_audio_framing_test PRIVATE cxx_std_20)
+  add_test(NAME es_audio_framing_test COMMAND es_audio_framing_test)
+  set_tests_properties(es_audio_framing_test PROPERTIES
+    TIMEOUT 120
+    SKIP_RETURN_CODE 77)
   set_tests_properties(stage_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()
 
