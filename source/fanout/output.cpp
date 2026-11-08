@@ -272,10 +272,12 @@ auto output_template(output_proto proto,
       // uses the Enhanced FLV muxer (eflvmux) — legacy flvmux cannot carry
       // H.265.
       return std::format(
+          // Video only, deliberately: pre-linking an audio pad makes flvmux
+          // wait for audio caps before it emits anything, so no data reaches
+          // the ingest while YouTube closes the publisher for sending nothing.
+          // Audio is attached once it can be produced (follow-up), never at the
+          // cost of the first video frame.
           "{}! queue ! {}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
-          "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=d "
-          "d. ! queue ! aacparse "
-          "! audio/mpeg,mpegversion=4,stream-format=raw ! mux. "
           "{} name=mux streamable=true "
           "! rtmp2sink name=osink async-connect=true",
           k_appsrc,
@@ -283,7 +285,6 @@ auto output_template(output_proto proto,
           enc,
           parse,
           vcaps,
-          k_audio_appsrc,
           mux);
     }
     case output_proto::srt: {
@@ -881,6 +882,40 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   // forever: run_once never returns, the worker never reconnects, and no bus
   // error is raised. Watch the buffer level instead and end the attempt once
   // it has been pinned at the limit, so the sink is rebuilt and reconnected.
+  if (!m_audio_probe_done && m_audio_appsrc != nullptr
+      && std::chrono::steady_clock::now() - m_run_started
+          > std::chrono::seconds(4))
+  {
+    m_audio_probe_done = true;
+    GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
+    if (mux != nullptr) {
+      // Judge by the MUXER's pad, not the appsrc: the appsrc is caps'd (it is
+      // fed MPEG-TS), while the branch downstream of it can still stall before
+      // the muxer -- which is what keeps flvmux from emitting at all.
+      GstIterator* it = gst_element_iterate_sink_pads(mux);
+      GValue item = G_VALUE_INIT;
+      while (gst_iterator_next(it, &item) == GST_ITERATOR_OK) {
+        auto* candidate = GST_PAD(g_value_get_object(&item));
+        const char* pname = GST_PAD_NAME(candidate);
+        if (pname != nullptr && g_str_has_prefix(pname, "audio") == TRUE) {
+          if (gst_pad_get_current_caps(candidate) == nullptr) {
+            GstPad* peer = gst_pad_get_peer(candidate);
+            if (peer != nullptr) {
+              gst_pad_unlink(peer, candidate);
+              gst_object_unref(peer);
+            }
+            log("audio pad had no caps at the muxer; dropping it so video publishes\n");
+          }
+          break;
+        }
+        g_value_reset(&item);
+      }
+      g_value_unset(&item);
+      gst_iterator_free(it);
+      gst_object_unref(mux);
+    }
+  }
+
   if (gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc))
       >= static_cast<guint64>(k_appsrc_max_bytes))
   {
@@ -902,42 +937,6 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
   // that never receives data pins the output in PAUSED: the sink never
   // prerolls and the publish looks frozen with no error. Probed from the feed
   // thread (this binary runs no GLib main loop, so a g_timeout never fires).
-  if (!m_audio_probe_done && m_audio_appsrc != nullptr
-      && std::chrono::steady_clock::now() - m_run_started
-          > std::chrono::seconds(4))
-  {
-    m_audio_probe_done = true;
-    GstPad* asrc = gst_element_get_static_pad(m_audio_appsrc, "src");
-    const bool capless = asrc == nullptr || gst_pad_get_current_caps(asrc) == nullptr;
-    if (asrc != nullptr) {
-      gst_object_unref(asrc);
-    }
-    if (capless) {
-      GstElement* mux = gst_bin_get_by_name(GST_BIN(m_pipeline), "mux");
-      if (mux != nullptr) {
-        GstIterator* it = gst_element_iterate_sink_pads(mux);
-        GValue item = G_VALUE_INIT;
-        while (gst_iterator_next(it, &item) == GST_ITERATOR_OK) {
-          auto* candidate = GST_PAD(g_value_get_object(&item));
-          const char* pname = GST_PAD_NAME(candidate);
-          if (pname != nullptr && g_str_has_prefix(pname, "audio") == TRUE) {
-            GstPad* peer = gst_pad_get_peer(candidate);
-            if (peer != nullptr) {
-              gst_pad_unlink(peer, candidate);
-              gst_object_unref(peer);
-            }
-            log("audio pad had no caps; dropping it so the video can publish\n");
-            break;
-          }
-          g_value_reset(&item);
-        }
-        g_value_unset(&item);
-        gst_iterator_free(it);
-        gst_object_unref(mux);
-      }
-    }
-  }
-
   frame_ring::frame_meta vmeta;
   const std::size_t vgot =
       m_frames->read(m_frame_consumer, vmeta, m_frame_buf.data(),
