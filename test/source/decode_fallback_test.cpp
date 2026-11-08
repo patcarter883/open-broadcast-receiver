@@ -28,6 +28,7 @@
 // pipelines actually ran.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -604,6 +605,48 @@ auto main(int argc, char** argv) -> int
         check(false, "the h264 fixture could not be muxed");
       }
     }
+  }
+
+  // ---- 8. counters() and stop() race the feeder's teardown ----------------
+  // The control thread reads counters() (and stop()) while the feeder thread
+  // retires an attempt and unrefs the pipeline. Both take a reference under the
+  // pipeline lock, so neither can call into an element the feeder has freed.
+  if (std::filesystem::exists(fx_420)) {
+    ts_ring ring {ts_ring::size_for_bandwidth(20000)};
+    decoder dec {ring, codec::av1, [](const std::string&) -> void {}};
+    check(dec.start(), "decode stage starts for the counters/stop race");
+    const auto bytes = read_file(fx_420);
+    check(!bytes.empty(), "the main fixture is readable for the teardown race");
+
+    std::atomic_bool feeding {true};
+    std::thread feeder {[&ring, &bytes, &feeding]() -> void {
+      while (feeding.load(std::memory_order_relaxed)) {
+        feed(ring, bytes);
+      }
+    }};
+    std::atomic_bool sampling {true};
+    std::atomic<long> samples {0};
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 3; ++i) {
+      readers.emplace_back([&dec, &sampling, &samples]() -> void {
+        while (sampling.load(std::memory_order_relaxed)) {
+          const auto sample = dec.counters();
+          (void)sample;
+          samples.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    dec.stop();  // tears the pipeline down underneath the readers
+    sampling.store(false, std::memory_order_relaxed);
+    feeding.store(false, std::memory_order_relaxed);
+    for (std::thread& reader : readers) {
+      reader.join();
+    }
+    feeder.join();
+    check(samples.load() > 0,
+          "counters() sampled the stage during a concurrent teardown");
+    dec.stop();  // idempotent: a second stop after the teardown is a no-op
   }
 
   std::filesystem::remove_all(dir);

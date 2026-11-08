@@ -394,9 +394,12 @@ auto decoder::stop() -> void
   // Everything that can RELEASE a blocked thread happens before the join, because
   // a thread parked in a GStreamer call or waiting on the frame ring never sees
   // m_stopping: the NULL transition frees the former, m_frames.close() wakes the
-  // latter. Joining first would block stop for as long as the park lasts.
-  if (m_pipeline != nullptr) {
-    gst_element_set_state(m_pipeline, GST_STATE_NULL);
+  // latter. The pipeline reference is taken under m_pipe_mutex and the lock is
+  // released before the join: the feeder thread takes the same lock to unref the
+  // pipeline, so holding it across the join would deadlock stop() forever.
+  if (GstElement* pipeline_now = pipeline(); pipeline_now != nullptr) {
+    gst_element_set_state(pipeline_now, GST_STATE_NULL);
+    gst_object_unref(pipeline_now);
   }
   m_frames.close();  // wake every blocked transcode consumer
   if (m_thread.joinable()) {
@@ -409,10 +412,28 @@ auto decoder::stop() -> void
   }
 }
 
+auto decoder::pipeline() const -> GstElement*
+{
+  std::lock_guard<std::mutex> guard(m_pipe_mutex);
+  if (m_pipeline == nullptr) {
+    return nullptr;
+  }
+  return GST_ELEMENT(gst_object_ref(m_pipeline));
+}
+
 auto decoder::destroy_pipeline() -> void
 {
-  if (m_pipeline != nullptr) {
-    gst_element_set_state(m_pipeline, GST_STATE_NULL);
+  // The pipeline is detached under the lock and unreffed outside it, so a
+  // concurrent pipeline() either sees the pointer (and takes its own reference)
+  // or sees null — never a freed element.
+  GstElement* pipeline = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(m_pipe_mutex);
+    pipeline = m_pipeline;
+    m_pipeline = nullptr;
+  }
+  if (pipeline != nullptr) {
+    gst_element_set_state(pipeline, GST_STATE_NULL);
   }
   if (m_decoder_caps != nullptr) {
     gst_caps_unref(m_decoder_caps);
@@ -430,9 +451,8 @@ auto decoder::destroy_pipeline() -> void
     gst_object_unref(m_appsink);
     m_appsink = nullptr;
   }
-  if (m_pipeline != nullptr) {
-    gst_object_unref(m_pipeline);
-    m_pipeline = nullptr;
+  if (pipeline != nullptr) {
+    gst_object_unref(pipeline);
   }
 }
 
@@ -640,9 +660,9 @@ auto decoder::counters() const -> stage_counters
 {
   GstState state = GST_STATE_VOID_PENDING;
   GstState pending = GST_STATE_VOID_PENDING;
-  if (m_pipeline != nullptr)
-  {
-    gst_element_get_state(m_pipeline, &state, &pending, 0);
+  if (GstElement* pipeline_now = pipeline(); pipeline_now != nullptr) {
+    gst_element_get_state(pipeline_now, &state, &pending, 0);
+    gst_object_unref(pipeline_now);
   }
 
   stage_counters sample;
@@ -708,6 +728,7 @@ auto decoder::start_attempt(std::size_t index, std::string& err) -> bool
       m_decoder_buffers.load(std::memory_order_relaxed),
       std::memory_order_relaxed);
   m_stall_since = std::chrono::steady_clock::time_point {};
+  m_stalled.store(false, std::memory_order_relaxed);
   return true;
 }
 
@@ -1043,6 +1064,7 @@ auto decoder::worker() -> void
       const auto now = now_steady();
       if (m_stall_since == std::chrono::steady_clock::time_point {}) {
         m_stall_since = now;
+        m_stalled.store(true, std::memory_order_relaxed);
         log("decode appsrc full: the decode chain is not consuming\n");
       } else if (!stall_reported && now - m_stall_since > k_stall_timeout) {
         stall_reported = true;
@@ -1054,6 +1076,7 @@ auto decoder::worker() -> void
     } else {
       if (m_stall_since != std::chrono::steady_clock::time_point {}) {
         m_stall_since = std::chrono::steady_clock::time_point {};
+        m_stalled.store(false, std::memory_order_relaxed);
         stall_reported = false;
         log("decode appsrc draining again\n");
       }

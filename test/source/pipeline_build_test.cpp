@@ -76,8 +76,10 @@ auto main() -> int
            "copy rtmp links no demuxer pad from the template");
     expect(has(rtmp, "queue name=vq ! h264parse config-interval=-1"),
            "copy rtmp names the video branch");
-    expect(has(rtmp, "queue name=aq ! aacparse"),
+    expect(has(rtmp, "queue name=aq ! aacparse name=aparse"),
            "copy rtmp names the audio branch");
+    expect(!has(rtmp, "avdec_aac"),
+           "copy rtmp carries AAC through instead of re-encoding it");
     expect(has(rtmp, "funnel name=ddrop ! fakesink sync=false async=false"),
            "copy rtmp has a drop funnel for pads no branch handles");
     expect(parses(rtmp), "copy rtmp template parses");
@@ -99,16 +101,21 @@ auto main() -> int
     expect(has(tmpl, "flvmux name=mux"), "h264 rtmp legacy flvmux");
     expect(has(tmpl, "appsrc name=asrc") && has(tmpl, "aacparse"),
            "h264 rtmp keeps the AAC audio appsrc");
-    expect(has(tmpl, "stream-format=raw,rate=48000,channels=2,"
-                    "codec_data=(buffer)1190"),
-           "h264 rtmp declares the AAC-LC 48 kHz stereo codec_data");
+    // The branch converts the source into the declared format instead of
+    // asserting it: an ingest at any rate must negotiate.
+    expect(has(tmpl, "avdec_aac") && has(tmpl, "audioresample")
+               && has(tmpl, "audio/x-raw,rate=48000,channels=2")
+               && has(tmpl, "avenc_aac"),
+           "h264 rtmp resamples the source audio into 48 kHz stereo");
     // The audio branch stops at the capsfilter: the muxer's audio pad is
     // requested from demux_pad_added() only, so a video-only source never
     // hands flvmux an audio pad to wait on and video publishes immediately.
-    expect(has(tmpl, "aacparse ! capsfilter name=acaps "
-                     "caps=audio/mpeg,mpegversion=4"),
-           "h264 rtmp audio branch is a named capsfilter");
-    expect(tmpl.find("codec_data=(buffer)1190 ! mux.") == std::string::npos,
+    expect(has(tmpl, "capsfilter name=acaps "
+                     "caps=audio/mpeg,mpegversion=4,stream-format=raw"),
+           "h264 rtmp audio branch is a named capsfilter on the container only");
+    expect(has(tmpl, "stream-format=raw ") && !has(tmpl, "codec_data="),
+           "h264 rtmp states no AudioSpecificConfig of its own");
+    expect(tmpl.find("stream-format=raw ! mux.") == std::string::npos,
            "h264 rtmp audio branch is not pre-linked to the muxer");
     // The encoder input is pinned: the destinations are 4:2:0 8-bit, and the
     // encoder's own sink caps would otherwise accept 4:4:4 or 10-bit layouts.

@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -130,6 +131,12 @@ public:
   {
     return m_audio_dropped.load(std::memory_order_relaxed);
   }
+  // Buffers the muxer's audio pad has received on this output. A linked pad
+  // with a zero count is an audio branch that is negotiated but silent.
+  [[nodiscard]] auto audio_frames() const -> uint64_t
+  {
+    return m_audio_frames.load(std::memory_order_relaxed);
+  }
   // Seconds in state=running for the current connection, 0 otherwise.
   [[nodiscard]] auto connected_s() const -> int64_t;
   [[nodiscard]] auto last_error() const -> std::string;
@@ -202,6 +209,11 @@ private:
   // rtmp_codec_unsupported class (caps/negotiation failure on an FLV path).
   auto is_codec_terminal(const GError* err, GstElement* src) const -> bool;
 
+  // Retires the audio branch of a live attempt: the demux pad is moved to the
+  // drop funnel and an untouched muxer audio pad is released. Video keeps
+  // flowing, because audio is optional and video is not.
+  auto degrade_audio_branch(std::string_view reason) -> void;
+
   static auto demux_pad_added(GstElement* demux, GstPad* pad, gpointer self)
       -> void;
 
@@ -233,9 +245,6 @@ private:
   // exists, so a pipeline-start clock retires a perfectly good audio branch
   // before its first buffer can arrive.
   std::chrono::steady_clock::time_point m_first_video_push {};
-  // One audio-branch observation per attempt: a linked pad that never receives
-  // a buffer is how flvmux stalls with no error anywhere.
-  bool m_audio_probe_done {false};
   bool m_muxer_input_logged {false};
   // Set when the muxer's audio pad has been reported with the caps it received,
   // so the report names the negotiated format (raw + codec_data) once.
@@ -243,8 +252,15 @@ private:
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};
   // Buffers the muxer's audio pad actually received. Caps on that pad are not
-  // data; a linked pad with no buffers is how flvmux stalls without an error.
+  // data; a linked pad with no buffers is how flvmux stalls without an error,
+  // which is what decides whether a failed branch's muxer pad can still be
+  // released.
   std::atomic<uint64_t> m_audio_frames {0};
+  // Guards the audio branch's pads: attach runs on the demux streaming thread,
+  // degrade on the output's worker thread.
+  std::mutex m_audio_mutex;
+  GstPad* m_audio_demux_pad = nullptr;  // demux audio pad -> aq (owned ref)
+  GstPad* m_audio_mux_pad = nullptr;    // acaps src -> mux audio (owned ref)
   std::atomic<int64_t> m_running_since_ms {0};  // steady ms; 0 = not running
 
   // Transcode feed accounting, reported once every k_feed_stats_period. It
@@ -311,5 +327,15 @@ private:
 auto output_template(output_proto proto,
                      const transcode_config& transcode,
                      const char* encoder) -> std::string;
+
+// The elements that make up an RTMP output's audio branch. A bus error whose
+// source is one of these is retired with the branch rather than the attempt.
+auto is_audio_branch_element(std::string_view element_name) -> bool;
+
+// The RTMP audio branch (queue -> ... -> acaps) both RTMP templates use.
+// `transcode` selects the re-encoding branch (decode, resample to the declared
+// output format, encode) over the copy branch (aacparse passthrough). Exposed so
+// the branch can be run on real MPEG-TS sources without restating it in a test.
+auto rtmp_audio_branch(bool transcode) -> std::string;
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_FANOUT_OUTPUT_H

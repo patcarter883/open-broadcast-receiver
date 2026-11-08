@@ -617,6 +617,7 @@ auto main(int argc, char** argv) -> int
       ostat.bytes_sent = out->bytes_sent();
       ostat.dropped_bytes = out->dropped_bytes();
       ostat.audio_dropped = out->audio_dropped();
+      ostat.audio_frames = out->audio_frames();
       ostat.last_error = out->last_error();
       snap.outputs.push_back(std::move(ostat));
     }

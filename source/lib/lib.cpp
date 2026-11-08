@@ -381,6 +381,8 @@ auto to_string(transcode_target target) noexcept -> const char*
       return "h264";
     case transcode_target::h265:
       return "h265";
+    case transcode_target::av1:
+      return "av1";
   }
   return "none";
 }
@@ -677,6 +679,15 @@ auto required_elements(output_proto proto,
       } else {
         reqs.push_back({{"flvmux"}, false});
         reqs.push_back({{"h264parse"}, transcode_on});
+      }
+      if (transcode_on) {
+        // The audio branch re-encodes the source into the declared output
+        // format; a missing element here is a transcode-path failure, not a
+        // base-chain one.
+        reqs.push_back({{"avdec_aac"}, true});
+        reqs.push_back({{"audioconvert"}, true});
+        reqs.push_back({{"audioresample"}, true});
+        reqs.push_back({{"avenc_aac"}, true});
       }
       break;
     case output_proto::srt:

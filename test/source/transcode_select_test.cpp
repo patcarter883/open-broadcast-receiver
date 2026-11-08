@@ -172,6 +172,32 @@ auto main() -> int
            "h264 rtmp never needs the flag");
   }
 
+  // Every transcode target round-trips through its name, and no two share one:
+  // a target the stringifier does not know is what made /stats report
+  // "codec":"none" for an AV1 output.
+  {
+    const transcode_target all[] = {transcode_target::none,
+                                    transcode_target::h264,
+                                    transcode_target::h265,
+                                    transcode_target::av1};
+    std::vector<std::string> seen;
+    for (const transcode_target target : all) {
+      const std::string name = to_string(target);
+      expect(!name.empty(), "every transcode target has a name");
+      expect(std::ranges::find(seen, name) == seen.end(),
+             "no two transcode targets share a name");
+      seen.push_back(name);
+      if (target == transcode_target::none) {
+        continue;  // copy-only is the absence of the object, never parsed back
+      }
+      transcode_target parsed = transcode_target::none;
+      expect(parse_transcode_target(name, parsed) && parsed == target,
+             "a transcode target parses back from its own name");
+    }
+    expect(to_string(transcode_target::av1) == std::string {"av1"},
+           "an AV1 transcode target reports \"av1\", not \"none\"");
+  }
+
   std::puts("transcode_select_test: ALL OK");
   return 0;
 }

@@ -41,6 +41,12 @@ constexpr guint64 k_appsrc_ceiling_bytes = 64 * 1024 * 1024;
 constexpr auto k_stall_timeout = std::chrono::seconds(5);
 // Period of the transcode feed's accounting line.
 constexpr auto k_feed_stats_period = std::chrono::seconds(2);
+// The audio format an RTMP transcode output publishes: AAC-LC, 48 kHz stereo.
+// The source is resampled and remixed into it, so the values are a destination
+// contract rather than an assumption about the ingest.
+constexpr int k_audio_rate = 48000;
+constexpr int k_audio_channels = 2;
+constexpr int k_audio_bitrate_bps = 128000;
 
 auto now_ms() -> int64_t
 {
@@ -98,6 +104,19 @@ auto count_buffer_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer dat
 }
 
 }  // namespace
+
+// The elements that make up an RTMP output's audio branch. A bus error whose
+// source is one of these is an audio failure: audio is optional and video is
+// not, so such an error retires the branch instead of the attempt.
+auto is_audio_branch_element(std::string_view element_name) -> bool
+{
+  static constexpr std::string_view k_names[] = {
+      "aq", "aparse", "adec", "aconv", "aresample", "aenc", "aencparse",
+      "acaps"};
+  return std::ranges::any_of(
+      k_names, [element_name](std::string_view name)
+      { return name == element_name; });
+}
 
 output::output(output_config cfg,
                ts_ring& ring,
@@ -251,6 +270,38 @@ auto output::first_missing_element(output_proto proto,
 // Pipeline construction (TRANSPORT_PROFILE §3.5)
 // ---------------------------------------------------------------------------
 
+// The RTMP audio branch, shared by the copy and transcode templates so the two
+// cannot drift. It ends at `acaps`; the muxer's audio pad is requested only when
+// the source TS exposes an audio pad (attach_audio_branch), so a video-only
+// ingest never hands flvmux an audio pad to wait on.
+//
+// Copy: the source AAC is passed through. aacparse turns the ADTS the demux
+// produces into the raw AAC flvmux carries, with the source's own rate, channel
+// count and AudioSpecificConfig in the caps — nothing about the ingest is
+// assumed and nothing is re-encoded.
+//
+// Transcode: the source audio is decoded and resampled into the declared output
+// format, so an ingest at any rate or channel count (OBS sets the rate per
+// session) negotiates instead of being refused. The AudioSpecificConfig flvmux
+// needs comes from avenc_aac's own caps, so it always describes the samples
+// actually published.
+auto rtmp_audio_branch(bool transcode) -> std::string
+{
+  if (!transcode) {
+    return "queue name=aq ! aacparse name=aparse "
+           "! capsfilter name=acaps "
+           "caps=audio/mpeg,mpegversion=4,stream-format=raw ";
+  }
+  return std::format(
+      "queue name=aq ! aacparse name=aparse ! avdec_aac name=adec "
+      "! audioconvert name=aconv ! audioresample name=aresample "
+      "! audio/x-raw,rate={},channels={} "
+      "! avenc_aac name=aenc bitrate={} ! aacparse name=aencparse "
+      "! capsfilter name=acaps "
+      "caps=audio/mpeg,mpegversion=4,stream-format=raw ",
+      k_audio_rate, k_audio_channels, k_audio_bitrate_bps);
+}
+
 auto output_template(output_proto proto,
                      const transcode_config& transcode,
                      const char* encoder) -> std::string
@@ -297,9 +348,8 @@ auto output_template(output_proto proto,
               "! tsdemux name=d "
               "queue name=vq ! h264parse config-interval=-1 "
               "! video/x-h264,stream-format=avc,alignment=au ! mux. "
-              "queue name=aq ! aacparse ! capsfilter name=acaps "
-              "caps=audio/mpeg,mpegversion=4,stream-format=raw "
-              "flvmux name=mux streamable=true latency=1000000000 "
+            + rtmp_audio_branch(false)
+            + "flvmux name=mux streamable=true latency=1000000000 "
               "! rtmp2sink name=osink async-connect=true "
               "funnel name=ddrop ! fakesink sync=false async=false";
     }
@@ -370,26 +420,20 @@ auto output_template(output_proto proto,
       const std::string vcaps = hevc
           ? "video/x-h265,stream-format=hvc1,alignment=au,profile=main"
           : "video/x-h264,stream-format=avc,alignment=au,profile=high";
-      // Encoded video is driven from the shared frame ring; audio stays on the
-      // ts_ring AAC copy path so RTMP audio passthrough is unchanged. h265
-      // uses the Enhanced FLV muxer (eflvmux) — legacy flvmux cannot carry
-      // H.265.
+      // Encoded video is driven from the shared frame ring; audio is read from
+      // the ts_ring and re-encoded into the declared output format by the
+      // branch (see rtmp_audio_branch). h265 uses the Enhanced FLV muxer
+      // (eflvmux) — legacy flvmux cannot carry H.265.
       //
-      // Audio is declared, never discovered: the source is AAC-LC 48 kHz
-      // stereo, so the branch states that and carries the matching
-      // AudioSpecificConfig (0x11 0x90: AOT 2, 48 kHz, 2 channels) as
-      // codec_data, which is what FLV requires and what flvmux otherwise
-      // waits for. The branch ENDS at `acaps` in this template: the muxer's
-      // audio pad is requested only from demux_pad_added(), i.e. only when the
-      // source TS actually exposes an audio pad. A video-only ingest therefore
-      // never hands flvmux an audio pad to wait on, and video publishes on the
-      // first encoded frame with no timeout involved.
+      // Audio is optional and video is not: the branch is attached only when the
+      // source TS exposes an audio pad, and an error raised inside it degrades
+      // the output to video-only instead of retiring the attempt
+      // (degrade_audio_branch). Nothing in the branch asserts a property of the
+      // ingest: the declared 48 kHz stereo is what the branch CONVERTS to.
       return std::format(
           "{}! queue ! {}{}{} name=venc ! {} config-interval=-1 ! {} ! mux. "
           "{}! tsparse set-timestamps=true alignment=7 ! tsdemux name=ad "
-          "queue name=aq ! aacparse ! capsfilter name=acaps "
-          "caps=audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2,"
-          "codec_data=(buffer)1190 "
+          "{}"
           "{} name=mux streamable=true "
           // The transcode sink does not sync to the pipeline clock. Its input is
           // a live drop-oldest ring: pacing the encoder by the output clock
@@ -405,6 +449,7 @@ auto output_template(output_proto proto,
           parse,
           vcaps,
           k_audio_appsrc,
+          rtmp_audio_branch(true),
           mux);
     }
     case output_proto::srt: {
@@ -855,6 +900,17 @@ auto output::destroy_pipeline() -> void
   if (pipeline != nullptr) {
     gst_element_set_state(pipeline, GST_STATE_NULL);
   }
+  {
+    std::lock_guard<std::mutex> guard(m_audio_mutex);
+    if (m_audio_demux_pad != nullptr) {
+      gst_object_unref(m_audio_demux_pad);
+      m_audio_demux_pad = nullptr;
+    }
+    if (m_audio_mux_pad != nullptr) {
+      gst_object_unref(m_audio_mux_pad);
+      m_audio_mux_pad = nullptr;
+    }
+  }
   if (m_bus != nullptr) {
     gst_object_unref(m_bus);
     m_bus = nullptr;
@@ -1081,7 +1137,6 @@ auto output::run_once() -> bool
   m_run_started = std::chrono::steady_clock::now();
   m_audio_linked.store(false, std::memory_order_relaxed);
   m_first_video_push = std::chrono::steady_clock::time_point {};
-  m_audio_probe_done = false;
   m_muxer_audio_logged.store(false);
   m_first_output_logged.store(false);
   m_feed = feed_stats {};
@@ -1128,11 +1183,23 @@ auto output::run_once() -> bool
           const int code = gerr != nullptr ? gerr->code : 0;
           const std::string debug = redact_secret(
               dbg != nullptr ? dbg : "", m_cfg.key_or_streamid);
-          terminal = is_codec_terminal(gerr, GST_ELEMENT(src_obj));
-          set_last_error(terminal ? "rtmp_codec_unsupported" : text);
           log(std::format("bus error from {}: domain={} code={} ({}) debug={}\n",
                           who, domain != nullptr ? domain : "none", code, text,
                           debug.empty() ? "-" : debug));
+          if (is_audio_branch_element(who)) {
+            // Audio is optional: an error raised inside the audio branch is
+            // contained there, so an attempt that is publishing video keeps
+            // publishing it.
+            if (gerr != nullptr) {
+              g_error_free(gerr);
+            }
+            g_free(dbg);
+            degrade_audio_branch(
+                std::format("{}: {}", who, text.empty() ? "error" : text));
+            break;
+          }
+          terminal = is_codec_terminal(gerr, GST_ELEMENT(src_obj));
+          set_last_error(terminal ? "rtmp_codec_unsupported" : text);
           if (gerr != nullptr) {
             g_error_free(gerr);
           }
@@ -1203,10 +1270,12 @@ auto output::run_once() -> bool
 // with a video pad alone, so nothing time-based decides whether video publishes.
 auto output::attach_audio_branch(GstPad* demux_pad) -> void
 {
-  if (m_audio_linked.exchange(true)) {
-    // One muxer audio pad per output; a second audio ES has nowhere to go.
+  std::lock_guard<std::mutex> guard(m_audio_mutex);
+  if (m_audio_dropped.load(std::memory_order_acquire)
+      || m_audio_linked.exchange(true)) {
+    // One muxer audio pad per output: a second audio ES, or one arriving after
+    // the branch was retired, has nowhere to go.
     sink_into_drop(demux_pad);
-    log("second audio pad from the source TS; the output keeps the first\n");
     return;
   }
 
@@ -1218,6 +1287,7 @@ auto output::attach_audio_branch(GstPad* demux_pad) -> void
     if (acaps != nullptr) { gst_object_unref(acaps); }
     if (mux != nullptr) { gst_object_unref(mux); }
     m_audio_dropped.store(true, std::memory_order_relaxed);
+    sink_into_drop(demux_pad);
     return;
   }
 
@@ -1255,18 +1325,28 @@ auto output::attach_audio_branch(GstPad* demux_pad) -> void
     gst_pad_add_probe(mux_audio, GST_PAD_PROBE_TYPE_BUFFER,
                       &output::muxer_audio_first_buffer, this, nullptr);
     linked = gst_pad_link(caps_src, mux_audio) == GST_PAD_LINK_OK;
-    if (!linked) {
-      // A requested-but-unlinked audio pad is exactly the state that stalls
-      // flvmux, so it is handed back rather than left on the muxer.
+  }
+  if (linked) {
+    m_audio_demux_pad = GST_PAD(gst_object_ref(demux_pad));
+    m_audio_mux_pad = GST_PAD(gst_object_ref(mux_audio));
+    log("source TS carries audio; muxer audio pad linked\n");
+  } else {
+    // A requested-but-unlinked audio pad is the state that stalls flvmux, and a
+    // queue left with a dead-end src peer fills until it blocks tsdemux's
+    // streaming thread. Both ends of the branch are therefore released, and the
+    // demux pad keeps the output flowing through the drop funnel.
+    if (mux_audio != nullptr) {
       gst_element_release_request_pad(mux, mux_audio);
     }
-  }
-  if (!linked) {
+    GstPad* branch_sink = gst_element_get_static_pad(aq, "sink");
+    if (branch_sink != nullptr) {
+      gst_pad_unlink(demux_pad, branch_sink);
+      gst_object_unref(branch_sink);
+    }
+    sink_into_drop(demux_pad);
+    m_audio_dropped.store(true, std::memory_order_relaxed);
     log("AAC branch could not be attached to the muxer; output runs "
         "video-only\n");
-    m_audio_dropped.store(true, std::memory_order_relaxed);
-  } else {
-    log("source TS carries audio; muxer audio pad linked\n");
   }
   if (caps_src != nullptr) {
     gst_object_unref(caps_src);
@@ -1277,6 +1357,76 @@ auto output::attach_audio_branch(GstPad* demux_pad) -> void
   gst_object_unref(aq);
   gst_object_unref(acaps);
   gst_object_unref(mux);
+}
+
+// An error posted from inside the audio branch retires the branch, not the
+// attempt: audio is optional and video is not. The demux pad is unlinked from
+// the branch and sunk into the drop funnel so tsdemux keeps streaming; the
+// muxer's audio pad is released while it has carried no buffer, and left in
+// place (going silent) once it has, because a pad the muxer is already
+// multiplexing from is not removed underneath it.
+auto output::degrade_audio_branch(std::string_view reason) -> void
+{
+  // The branch's pads are claimed under the lock and torn down outside it: the
+  // streaming thread takes the same lock to attach them.
+  GstPad* demux_pad = nullptr;
+  GstPad* mux_pad = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(m_audio_mutex);
+    if (m_audio_dropped.exchange(true, std::memory_order_acq_rel)) {
+      return;  // this attempt's audio branch is already retired
+    }
+    demux_pad = m_audio_demux_pad;
+    mux_pad = m_audio_mux_pad;
+    m_audio_demux_pad = nullptr;
+    m_audio_mux_pad = nullptr;
+  }
+  log(std::format("audio branch retired ({}); output continues video-only\n",
+                  reason));
+
+  GstElement* aq =
+      m_pipeline != nullptr ? gst_bin_get_by_name(GST_BIN(m_pipeline), "aq")
+                            : nullptr;
+  if (demux_pad != nullptr) {
+    if (aq != nullptr) {
+      GstPad* branch_sink = gst_element_get_static_pad(aq, "sink");
+      if (branch_sink != nullptr) {
+        gst_pad_unlink(demux_pad, branch_sink);
+        gst_object_unref(branch_sink);
+      }
+    }
+    sink_into_drop(demux_pad);
+    gst_object_unref(demux_pad);
+  }
+  if (mux_pad != nullptr) {
+    GstElement* acaps =
+        m_pipeline != nullptr ? gst_bin_get_by_name(GST_BIN(m_pipeline), "acaps")
+                              : nullptr;
+    GstElement* mux =
+        m_pipeline != nullptr ? gst_bin_get_by_name(GST_BIN(m_pipeline), "mux")
+                              : nullptr;
+    if (acaps != nullptr) {
+      GstPad* caps_src = gst_element_get_static_pad(acaps, "src");
+      if (caps_src != nullptr) {
+        gst_pad_unlink(caps_src, mux_pad);
+        gst_object_unref(caps_src);
+      }
+      gst_object_unref(acaps);
+    }
+    if (mux != nullptr) {
+      // The first-buffer probe flips m_muxer_audio_logged, so it says whether
+      // this attempt's muxer pad has carried anything: an untouched pad is
+      // handed back, a streaming one is left to go silent.
+      if (!m_muxer_audio_logged.load(std::memory_order_acquire)) {
+        gst_element_release_request_pad(mux, mux_pad);
+      }
+      gst_object_unref(mux);
+    }
+    gst_object_unref(mux_pad);
+  }
+  if (aq != nullptr) {
+    gst_object_unref(aq);
+  }
 }
 
 // A demux src pad with nowhere to go fails the pipeline with "streaming

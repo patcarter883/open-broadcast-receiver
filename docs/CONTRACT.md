@@ -204,7 +204,8 @@ The PSK travels via the librist settings struct — never inside any URL.
   copied to RTMP); with one, the receiver decodes and re-encodes to the requested target. If runtime detection later
   finds a non-H.264 video ES on a copy-only rtmp output, that output enters `error` state `rtmp_codec_unsupported`
   (session survives; srt/rist and transcode outputs continue). A non-AAC **audio** ES with rtmp outputs ⇒ those
-  outputs run **video-only** and report `audio_dropped: true` rather than failing.
+  outputs run **video-only** and report `audio_dropped: true` rather than failing. The same holds at runtime: an error
+  inside an rtmp output's audio branch (decode, resample, AAC encode) retires the branch, not the output.
 
 ### Response 200 (started or already-running-identical)
 ```json
@@ -288,7 +289,7 @@ Poll for health/state, decoupled from RIST. Recommended encoder poll interval **
   "ok": true, "schema_version": 3, "state": "running", "session_id": "s_9f2c", "uptime_s": 1234,
   "telemetry": { "link_quality": 92, "worst_case_rtt_ms": 140 },
   "outputs": [
-    { "id": "yt",  "type": "rtmp",  "state": "running", "connected_s": 1230, "reconnects": 0, "audio_dropped": false },
+    { "id": "yt",  "type": "rtmp",  "state": "running", "connected_s": 1230, "reconnects": 0, "audio_dropped": false, "audio_frames": 3392 },
     { "id": "fb",  "type": "rtmps", "state": "reconnecting", "reconnects": 3, "audio_dropped": false, "last_error": "connection_refused", "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } },
     { "id": "cli", "type": "srt",   "state": "running", "connected_s": 1231, "reconnects": 0, "audio_dropped": false }
   ],
@@ -299,7 +300,11 @@ Poll for health/state, decoupled from RIST. Recommended encoder poll interval **
 - A per-output `transcode` object appears **only for outputs that opted into the transcode tier** (§4) and carries the
   target `codec`, the chosen `encoder` element name (e.g. `"vah264enc"`; may be `""` before the first pipeline build)
   and `frames_dropped` (whole-frame drop-oldest on the shared decode frame ring for that output); **copy-only outputs
-  omit it entirely**. It never echoes the source codec or any secret.
+  omit it entirely**. It never echoes the source codec or any secret. `codec` names the target codec the output is
+  re-encoding to (`h264`, `h265` or `av1`) — never `none`, which is what an omitted object means.
+- `audio_frames` counts the buffers the muxer's audio pad has received. `audio_dropped: false` with `audio_frames: 0`
+  is an audio branch that is linked but has published nothing yet; `audio_dropped: true` means the output is running
+  video-only, either because the source carries no AAC or because the branch was retired at runtime.
 - Session `state` ∈ `"running"`, `"stopped"`, `"error"`. It stays `running` while **any** output runs or the
   session is intact with zero outputs; **per-output failure is never session-fatal**. `error` is reserved for
   session-level failures (`idle_timeout`, listener death), reported with `last_bus_error` until the next `/start`.
