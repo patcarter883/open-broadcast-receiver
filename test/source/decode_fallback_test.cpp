@@ -492,11 +492,14 @@ auto main(int argc, char** argv) -> int
   // ---- 5. the chain is finite -------------------------------------------
   // Undemuxable bytes: no pad, no frames, no bus error -- only the bounded
   // window can retire the attempt. With nothing decodable the stage must end
-  // failed rather than retry forever.
+  // failed rather than retry forever. The junk arrives at a real rate and in a
+  // volume that is evidence (decode_health::k_min_fed_bytes and then some):
+  // below that the stage is supposed to keep waiting, which case 6b pins.
   {
-    // Both attempts must exhaust their own window, so the drain outlasts two of
-    // them, and the junk keeps arriving so the rebuilt attempt is fed too.
-    const std::vector<std::uint8_t> junk(16 * 1024, 0x00);
+    // Both attempts must reach the volume minimum and exhaust their own window,
+    // so the drain outlasts two of them, and the junk keeps arriving so the
+    // rebuilt attempt is fed too.
+    const std::vector<std::uint8_t> junk(320 * 1024, 0x00);
     const auto r = run_bytes(junk, false, std::chrono::seconds(14), true);
     check(r.failed, "undecodable input leaves the stage failed");
     check(contains(r.log, "no decoder left for av1"),
@@ -504,7 +507,24 @@ auto main(int argc, char** argv) -> int
     check(r.frames == 0, "no frames are fabricated from undecodable input");
   }
 
-  // ---- 6. a stream that has not started yet is not a decoder failure ------
+  // ---- 6. a trickle is not evidence that tsdemux has no video ------------
+  // 200 KiB of undemuxable bytes spread over the feed window: the old rule
+  // (first chunk + a flat five seconds) retired vaav1dec and rebuilt the chain,
+  // which on a slow RIST start throws away a hardware decoder that works. With
+  // the volume minimum in place the stage is not allowed to conclude anything
+  // yet.
+  {
+    const std::vector<std::uint8_t> trickle(200 * 1024, 0x00);
+    const auto r = run_bytes(trickle, false, std::chrono::seconds(8));
+    check(!r.failed, "a trickle of TS does not fail the stage");
+    check(r.decoder == "vaav1dec" && !r.fallback,
+          "a trickle does not retire the hardware decoder, got "
+              + r.decoder + (r.fallback ? " (fallback)" : ""));
+    check(!contains(r.log, "tsdemux produced no video"),
+          "no demux verdict is reached on a trickle");
+  }
+
+  // ---- 7. a stream that has not started yet is not a decoder failure ------
   // The stream arrives seconds after /start. Neither health clock may run before
   // data does, or the hardware decoder is retired as "no decoded frame" and the
   // session silently runs on the software one.

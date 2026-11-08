@@ -33,6 +33,7 @@ target_sources(fanout_lib ${warning_guard}
     output.cpp
     decoder.h
     decoder.cpp
+    decode_health.h
     recorder.h
     recorder.cpp
 )
