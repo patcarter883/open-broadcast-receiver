@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -670,11 +671,16 @@ auto output::link_pad_to(GstPad* pad,
       ? gst_element_request_pad_simple(element, pad_name)
       : gst_element_get_static_pad(element, pad_name);
   bool linked = false;
-  if (sink != nullptr && !gst_pad_is_linked(sink)) {
+  if (sink == nullptr) {
+    log(std::format("{} has no {} pad\n", element_name, pad_name));
+  } else if (gst_pad_is_linked(sink)) {
+    log(std::format("{} already carries another demux pad\n", element_name));
+  } else {
     const GstPadLinkReturn lr = gst_pad_link(pad, sink);
     linked = lr == GST_PAD_LINK_OK;
     if (!linked) {
-      log(std::format("demux pad {} could not join {} ({})\n", GST_PAD_NAME(pad),
+      log(std::format("demux pad {} could not join {} ({})\n",
+                      GST_PAD_NAME(pad) != nullptr ? GST_PAD_NAME(pad) : "?",
                       element_name, gst_pad_link_get_name(lr)));
     }
   }
@@ -739,13 +745,18 @@ auto output::demux_pad_added(GstElement* demux,
     return;
   }
 
-  if (video && copy_path && media == "video/x-h264") {
-    // The copy path carries the video ES itself, so this pad has to reach
-    // h264parse whichever position the demuxer exposed it in. FLV carries
-    // H.264 only, so any other video ES falls through to the drop funnel.
-    if (out->link_pad_to(pad, "vq", "sink")) {
+  if (video && copy_path) {
+    if (media == "video/x-h264" && out->link_pad_to(pad, "vq", "sink")) {
+      // The copy path carries the video ES itself, so this pad has to reach
+      // h264parse whichever position the demuxer exposed it in.
       return;
     }
+    // FLV carries H.264 only, so any other video ES cannot reach the muxer.
+    // Say which one: a copy output fed AV1 or HEVC otherwise publishes nothing
+    // and reports no reason.
+    out->log(std::format("video ES {} cannot enter the H.264 branch; output "
+                         "runs without video\n",
+                         media));
   }
 
   // Video on the transcode path's audio demux (its video comes from the frame

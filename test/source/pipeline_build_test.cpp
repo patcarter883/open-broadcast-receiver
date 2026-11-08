@@ -61,7 +61,9 @@ auto main() -> int
   transcode_config h265;
   h265.target = transcode_target::h265;
 
-  // Copy-only templates are unchanged (legacy flvmux, no encoder element).
+  // Copy-only templates keep legacy flvmux and no encoder. The demuxer's pads
+  // are dispatched by caps in demux_pad_added, so the template must not leave
+  // pad selection to a `d.` link.
   {
     const std::string rtmp =
         output_template(output_proto::rtmp, transcode_config {}, nullptr);

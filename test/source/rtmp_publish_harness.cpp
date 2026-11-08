@@ -154,6 +154,15 @@ struct options
       || m == mode::copy_audio_first;
 }
 
+// The copy template dispatches tsdemux's pads by caps, so pad order cannot
+// decide which parser a pad reaches; this is the mode that feeds the order in
+// which the audio pad arrives FIRST, and the verdict requires the live pipeline
+// to have seen that order.
+[[nodiscard]] auto wants_audio_first(mode m) -> bool
+{
+  return m == mode::copy_audio_first;
+}
+
 // Modes whose frame ring is filled by the real decode stage from an AV1
 // MPEG-TS instead of by synthetic NV12 frames generated in-process.
 [[nodiscard]] auto is_decode_mode(mode m) -> bool
@@ -644,6 +653,9 @@ struct instruments
   std::mutex mutex;
   std::string video_caps;
   std::string audio_caps;
+  // Order in which tsdemux exposed its src pads, with each pad's caps name. This
+  // is what says whether a run actually exercised the audio-first order.
+  std::vector<std::string> demux_pads;
   std::vector<std::string> bus_events;
   std::vector<std::string> output_log;
 
@@ -749,12 +761,63 @@ auto bus_sync_handler(GstBus* /*bus*/, GstMessage* message, gpointer data)
   return GST_BUS_PASS;
 }
 
+// Records the order in which the demuxer exposes its src pads. Pad selection is
+// by caps, so the order must not change the verdict -- printing it (and
+// requiring it in the audio-first mode) is what keeps that a measured statement
+// instead of an assumption about which order a run exercised.
+auto demux_pad_added_order(GstElement* /*demux*/, GstPad* pad, gpointer data)
+    -> void
+{
+  auto* inst = static_cast<instruments*>(data);
+  std::string entry = GST_PAD_NAME(pad) != nullptr ? GST_PAD_NAME(pad) : "?";
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  if (caps != nullptr) {
+    if (gst_caps_get_size(caps) > 0) {
+      entry += std::format(
+          " ({})", gst_structure_get_name(gst_caps_get_structure(caps, 0)));
+    }
+    gst_caps_unref(caps);
+  }
+  std::lock_guard<std::mutex> guard(inst->mutex);
+  inst->demux_pads.push_back(entry);
+}
+
 auto install_instruments(instruments& inst, GstElement* pipeline) -> void
 {
   inst.pipeline = GST_ELEMENT(gst_object_ref(pipeline));
   inst.bus = gst_element_get_bus(inst.pipeline);
   if (inst.bus != nullptr) {
     gst_bus_set_sync_handler(inst.bus, &bus_sync_handler, &inst, nullptr);
+  }
+  // The demuxer's pad order is part of the verdict for the audio-first mode.
+  // Connect before any pad exists and record any that arrived first, so an
+  // install that loses a race with the first TS bytes still sees the order.
+  if (GstElement* demux = gst_bin_get_by_name(GST_BIN(inst.pipeline), "d");
+      demux != nullptr) {
+    g_signal_connect(demux, "pad-added", G_CALLBACK(&demux_pad_added_order),
+                     &inst);
+    GstIterator* pads = gst_element_iterate_src_pads(demux);
+    GValue item = G_VALUE_INIT;
+    bool done = false;
+    while (!done) {
+      switch (gst_iterator_next(pads, &item)) {
+        case GST_ITERATOR_OK:
+          demux_pad_added_order(demux, GST_PAD(g_value_get_object(&item)),
+                                &inst);
+          g_value_reset(&item);
+          break;
+        case GST_ITERATOR_RESYNC:
+          gst_iterator_resync(pads);
+          break;
+        case GST_ITERATOR_ERROR:
+        case GST_ITERATOR_DONE:
+          done = true;
+          break;
+      }
+    }
+    g_value_unset(&item);
+    gst_iterator_free(pads);
+    gst_object_unref(demux);
   }
   GstElement* mux = gst_bin_get_by_name(GST_BIN(inst.pipeline), "mux");
   if (mux == nullptr) {
@@ -1265,6 +1328,11 @@ auto main(int argc, char** argv) -> int
   // additional assertions about behaviour that "bytes arrived" alone would not
   // pin down. Diagnostics must run while the attempt's pipeline still exists.
   const auto mux_audio_final = inst.mux_audio_buffers.load();
+  std::vector<std::string> demux_pads;
+  {
+    std::lock_guard<std::mutex> guard(inst.mutex);
+    demux_pads = inst.demux_pads;
+  }
   bool ok = server_grew;
   std::string mode_failure;
   if (ok && server_grew && has_audio(opts.run_mode) && mux_audio_final == 0) {
@@ -1274,6 +1342,15 @@ auto main(int argc, char** argv) -> int
   if (ok && server_grew && !has_audio(opts.run_mode) && mux_audio_final != 0) {
     ok = false;
     mode_failure = "audio reached the muxer in a video-only mode";
+  }
+  // The audio-first mode exists to feed the order that used to break the copy
+  // template. If the fixture did not actually expose its audio pad first, the
+  // run is a second video-first run and proves nothing about pad ordering.
+  if (ok && server_grew && wants_audio_first(opts.run_mode)
+      && (demux_pads.empty()
+          || demux_pads.front().find("(audio/") == std::string::npos)) {
+    ok = false;
+    mode_failure = "the fixture did not expose the audio pad first";
   }
   // The decode mode exists to prove the AV1 -> NV12 -> H.264 -> RTMP chain, so
   // publishing without the decode stage having produced frames would be a pass
@@ -1418,6 +1495,13 @@ auto main(int argc, char** argv) -> int
                 gst_element_state_get_name(decode_counters.state),
                 decode_counters.stalled ? "yes" : "no",
                 decode_counters.failed ? "yes" : "no");
+  }
+  if (!demux_pads.empty()) {
+    std::string order;
+    for (const auto& entry : demux_pads) {
+      order += (order.empty() ? "" : ", ") + entry;
+    }
+    std::printf("demux pad order      %s\n", order.c_str());
   }
   std::printf("mux sink video       %llu buffers / %llu bytes\n",
               static_cast<unsigned long long>(
