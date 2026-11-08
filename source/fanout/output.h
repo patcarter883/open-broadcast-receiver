@@ -162,6 +162,11 @@ private:
 
   std::atomic<run_state> m_state {run_state::starting};
   std::atomic<uint64_t> m_reconnects {0};
+  // Set while the transit appsrc is pinned at its limit; drives the stall
+  // watchdog in feed_transcode.
+  std::chrono::steady_clock::time_point m_stall_since {};
+  std::chrono::steady_clock::time_point m_run_started {};
+  bool m_audio_probe_done {false};
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};
   std::atomic<int64_t> m_running_since_ms {0};  // steady ms; 0 = not running

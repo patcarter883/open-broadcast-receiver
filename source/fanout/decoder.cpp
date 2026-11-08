@@ -99,7 +99,10 @@ auto decoder_template(codec /*in_codec*/,
       "block=true max-bytes=4194304 caps=video/mpegts,systemstream=true "
       "! tsparse set-timestamps=true alignment=7 "
       "! tsdemux name=d "
-      "queue name=vqueue ! {} ! {} ! videoconvert ! video/x-raw,format=NV12 "
+      // decodebin3 adapts to the pad's ACTUAL caps. A declared-codec branch
+      // links an AV1 pad into h264parse and dies with "no common format",
+      // starving every transcode output while the copy path looks healthy.
+      "queue name=vqueue ! decodebin3 ! videoconvert ! video/x-raw,format=NV12 "
       "! appsink name=dsink sync=false max-buffers=8 drop=true "
       // adrop exists so EVERY demux src pad can be linked. tsdemux emits its pads
       // as it parses, and it returns GST_FLOW_NOT_LINKED while it has NO linked src
@@ -107,9 +110,7 @@ auto decoder_template(codec /*in_codec*/,
       // first (which the live ingest does), the very first push into the decode
       // appsrc is fatal and the video pad is never reached. Sinking the non-video
       // pads costs nothing and removes the race entirely.
-      "fakesink name=adrop sync=false",
-      source_parser,
-      decoder);
+      "fakesink name=adrop sync=false");
 }
 
 decoder::decoder(ts_ring& ring, codec in_codec, log_fn log)
