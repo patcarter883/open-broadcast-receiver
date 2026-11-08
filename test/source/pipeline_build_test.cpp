@@ -86,6 +86,9 @@ auto main() -> int
     expect(has(tmpl, "flvmux name=mux"), "h264 rtmp legacy flvmux");
     expect(has(tmpl, "appsrc name=asrc") && has(tmpl, "aacparse"),
            "h264 rtmp keeps the AAC audio appsrc");
+    expect(has(tmpl, "stream-format=raw,rate=48000,channels=2,"
+                    "codec_data=(buffer)1190"),
+           "h264 rtmp declares the AAC-LC 48 kHz stereo codec_data");
     expect(parses(tmpl), "h264 rtmp transcode template parses");
   }
 
@@ -130,6 +133,8 @@ auto main() -> int
     expect(has(av1, "video/x-raw,format=NV12")
                && has(av1, "appsink name=dsink sync=false"),
            "decoder NV12 appsink");
+    expect(has(av1, "block=false") && !has(av1, "block=true"),
+           "decode appsrc never blocks the feed thread");
     expect(parses(av1), "av1 decoder template parses");
 
     const std::string h264d =

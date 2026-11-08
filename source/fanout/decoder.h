@@ -76,6 +76,11 @@ private:
   auto build_pipeline(std::string& err) -> bool;
   auto destroy_pipeline() -> void;
   auto publish_sample(GstSample* sample) -> void;
+  // Attach the buffer-count probes: demux output, decoder output, appsink input.
+  auto attach_probes(const char* decoder_name) -> void;
+  // One compact line per k_stats_period with the stage counters and the state the
+  // pipeline actually reached.
+  auto log_stats() -> void;
   auto log(const std::string& msg) const -> void;
 
   ts_ring& m_ring;
@@ -91,6 +96,18 @@ private:
   std::thread m_thread;
   std::atomic_bool m_stopping {false};
   std::atomic_bool m_failed {false};
+
+  // Decode-stage counters, read only by the periodic line: TS chunks pushed into
+  // the demux appsrc, buffers out of tsdemux, buffers out of the decoder, and
+  // buffers arriving at the appsink.
+  std::atomic<std::uint64_t> m_in_chunks {0};
+  std::atomic<std::uint64_t> m_in_bytes {0};
+  std::atomic<std::uint64_t> m_demux_buffers {0};
+  std::atomic<std::uint64_t> m_decoder_buffers {0};
+  std::atomic<std::uint64_t> m_sink_buffers {0};
+  // Set while the decode appsrc sits at its byte limit; the feed thread keeps
+  // polling rather than blocking, so this only drives the stall report.
+  std::chrono::steady_clock::time_point m_stall_since {};
 
   GstElement* m_pipeline = nullptr;
   GstElement* m_appsrc = nullptr;  // ref held via gst_bin_get_by_name

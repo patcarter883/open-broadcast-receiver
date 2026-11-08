@@ -6,6 +6,7 @@
 #include <chrono>
 #include <format>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gst/app/gstappsink.h>
@@ -20,6 +21,19 @@ constexpr std::size_t k_read_chunk = 32 * 1024;
 constexpr std::chrono::milliseconds k_read_timeout {0};   // non-blocking feed
 constexpr GstClockTime k_pull_timeout = 5 * GST_MSECOND;  // decoded-frame poll
 constexpr guint64 k_appsrc_max_bytes = 4 * 1024 * 1024;
+// How long the decode appsrc may sit at its byte limit before the stage reports
+// itself stalled. The feed thread never blocks on the push, so this is an
+// observation, not a timeout that interrupts anything.
+constexpr auto k_stall_timeout = std::chrono::seconds(5);
+constexpr auto k_stats_period = std::chrono::seconds(2);
+// Decoded frames published per feed iteration; the appsink drops beyond its
+// own queue, so draining it fully keeps the frame ring current.
+constexpr int k_publish_burst = 8;
+
+auto now_steady() -> std::chrono::steady_clock::time_point
+{
+  return std::chrono::steady_clock::now();
+}
 
 auto registry_has_element(const char* name) -> bool
 {
@@ -52,11 +66,6 @@ static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data
   }
   const char* name = gst_structure_get_name(gst_caps_get_structure(caps, 0));
   const bool is_video = name != nullptr && g_str_has_prefix(name, "video/");
-  // stderr, not the receiver's log: this runs from a GStreamer streaming thread
-  // and must not touch anything that could deadlock, and it still lands in
-  // `docker logs`. Whether this fires AT ALL is the decisive fact.
-  fprintf(stderr, "[decoder] demux pad-added: caps=%s video=%d\n",
-          name != nullptr ? name : "(null)", is_video ? 1 : 0);
   gst_caps_unref(caps);
   // Video goes to the branch; every other pad goes to adrop. Leaving a pad
   // unlinked is NOT safe: tsdemux returns GST_FLOW_NOT_LINKED until it has a
@@ -69,11 +78,63 @@ static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data
   if (sink != nullptr) {
     if (!gst_pad_is_linked(sink)) {
       const GstPadLinkReturn lr = gst_pad_link(pad, sink);
-      fprintf(stderr, "[decoder] demux pad link (%s) -> %s (%d)\n",
-              is_video ? "video" : "other", gst_pad_link_get_name(lr), (int)lr);
+      if (lr != GST_PAD_LINK_OK) {
+        fprintf(stderr, "[decoder] demux pad link (%s) failed: %s\n",
+                is_video ? "video" : "other", gst_pad_link_get_name(lr));
+      }
     }
     gst_object_unref(sink);
   }
+}
+
+// Counts buffers on one pad. Attached to the pads whose counters are reported in
+// the periodic line, so a stall in the decode chain can be located to a stage
+// instead of inferred from the pipeline state.
+auto count_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer data)
+    -> GstPadProbeReturn
+{
+  auto* counter = static_cast<std::atomic<std::uint64_t>*>(data);
+  counter->fetch_add(1, std::memory_order_relaxed);
+  return GST_PAD_PROBE_PASS;
+}
+
+// The parse string leaves elements unnamed, so gst_parse_launch names each one
+// after its factory ("vaav1dec0").
+auto find_child(GstElement* pipeline, const char* factory) -> GstElement*
+{
+  GstElement* direct = gst_bin_get_by_name(GST_BIN(pipeline), factory);
+  if (direct != nullptr) {
+    return direct;
+  }
+  GstElement* found = nullptr;
+  GstIterator* it = gst_bin_iterate_elements(GST_BIN(pipeline));
+  GValue item = G_VALUE_INIT;
+  bool done = false;
+  while (!done) {
+    switch (gst_iterator_next(it, &item)) {
+      case GST_ITERATOR_OK: {
+        auto* elem = GST_ELEMENT(g_value_get_object(&item));
+        GstElementFactory* fac = gst_element_get_factory(elem);
+        if (fac != nullptr
+            && g_strcmp0(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(fac)),
+                         factory) == 0) {
+          found = GST_ELEMENT(gst_object_ref(elem));
+          done = true;
+        }
+        g_value_reset(&item);
+        break;
+      }
+      case GST_ITERATOR_RESYNC:
+        gst_iterator_resync(it);
+        break;
+      case GST_ITERATOR_ERROR:
+      case GST_ITERATOR_DONE:
+        done = true;
+        break;
+    }
+  }
+  gst_iterator_free(it);
+  return found;
 }
 }  // namespace
 
@@ -95,8 +156,13 @@ auto decoder_template(codec /*in_codec*/,
       // to an uncaps'd source, and the failure surfaces as a bare
       // "Internal data stream error" on the decode stage -- starving every
       // transcode output while the copy path (which never parses) stays healthy.
+      //
+      // block=false: with block=true the feed thread parks inside
+      // gst_app_src_push_buffer as soon as the 4 MiB limit is reached, so the bus
+      // poll, the frame pull and the stall report all stop while the pipeline
+      // waits for frames. Under pressure a live stage drops, it does not wait.
       "appsrc name=dsrc is-live=true do-timestamp=true format=time "
-      "block=true max-bytes=4194304 caps=video/mpegts,systemstream=true "
+      "block=false max-bytes=4194304 caps=video/mpegts,systemstream=true "
       "! tsparse set-timestamps=true alignment=7 "
       "! tsdemux name=d "
       "queue name=vqueue ! {} ! {} ! videoconvert ! video/x-raw,format=NV12 "
@@ -237,8 +303,69 @@ auto decoder::build_pipeline(std::string& err) -> bool
     return false;
   }
   gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), k_appsrc_max_bytes);
+  attach_probes(decode->c_str());
   m_bus = gst_element_get_bus(m_pipeline);
   return true;
+}
+
+auto decoder::attach_probes(const char* decoder_name) -> void
+{
+  // vqueue's sink pad receives exactly what the demuxer's video pad produced.
+  GstElement* vqueue = gst_bin_get_by_name(GST_BIN(m_pipeline), "vqueue");
+  if (vqueue != nullptr) {
+    GstPad* sink = gst_element_get_static_pad(vqueue, "sink");
+    if (sink != nullptr) {
+      gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_BUFFER, &count_probe,
+                        &m_demux_buffers, nullptr);
+      gst_object_unref(sink);
+    }
+    gst_object_unref(vqueue);
+  }
+  // Probe the decoder's src pad, not its sink: the sink pad can accept a buffer
+  // the decoder then never emits (a frame it cannot complete).
+  GstElement* dec = find_child(m_pipeline, decoder_name);
+  if (dec != nullptr) {
+    GstPad* src = gst_element_get_static_pad(dec, "src");
+    if (src != nullptr) {
+      gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER, &count_probe,
+                        &m_decoder_buffers, nullptr);
+      gst_object_unref(src);
+    }
+    gst_object_unref(dec);
+  } else {
+    log("cannot find " + std::string {decoder_name}
+        + " to probe; decoder counts stay 0\n");
+  }
+  GstPad* sink = gst_element_get_static_pad(m_appsink, "sink");
+  if (sink != nullptr) {
+    gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_BUFFER, &count_probe,
+                      &m_sink_buffers, nullptr);
+    gst_object_unref(sink);
+  }
+}
+
+auto decoder::log_stats() -> void
+{
+  GstState state = GST_STATE_VOID_PENDING;
+  GstState pending = GST_STATE_VOID_PENDING;
+  const GstStateChangeReturn scr =
+      gst_element_get_state(m_pipeline, &state, &pending, 0);
+  const guint64 level = m_appsrc != nullptr
+      ? gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc))
+      : 0;
+  log(std::format(
+      "in={} chunks/{} KiB demux={} dec={} sink={} level={} KiB "
+      "state={} ({}) pending={} stalled={}\n",
+      m_in_chunks.load(std::memory_order_relaxed),
+      m_in_bytes.load(std::memory_order_relaxed) / 1024U,
+      m_demux_buffers.load(std::memory_order_relaxed),
+      m_decoder_buffers.load(std::memory_order_relaxed),
+      m_sink_buffers.load(std::memory_order_relaxed),
+      level / 1024U,
+      gst_element_state_get_name(state),
+      gst_element_state_change_return_get_name(scr),
+      gst_element_state_get_name(pending),
+      m_stall_since == std::chrono::steady_clock::time_point {} ? 0 : 1));
 }
 
 auto decoder::start() -> bool
@@ -295,6 +422,12 @@ auto decoder::start() -> bool
                   gst_element_state_change_return_get_name(scr), src_pads));
 
   m_stopping.store(false, std::memory_order_release);
+  m_in_chunks.store(0, std::memory_order_relaxed);
+  m_in_bytes.store(0, std::memory_order_relaxed);
+  m_demux_buffers.store(0, std::memory_order_relaxed);
+  m_decoder_buffers.store(0, std::memory_order_relaxed);
+  m_sink_buffers.store(0, std::memory_order_relaxed);
+  m_stall_since = std::chrono::steady_clock::time_point {};
   m_thread = std::thread([this]() -> void { worker(); });
   log("decode stage running\n");
   return true;
@@ -339,7 +472,8 @@ auto decoder::worker() -> void
   std::vector<std::uint8_t> tsbuf(k_read_chunk);
   bool announced_failure = false;
   bool announced_first_feed = false;
-  std::size_t total_fed = 0;
+  bool stall_reported = false;
+  auto last_stats = now_steady();
 
   while (!m_stopping.load(std::memory_order_acquire)) {
     // 1) bus: surface a decoder error once, then keep draining the ring so a
@@ -379,32 +513,67 @@ auto decoder::worker() -> void
       gst_message_unref(msg);
     }
 
-    // 2) feed: ts_ring -> dsrc, draining everything immediately available.
-    for (;;) {
-      const std::size_t got = m_ring.read(
-          m_consumer, tsbuf.data(), tsbuf.size(), k_read_timeout);
-      if (got == 0) {
-        break;
+    // 2) feed: ts_ring -> dsrc. The appsrc is block=false, so a full queue means
+    //    the decode chain has stopped consuming: hold the ring cursor instead of
+    //    pushing (draining on would hand tsdemux a stream with holes in it) and
+    //    keep this loop alive so the bus, the pull and the report still run.
+    const guint64 level =
+        gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc));
+    if (level >= k_appsrc_max_bytes) {
+      const auto now = now_steady();
+      if (m_stall_since == std::chrono::steady_clock::time_point {}) {
+        m_stall_since = now;
+        log("decode appsrc full: the decode chain is not consuming\n");
+      } else if (!stall_reported && now - m_stall_since > k_stall_timeout) {
+        stall_reported = true;
+        log("decode stage stalled: appsrc full for over "
+            + std::to_string(k_stall_timeout.count()) + " s\n");
+        log_stats();
       }
-      total_fed += got;
-      if (!announced_first_feed) {
-        log("first TS chunk fed to the decode stage: " + std::to_string(got)
-            + " bytes\n");
-        announced_first_feed = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } else {
+      if (m_stall_since != std::chrono::steady_clock::time_point {}) {
+        m_stall_since = std::chrono::steady_clock::time_point {};
+        stall_reported = false;
+        log("decode appsrc draining again\n");
       }
-      GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
-      gst_buffer_fill(gbuf, 0, tsbuf.data(), got);
-      if (gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf) != GST_FLOW_OK) {
-        break;
+      for (;;) {
+        const std::size_t got = m_ring.read(
+            m_consumer, tsbuf.data(), tsbuf.size(), k_read_timeout);
+        if (got == 0) {
+          break;
+        }
+        if (!announced_first_feed) {
+          log("first TS chunk fed to the decode stage: " + std::to_string(got)
+              + " bytes\n");
+          announced_first_feed = true;
+        }
+        GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
+        gst_buffer_fill(gbuf, 0, tsbuf.data(), got);
+        if (gst_app_src_push_buffer(GST_APP_SRC(m_appsrc), gbuf)
+            != GST_FLOW_OK) {
+          break;
+        }
+        m_in_chunks.fetch_add(1, std::memory_order_relaxed);
+        m_in_bytes.fetch_add(got, std::memory_order_relaxed);
       }
     }
 
-    // 3) publish one decoded frame (bounded poll keeps the loop responsive).
-    GstSample* sample = gst_app_sink_try_pull_sample(
-        GST_APP_SINK(m_appsink), k_pull_timeout);
-    if (sample != nullptr) {
+    // 3) publish decoded frames (bounded burst keeps the loop responsive).
+    for (int pulled = 0; pulled < k_publish_burst; ++pulled) {
+      GstSample* sample = gst_app_sink_try_pull_sample(
+          GST_APP_SINK(m_appsink), pulled == 0 ? k_pull_timeout : 0);
+      if (sample == nullptr) {
+        break;
+      }
       publish_sample(sample);
       gst_sample_unref(sample);
+    }
+
+    const auto now = now_steady();
+    if (now - last_stats >= k_stats_period) {
+      last_stats = now;
+      log_stats();
     }
   }
 }
