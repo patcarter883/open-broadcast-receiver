@@ -15,11 +15,17 @@
 //      (bounded no-frame window), and the chain is finite: when nothing can
 //      decode, the stage marks itself failed instead of looping.
 //
-// Fixtures are generated in-process so the test does not depend on a file
-// outside the repo; the encoder is av1enc, the same one the product's encoder
-// chain uses. Skipping is explicit and non-zero-free: a missing element or a
-// fixture that cannot be muxed fails the test rather than passing silently,
-// because a green run must mean the pipelines actually ran.
+// Fixtures are generated in-process, in the shape the product's encoder emits
+// (open-broadcast-encoder, pipeline_build_video_encoder + pipeline_build_sink):
+// a hardware AV1 encoder fed NV12 at 1080p, `av1parse`, the frame-aligned caps
+// mpegtsmux requires, and `mpegtsmux alignment=7 enable-custom-mappings=true`.
+// The caps of every fixture are read back through tsdemux + av1parse and
+// asserted, so a fixture whose profile/chroma drifted away from what the
+// encoder really sends fails here instead of hiding a decode bug behind a
+// stream the hardware decoder happens to like. Skipping is explicit and
+// non-zero-free: a missing element or a fixture that cannot be muxed fails the
+// test rather than passing silently, because a green run must mean the
+// pipelines actually ran.
 
 #include <algorithm>
 #include <chrono>
@@ -85,19 +91,38 @@ auto joined(const std::vector<std::string>& items) -> std::string
   return out;
 }
 
+// The AV1 hardware encoder on this box. The product's encoder runs qsvav1enc on
+// the capture box; both are VAAPI-class hardware AV1 encoders fed NV12 and both
+// publish the same caps through av1parse, so this is the closest stand-in for
+// what the receiver actually receives.
+auto product_encoder() -> const char*
+{
+  return has_element("vaav1enc") ? "vaav1enc" : "av1enc";
+}
+
 // Mux `chroma` frames into the TS shape the product's encoder emits: framerate
 // pacing, alignment=7 datagrams, explicit AV1 stream type.
 auto make_fixture(const char* chroma, const std::filesystem::path& path) -> bool
 {
+  // 4:4:4 exists only to produce a stream the hardware decoder refuses, and the
+  // VAAPI encoder cannot make one: av1enc is required for that case. The
+  // encoder-representative fixture is the hardware encoder at 1080p NV12, the
+  // input the product's encoder carries.
+  const bool high44 = std::string {chroma} == "Y444";
+  const char* encoder = high44 ? "av1enc" : product_encoder();
+  const int width = high44 ? 640 : 1920;
+  const int height = high44 ? 360 : 1080;
+  const std::string enc_args = std::string {encoder} == "vaav1enc"
+      ? "bitrate=4000 rate-control=cbr key-int-max=60"
+      : "cpu-used=8 lag-in-frames=0 target-bitrate=4000 keyframe-max-dist=60";
   const std::string desc = std::format(
-      "videotestsrc num-buffers=120 ! "
-      "video/x-raw,format={},width=640,height=360,framerate=30/1 ! "
-      "av1enc cpu-used=8 lag-in-frames=0 target-bitrate=2000 "
-      "keyframe-max-dist=30 ! av1parse ! "
+      "videotestsrc num-buffers=120 pattern=smpte ! "
+      "video/x-raw,format={},width={},height={},framerate=30/1 ! "
+      "videoconvert ! {} {} ! av1parse ! "
       "video/x-av1,stream-format=obu-stream,alignment=frame ! "
       "mpegtsmux alignment=7 enable-custom-mappings=true ! "
       "filesink location={}",
-      chroma, path.string());
+      chroma, width, height, encoder, enc_args, path.string());
   GError* gerr = nullptr;
   GstElement* p = gst_parse_launch(desc.c_str(), &gerr);
   if (p == nullptr || gerr != nullptr) {
@@ -134,6 +159,86 @@ auto make_fixture(const char* chroma, const std::filesystem::path& path) -> bool
   gst_element_set_state(p, GST_STATE_NULL);
   gst_object_unref(p);
   return ok;
+}
+
+// The caps the fixture's elementary stream really carries, read off av1parse's
+// src pad through the same demux path the receiver uses. This is the check that
+// the fixture is what the encoder sends -- profile, chroma, bit depth, layout --
+// rather than a stream that only the local decoder happens to accept.
+auto fixture_stream_caps(const std::filesystem::path& path) -> std::string
+{
+  const std::string desc = std::format(
+      "filesrc location={} ! tsparse ! tsdemux ! av1parse name=p ! "
+      "fakesink sync=false",
+      path.string());
+  GError* gerr = nullptr;
+  GstElement* p = gst_parse_launch(desc.c_str(), &gerr);
+  if (p == nullptr || gerr != nullptr) {
+    if (gerr != nullptr) {
+      std::fprintf(stderr, "fixture caps probe: %s\n", gerr->message);
+      g_error_free(gerr);
+    }
+    if (p != nullptr) {
+      gst_object_unref(p);
+    }
+    return {};
+  }
+  std::string out;
+  gst_element_set_state(p, GST_STATE_PLAYING);
+  gst_element_get_state(p, nullptr, nullptr, 10 * GST_SECOND);
+  GstElement* parse = gst_bin_get_by_name(GST_BIN(p), "p");
+  if (parse != nullptr) {
+    GstPad* src = gst_element_get_static_pad(parse, "src");
+    if (src != nullptr) {
+      GstCaps* caps = gst_pad_get_current_caps(src);
+      if (caps != nullptr) {
+        gchar* text = gst_caps_to_string(caps);
+        out = text != nullptr ? text : "";
+        g_free(text);
+        gst_caps_unref(caps);
+      }
+      gst_object_unref(src);
+    }
+    gst_object_unref(parse);
+  }
+  gst_element_set_state(p, GST_STATE_NULL);
+  gst_object_unref(p);
+  return out;
+}
+
+// True when the pipeline ends in an ERROR rather than EOS. Used for the
+// element-level layout check: negotiation failures surface here and nowhere
+// else (the decoder produces no frames and says nothing on stdout).
+auto pipeline_errors(const std::string& desc) -> bool
+{
+  GError* gerr = nullptr;
+  GstElement* p = gst_parse_launch(desc.c_str(), &gerr);
+  if (p == nullptr || gerr != nullptr) {
+    if (gerr != nullptr) {
+      std::fprintf(stderr, "layout pipeline: %s\n", gerr->message);
+      g_error_free(gerr);
+    }
+    if (p != nullptr) {
+      gst_object_unref(p);
+    }
+    return true;
+  }
+  bool errored = gst_element_set_state(p, GST_STATE_PLAYING)
+      == GST_STATE_CHANGE_FAILURE;
+  if (!errored) {
+    GstBus* bus = gst_element_get_bus(p);
+    GstMessage* msg = gst_bus_timed_pop_filtered(
+        bus, 30 * GST_SECOND,
+        static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+    errored = msg == nullptr || GST_MESSAGE_TYPE(msg) != GST_MESSAGE_EOS;
+    if (msg != nullptr) {
+      gst_message_unref(msg);
+    }
+    gst_object_unref(bus);
+  }
+  gst_element_set_state(p, GST_STATE_NULL);
+  gst_object_unref(p);
+  return errored;
 }
 
 struct run_result {
@@ -252,6 +357,28 @@ auto main(int argc, char** argv) -> int
     return g_failures == 0 ? 0 : 1;
   }
 
+  // The branch pins, after the parser, exactly the fields the decoder fixes on
+  // its own sink pad. The two AV1 decoders want different layouts (vaav1dec
+  // frame-aligned, av1dec TU-aligned), so av1parse cannot be left to its own
+  // default: the caps have to be derived per decoder or one of the two attempts
+  // is refused for a layout the parser chose.
+  if (have_hw) {
+    const std::string hw_caps = decoder_branch_caps("vaav1dec");
+    check(hw_caps.find("profile=main") != std::string::npos
+              && hw_caps.find("alignment=frame") != std::string::npos,
+          "vaav1dec branch caps pin profile=main and alignment=frame, got "
+              + hw_caps);
+    const std::string tmpl = decoder_template(codec::av1, "av1parse", "vaav1dec");
+    check(tmpl.find("av1parse ! video/x-av1,profile=main,alignment=frame ! "
+                    "vaav1dec") != std::string::npos,
+          "the hardware branch pins vaav1dec's caps after the parser");
+  }
+  {
+    const std::string sw_caps = decoder_branch_caps("av1dec");
+    check(sw_caps.find("alignment=tu") != std::string::npos,
+          "av1dec branch caps pin alignment=tu, got " + sw_caps);
+  }
+
   const auto dir = std::filesystem::temp_directory_path()
       / std::format("obr_decode_fallback_{}", static_cast<long>(::getpid()));
   std::filesystem::create_directories(dir);
@@ -261,14 +388,33 @@ auto main(int argc, char** argv) -> int
   // ---- 2. hardware refused, software takes over ---------------------------
   // vaav1dec's sink caps are profile=main only; a 4:4:4 profile=high stream is
   // refused at negotiation, which is the failure this stage must survive.
-  if (make_fixture("Y444", fx_444) && make_fixture("I420", fx_420)) {
+  if (make_fixture("Y444", fx_444) && make_fixture("NV12", fx_420)) {
+    // The encoder-representative fixture: what qsvav1enc/vaav1enc + av1parse
+    // publish for a 1080p NV12 source. Asserted, not assumed -- a fixture that
+    // drifted to another profile or chroma is a different bug hiding the same
+    // way.
+    const std::string caps_420 = fixture_stream_caps(fx_420);
+    std::fprintf(stderr, "main fixture caps: %s\n", caps_420.c_str());
+    check(caps_420.find("profile=(string)main") != std::string::npos,
+          "the fixture carries the encoder's profile=main, got " + caps_420);
+    check(caps_420.find("chroma-format=(string)4:2:0") != std::string::npos,
+          "the fixture carries the encoder's chroma-format=4:2:0");
+    check(caps_420.find("bit-depth-luma=(uint)8") != std::string::npos,
+          "the fixture carries the encoder's 8-bit luma");
+    check(caps_420.find("width=(int)1920") != std::string::npos
+              && caps_420.find("height=(int)1080") != std::string::npos,
+          "the fixture is the 1080p the encoder encodes");
     {
+
       const auto r = run_bytes(read_file(fx_444), false);
       check(r.frames > 0, "4:4:4 stream decoded after a hardware refusal, got "
                               + std::to_string(r.frames) + " frames");
       if (have_hw) {
         check(count_of(r.log, "decoder vaav1dec failed") == 1,
               "the hardware failure is logged exactly once");
+        check(contains(r.log, "profile=high") &&
+                  contains(r.log, "the decoder accepts profile=main"),
+              "the hardware refusal names the field it refused");
         check(contains(r.log, "dec=av1dec"), "periodic line names av1dec");
         check(contains(r.log, "fallback=1"), "periodic line carries fallback=1");
         check(r.fallback && r.decoder == "av1dec",
@@ -288,7 +434,28 @@ auto main(int argc, char** argv) -> int
                   + r.decoder);
         check(contains(r.log, "fallback=0"),
               "periodic line reports fallback=0 on the hardware path");
+        check(contains(r.log, "profile=main")
+                  && contains(r.log, "alignment=frame")
+                  && contains(r.log, "accepts it"),
+              "the hardware attempt reports the stream caps it negotiated");
+        check(!contains(r.log, "failed:"),
+              "no decoder attempt failed on the hardware path");
       }
+    }
+
+    // ---- 3b. the layout decides it ---------------------------------------
+    // The same main-profile stream, offered TU-aligned (av1parse's default, and
+    // what the software decoder takes) is refused by the hardware decoder;
+    // frame-aligned, which is what the branch pins, it decodes. This is why the
+    // pin exists rather than being left to negotiation.
+    if (have_hw) {
+      const std::string base = std::format(
+          "filesrc location={} ! tsparse ! tsdemux ! av1parse ! ", fx_420.string());
+      const std::string tail = " ! vaav1dec ! fakesink sync=false";
+      check(pipeline_errors(base + "video/x-av1,alignment=tu" + tail),
+            "vaav1dec refuses the TU-aligned layout av1parse defaults to");
+      check(!pipeline_errors(base + "video/x-av1,alignment=frame" + tail),
+            "vaav1dec takes the same stream frame-aligned");
     }
 
     // ---- 4. forced first-decoder failure --------------------------------

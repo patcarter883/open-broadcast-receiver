@@ -142,9 +142,15 @@ auto main() -> int
            "decode drop sink does not gate preroll");
     expect(parses(av1), "av1 decoder template parses");
 
+    // The parser's output is pinned to the decoder's own sink caps: h264parse
+    // must produce the access-unit alignment vah264dec declares.
     const std::string h264d =
         decoder_template(codec::h264, "h264parse", "vah264dec");
-    expect(has(h264d, "h264parse ! vah264dec"), "h264 decoder chain");
+    expect(has(h264d, "h264parse ! video/x-h264,alignment=au ! vah264dec"),
+           "h264 decoder chain pins the decoder's alignment");
+    // A decoder that declares no single-value field gets no caps filter at all.
+    expect(!has(h264d, "profile="),
+           "no profile is pinned where the decoder lists several");
     expect(parses(h264d), "h264 decoder template parses");
   }
 

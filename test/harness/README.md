@@ -43,7 +43,7 @@ do not), and it is what the harness reads.
 | mode | ring contents | expectation |
 | --- | --- | --- |
 | `transcode-av` | NV12 frames + AAC-in-MPEG-TS | publishes |
-| `transcode-video-only` | NV12 frames, no audio at all | publishes after the 4 s capless-audio-pad unlink |
+| `transcode-video-only` | NV12 frames, no audio at all | publishes once the 4 s probe retires the capless audio pad (unlink + EOS) |
 | `copy-av` | H.264+AAC MPEG-TS | publishes |
 | `copy-video-only` | H.264-only MPEG-TS | does **not** publish (the copy template has no timeout unlink, so flvmux waits for audio forever) |
 
@@ -79,34 +79,25 @@ Against `alfg/nginx-rtmp` on this box, with `vah264enc`:
 
 | mode | result | numbers |
 | --- | --- | --- |
-| `transcode-av` | PASS | 61 frames pushed, 61 video + 90 audio buffers at the muxer, 138 buffers emitted, server +608 689 B |
-| `copy-av` | PASS | 69 video + 108 audio buffers at the muxer, 91 emitted, server +290 138 B |
-| `copy-video-only` | PASS (expected stall) | 53 video buffers at the muxer, 0 emitted, server +288 B (handshake only) |
-| `transcode-video-only` | **FAIL** | 3 video buffers at the muxer, 0 emitted, server +576 B (handshake only) |
+| `transcode-av` | PASS | 61 frames pushed, 61 video + 89 audio buffers at the muxer, 136 buffers emitted, server +596 246 B |
+| `copy-av` | PASS | 69 video + 109 audio buffers at the muxer, 90 emitted, server +281 319 B |
+| `copy-video-only` | PASS (expected stall) | 52 video buffers at the muxer, 0 emitted, server +288 B (handshake only) |
+| `transcode-video-only` | PASS | 137 frames pushed, 110 video buffers at the muxer, 133 emitted, server +1 202 044 B |
 
-### The `transcode-video-only` failure
+### The capless audio pad
 
-The 4 s probe does run — the log line `audio pad received no buffers; dropped it
-so video publishes` appears and `audio_dropped()` is true — but unlinking the
-muxer's audio pad does not retire it. flvmux keeps that request pad in its
-collect-pad aggregate, and because the pad never received caps it never
-completes negotiation, so the muxer emits nothing. Video backs up through the
-queue into `vah264enc` and then into the appsrc; the 4 MB appsrc ceiling plus the
-2 s stall watchdog then rebuild the attempt, which repeats every 4 s.
+flvmux keeps a linked request pad in its collect-pad aggregate even after its
+peer is unlinked. With no caps on that pad the muxer never completes
+negotiation and emits nothing, so video backs up through the queue into
+`vah264enc` and then into the 4 MB appsrc, and the stall watchdog rebuilds the
+attempt every 4 s. Isolated on the same flvmux/vah264enc chain with a starved
+audio appsrc: doing nothing yields 0 muxer buffers over the next 4 s, unlinking
+the peer also yields 0, and unlinking then pushing EOS on the muxer's audio sink
+pad yields 273.
 
-Verified in isolation (same flvmux/vah264enc chain, audio branch linked to a
-starved appsrc):
-
-| action at 4 s | muxer buffers over the next 4 s |
-| --- | --- |
-| nothing | 0 |
-| unlink the audio pad's peer | 0 |
-| unlink, then push EOS on the muxer's audio sink pad | 273 |
-
-So the next change is in `output::feed_transcode`'s audio probe: after
-`gst_pad_unlink(peer, candidate)`, send `gst_event_new_eos()` on `candidate` (the
-muxer's audio sink pad) and check the return value, so flvmux drops the pad from
-its aggregate. A failed send should be treated like a failed unlink.
+`output::feed_transcode`'s 4 s probe therefore sends `gst_event_new_eos()` on
+the muxer's audio sink pad after the unlink, logs whether the EOS was accepted,
+and only then reports the pad dropped.
 
 ## Notes
 

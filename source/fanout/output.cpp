@@ -1006,9 +1006,15 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
                   gst_pad_unlink(peer, candidate);
                   gst_object_unref(peer);
                 }
+                // Unlinking alone leaves flvmux's request pad in its collect
+                // aggregate; without caps it never completes negotiation and
+                // the muxer stays silent. EOS retires the pad.
+                const bool retired =
+                    gst_pad_send_event(candidate, gst_event_new_eos()) == TRUE;
                 m_audio_dropped.store(true, std::memory_order_relaxed);
-                log("audio pad received no buffers; dropped it so video "
-                    "publishes\n");
+                log(std::format("audio pad received no buffers; dropped it so "
+                                "video publishes (eos={})\n",
+                                retired ? "sent" : "refused"));
               }
               break;
             }
