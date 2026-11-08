@@ -145,34 +145,17 @@ auto decoder_template(codec /*in_codec*/,
   // The parse element is chosen from the source codec and the decoder from the
   // same alternatives list required_elements() preflights (lib.h), so the
   // runtime can never pick an element the preflight did not check.
-  // The video branch queue is named and referenced with NO `d.` request: tsdemux
-  // src pads are dynamic, and on GStreamer 1.28.6 a pad-agnostic `d.` link can
-  // hand the AUDIO pad to the video branch. With an AV1+AAC ingest that fed AAC
-  // into av1parse and killed the whole decode stage with "Internal data stream
-  // error", starving every transcode output while the copy path stayed healthy
-  // (DT-12 -- the encoder hit exactly this; the decode stage had not).
+  // Branch queues are named and linked per pad: tsdemux src pads are dynamic,
+  // and a pad-agnostic `d.` link would hand the audio pad to the video branch.
   return std::format(
-      // caps=video/mpegts,systemstream=true is MANDATORY: tsparse will not link
-      // to an uncaps'd source, and the failure surfaces as a bare
-      // "Internal data stream error" on the decode stage -- starving every
-      // transcode output while the copy path (which never parses) stays healthy.
-      //
-      // block=false: with block=true the feed thread parks inside
-      // gst_app_src_push_buffer as soon as the 4 MiB limit is reached, so the bus
-      // poll, the frame pull and the stall report all stop while the pipeline
-      // waits for frames. Under pressure a live stage drops, it does not wait.
+      // tsparse requires explicit caps on its source.
       "appsrc name=dsrc is-live=true do-timestamp=true format=time "
       "block=false max-bytes=4194304 caps=video/mpegts,systemstream=true "
       "! tsparse set-timestamps=true alignment=7 "
       "! tsdemux name=d "
       "queue name=vqueue ! {} ! {} ! videoconvert ! video/x-raw,format=NV12 "
       "! appsink name=dsink sync=false max-buffers=8 drop=true "
-      // adrop exists so EVERY demux src pad can be linked. tsdemux emits its pads
-      // as it parses, and it returns GST_FLOW_NOT_LINKED while it has NO linked src
-      // pad -- so if only the video pad is consumed and the audio pad is exposed
-      // first (which the live ingest does), the very first push into the decode
-      // appsrc is fatal and the video pad is never reached. Sinking the non-video
-      // pads costs nothing and removes the race entirely.
+      // tsdemux fails with NOT_LINKED until every src pad it exposes is linked.
       "fakesink name=adrop sync=false",
       source_parser,
       decoder);
