@@ -1,0 +1,2 @@
+/usr/sbin/ar qc libring_lib.a CMakeFiles/ring_lib.dir/ring.cpp.o CMakeFiles/ring_lib.dir/frame_ring.cpp.o
+/usr/sbin/ranlib libring_lib.a

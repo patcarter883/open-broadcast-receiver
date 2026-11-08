@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/CMakeFiles/external_rist_cpp"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/CMakeFiles/external_rist_cpp.rule"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/CMakeFiles/external_rist_cpp-complete.rule"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-build.rule"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-configure.rule"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-download.rule"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-install.rule"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-mkdir.rule"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-patch.rule"
+		},
+		{
+			"file" : "/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"external_rist_cpp"
+		],
+		"name" : "external_rist_cpp"
+	}
+}

@@ -1,0 +1,12 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/cmake_install.cmake",
+		"/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/source/lib/cmake_install.cmake",
+		"/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/source/fanout/cmake_install.cmake",
+		"/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/source/receive/cmake_install.cmake",
+		"/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/source/control/cmake_install.cmake",
+		"/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/test/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

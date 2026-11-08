@@ -1,0 +1,2 @@
+/usr/sbin/ar qc libfanout_lib.a CMakeFiles/fanout_lib.dir/output.cpp.o CMakeFiles/fanout_lib.dir/decoder.cpp.o CMakeFiles/fanout_lib.dir/recorder.cpp.o CMakeFiles/fanout_lib.dir/__/lib/lib.cpp.o CMakeFiles/fanout_lib.dir/ring.cpp.o CMakeFiles/fanout_lib.dir/frame_ring.cpp.o
+/usr/sbin/ranlib libfanout_lib.a

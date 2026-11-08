@@ -549,7 +549,7 @@ auto transcode_decoder_alternatives(codec in_codec) -> std::vector<std::string>
 {
   switch (in_codec) {
     case codec::av1:
-      return {"vaav1dec", "av1dec"};
+      return {"vaav1dec", "av1dec", "dav1ddec"};
     case codec::h265:
       return {"vah265dec", "avdec_h265"};
     case codec::h264:

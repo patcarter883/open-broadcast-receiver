@@ -1,0 +1,13 @@
+# Target labels
+ external_rist_cpp
+# Source files and their labels
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/CMakeFiles/external_rist_cpp
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/CMakeFiles/external_rist_cpp.rule
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-verify/CMakeFiles/external_rist_cpp-complete.rule
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-build.rule
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-configure.rule
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-download.rule
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-install.rule
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-mkdir.rule
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-patch.rule
+/home/pat/workspace/open-broadcast/open-broadcast-receiver/build-external/rist-cpp/src/external_rist_cpp-stamp/external_rist_cpp-update.rule

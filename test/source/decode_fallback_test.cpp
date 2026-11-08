@@ -225,8 +225,8 @@ auto main(int argc, char** argv) -> int
   // ---- 1. selection: hardware first, software as the last resort ----------
   {
     const auto av1 = transcode_decoder_alternatives(codec::av1);
-    check(av1 == (std::vector<std::string> {"vaav1dec", "av1dec"}),
-          "av1 decoder alternatives are [vaav1dec, av1dec], got " + joined(av1));
+    check(av1 == (std::vector<std::string> {"vaav1dec", "av1dec", "dav1ddec"}),
+          "av1 decoder alternatives are [vaav1dec, av1dec, dav1ddec], got " + joined(av1));
 
     const auto full =
         transcode_decoder_chain(codec::av1, only({"vaav1dec", "av1dec"}));

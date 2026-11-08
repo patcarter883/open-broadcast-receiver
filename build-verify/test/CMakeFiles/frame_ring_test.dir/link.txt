@@ -1,0 +1,1 @@
+/usr/sbin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/frame_ring_test.dir/link.d CMakeFiles/frame_ring_test.dir/source/frame_ring_test.cpp.o CMakeFiles/frame_ring_test.dir/__/source/fanout/ring.cpp.o CMakeFiles/frame_ring_test.dir/__/source/fanout/frame_ring.cpp.o -o frame_ring_test  ../source/fanout/libring_lib.a
