@@ -62,7 +62,8 @@ constexpr std::string_view k_es_video_appsrc =
 // raw from the bytes themselves and emits the raw frames the muxers need.
 constexpr std::string_view k_es_audio_appsrc =
     "appsrc name=asrc is-live=true do-timestamp=true format=time "
-    "block=false max-bytes=4194304 caps=audio/mpeg,mpegversion=4 ";
+    "block=false max-bytes=4194304 "
+    "caps=audio/mpeg,mpegversion=4,stream-format=adts,parsed=true ";
 constexpr std::string_view k_es_audio_tail =
     "queue name=aq ! aacparse name=aparse ! capsfilter name=acaps "
     "caps=audio/mpeg,mpegversion=4,stream-format=raw ";

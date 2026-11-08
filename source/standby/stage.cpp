@@ -122,7 +122,8 @@ auto build_description(es_frame_codec codec, bool slate) -> std::string
       "caps=video/mpegts,systemstream=true "
       "! tsparse set-timestamps=true alignment=7 ! tsdemux name=d "
       "queue name=vq ! {}{} ! {} ! capsfilter name=vcap0 "
-      "queue name=aq ! aacparse ! audio/mpeg,stream-format=raw "
+      "queue name=aq ! aacparse "
+      "! audio/mpeg,mpegversion=4,stream-format=adts,parsed=true "
       "! capsfilter name=acap0 "
       "fakesink name=vsink sync=false async=false "
       "fakesink name=asink sync=false async=false",
@@ -140,7 +141,8 @@ auto build_description(es_frame_codec codec, bool slate) -> std::string
       "appsrc name=sasrc format=time is-live=true block=false "
       "max-bytes=4194304 "
       "caps=audio/mpeg,mpegversion=4,stream-format=adts,parsed=true "
-      "! aacparse ! audio/mpeg,stream-format=raw ! capsfilter name=acap1",
+      "! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts,parsed=true "
+      "! capsfilter name=acap1",
       slate_src_caps(codec), codec_parser(codec), parser_props(codec), caps);
   return d;
 }
@@ -886,7 +888,7 @@ auto stage::start(const stage_config& cfg) -> bool
   // framing for AV1.
   m_framing = es_nal_framing::annexb;
   m_video_caps = video_caps(m_codec);
-  m_audio_caps = "audio/mpeg,stream-format=raw";
+  m_audio_caps = "audio/mpeg,mpegversion=4,stream-format=adts,parsed=true";
 
   // Created once per session: rebuild() must not reset it, or the first AU of
   // the rebuilt pipeline would jump the published timeline back to zero.
