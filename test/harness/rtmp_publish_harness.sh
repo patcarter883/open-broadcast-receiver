@@ -10,7 +10,9 @@
 #   test/harness/rtmp_publish_harness.sh [--bin build/test/rtmp_publish_harness]
 #                                        [--modes "transcode-av copy-av"]
 #
-# Env overrides: HARNESS_BIN, MODES, RTMP_PORT, STAT_PORT, IMAGE, LOG_DIR.
+# Env overrides: HARNESS_BIN, MODES, RTMP_PORT, STAT_PORT, IMAGE, LOG_DIR,
+# FIXTURE (AV1-in-MPEG-TS clip required by the transcode-av1 mode; generate it
+# with `make fixture`).
 # Exit status: 0 when every mode behaved as its expectation says, 1 otherwise,
 # 2 when the harness could not be run at all (no docker, no sink, no binary).
 
@@ -23,6 +25,7 @@ RTMP_PORT="${RTMP_PORT:-11935}"
 STAT_PORT="${STAT_PORT:-18080}"
 IMAGE="${IMAGE:-alfg/nginx-rtmp:latest}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/build/rtmp-harness-logs}"
+FIXTURE="${FIXTURE:-}"
 CONTAINER="obr-rtmp-sink-$$"
 
 while [[ $# -gt 0 ]]; do
@@ -85,9 +88,18 @@ for mode in $MODES; do
   log="${LOG_DIR}/${mode}.log"
   echo
   echo "=== mode ${mode} ==="
+  mode_args=()
+  if [[ "$mode" == "transcode-av1" ]]; then
+    if [[ -z "$FIXTURE" ]]; then
+      echo "mode transcode-av1 needs FIXTURE=<av1.ts> (make fixture)" >&2
+      exit 2
+    fi
+    mode_args=(--fixture "$FIXTURE")
+  fi
   if "$HARNESS_BIN" --mode "$mode" \
       --host 127.0.0.1 --port "$RTMP_PORT" \
-      --stat-url "http://127.0.0.1:${STAT_PORT}/stat" 2>&1 | tee "$log"; then
+      --stat-url "http://127.0.0.1:${STAT_PORT}/stat" \
+      "${mode_args[@]}" 2>&1 | tee "$log"; then
     verdict="PASS"
   else
     verdict="FAIL"
