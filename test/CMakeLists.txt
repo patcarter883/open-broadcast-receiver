@@ -50,8 +50,9 @@ if(NOT OBR_TESTS_ONLY)
   add_test(NAME pipeline_build_test COMMAND pipeline_build_test)
 
   # decode_file drives the receiver's real decode stage from a local MPEG-TS
-  # fixture. It needs a working VA (or software) decoder and a fixture, so it is
-  # a manual tool, not a ctest entry:
+  # fixture; run_decode_fixture.sh generates the fixture, runs it with
+  # --expect-frames and exits 77 (skip) when the AV1 encoder or a VA-API render
+  # node is absent.
   #   ./build/test/decode_file /tmp/av1.ts av1
   add_executable(decode_file tools/decode_file.cpp)
   target_link_libraries(decode_file PRIVATE
@@ -60,4 +61,12 @@ if(NOT OBR_TESTS_ONLY)
     PkgConfig::gstreamer-app
     Threads::Threads)
   target_compile_features(decode_file PRIVATE cxx_std_20)
+
+  add_test(NAME decode_fixture_test
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/run_decode_fixture.sh
+            $<TARGET_FILE:decode_file>
+            ${CMAKE_CURRENT_BINARY_DIR}/av1_fixture.ts)
+  set_tests_properties(decode_fixture_test PROPERTIES
+    SKIP_RETURN_CODE 77
+    TIMEOUT 180)
 endif()

@@ -4,12 +4,11 @@
 // decode_file — run the receiver's OWN decode stage against a local MPEG-TS
 // file, with no RIST, no network and no outputs.
 //
-// WHY THIS EXISTS: the decode stage could only be exercised by running the
-// whole receiver against a live rig, so a stall in it ("state=3 ASYNC, zero
-// frames, no element errors") could not be reproduced off-rig. This tool builds
-// the exact pipeline `decoder_template()` produces — the same code path the
-// receiver uses, not a copy — feeds a fixture through a real ts_ring at RIST
-// datagram granularity, and prints the counters the stage publishes.
+// The tool builds the exact pipeline `decoder_template()` produces — the same
+// code path the receiver uses, not a copy — feeds a fixture through a real
+// ts_ring at RIST datagram granularity, and reports the stage's counters. With
+// --expect-frames it asserts on them, which is how CTest runs it
+// (test/tools/run_decode_fixture.sh).
 //
 // The fixture MUST be muxed the way the product's encoder muxes:
 //   gst-launch-1.0 -e videotestsrc num-buffers=150 \
@@ -26,13 +25,17 @@
 // enable-custom-mappings has no AV1 stream type and tsdemux exposes no
 // video/x-av1 pad for it.
 //
-// Usage: decode_file <fixture.ts> [codec]
+// Usage: decode_file <fixture.ts> [codec] [--expect-frames N] [--duration S]
 //   codec: av1 (default) | h264 | h265
-// Exit 0 when the stage ran; the printed `frames=` line is the measurement.
+// Exit 0 when the stage ran (and met --expect-frames); 1 when an assertion
+// failed; 2 on a usage or fixture error.
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -51,42 +54,83 @@ namespace
 // what the encoder's mpegtsmux alignment=7 produces.
 constexpr std::size_t k_datagram = 7 * 188;
 constexpr auto k_drain = std::chrono::seconds(2);
-// The fixture is 150 frames at 30 fps. Feeding 12 MiB in a single burst is not
-// what a live ingest does: the decode loop drains the appsink in bounded bursts,
-// so a burst feed overflows its 8-buffer queue and the measurement becomes a
-// statement about the harness. Pacing the datagrams over the fixture's real
-// duration reproduces the live arrival rate.
-constexpr double k_fixture_seconds = 5.0;
+// Feeding a fixture in one burst is not what a live ingest does: the decode
+// loop drains the appsink in bounded bursts, so a burst feed overflows its
+// 8-buffer queue and the measurement becomes a statement about the harness.
+// Pacing the datagrams over the fixture's real duration reproduces the live
+// arrival rate. --duration overrides it.
+constexpr double k_default_seconds = 5.0;
+// A live stage can lose a frame or two at the head while it prerolls and at the
+// tail while the drain finishes; the counters are asserted against this fraction
+// of the fixture's frame count, which still catches a stage that publishes none.
+constexpr double k_published_fraction = 0.8;
 }  // namespace
 
 auto main(int argc, char** argv) -> int
 {
-  if (argc < 2) {
-    fprintf(stderr, "usage: %s <fixture.ts> [av1|h264|h265]\n", argv[0]);
-    return 2;
-  }
+  std::string fixture;
   codec in_codec = codec::av1;
-  if (argc > 2) {
-    const std::string name {argv[2]};
-    if (name == "h264") {
-      in_codec = codec::h264;
-    } else if (name == "h265") {
-      in_codec = codec::h265;
-    } else if (name != "av1") {
-      fprintf(stderr, "unknown codec %s\n", name.c_str());
+  long expect_frames = -1;
+  double duration = k_default_seconds;
+  bool codec_given = false;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg {argv[i]};
+    if (arg == "--expect-frames") {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "--expect-frames needs a value\n");
+        return 2;
+      }
+      expect_frames = std::strtol(argv[++i], nullptr, 10);
+      continue;
+    }
+    if (arg == "--duration") {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "--duration needs a value\n");
+        return 2;
+      }
+      duration = std::strtod(argv[++i], nullptr);
+      continue;
+    }
+    if (!arg.empty() && arg[0] == '-') {
+      fprintf(stderr, "unknown option %s\n", arg.c_str());
+      return 2;
+    }
+    if (fixture.empty()) {
+      fixture = arg;
+    } else if (!codec_given) {
+      codec_given = true;
+      if (arg == "h264") {
+        in_codec = codec::h264;
+      } else if (arg == "h265") {
+        in_codec = codec::h265;
+      } else if (arg != "av1") {
+        fprintf(stderr, "unknown codec %s\n", arg.c_str());
+        return 2;
+      }
+    } else {
+      fprintf(stderr, "unexpected argument %s\n", arg.c_str());
       return 2;
     }
   }
 
-  std::ifstream in(argv[1], std::ios::binary);
+  if (fixture.empty()) {
+    fprintf(stderr,
+            "usage: %s <fixture.ts> [av1|h264|h265] [--expect-frames N] "
+            "[--duration S]\n",
+            argv[0]);
+    return 2;
+  }
+
+  std::ifstream in(fixture, std::ios::binary);
   if (!in) {
-    fprintf(stderr, "cannot open %s\n", argv[1]);
+    fprintf(stderr, "cannot open %s\n", fixture.c_str());
     return 2;
   }
   const std::vector<std::uint8_t> ts {std::istreambuf_iterator<char>(in),
                                       std::istreambuf_iterator<char>()};
   if (ts.empty()) {
-    fprintf(stderr, "%s is empty\n", argv[1]);
+    fprintf(stderr, "%s is empty\n", fixture.c_str());
     return 2;
   }
 
@@ -104,10 +148,10 @@ auto main(int argc, char** argv) -> int
 
   // Feed exactly as the RIST callback does: fixed-size datagrams arriving at the
   // stream's own rate.
-  std::thread feeder {[&ring, &ts]() -> void {
+  std::thread feeder {[&ring, &ts, duration]() -> void {
     const std::size_t datagrams = (ts.size() + k_datagram - 1) / k_datagram;
     const auto period = std::chrono::duration<double> {
-        k_fixture_seconds / static_cast<double>(datagrams)};
+        duration / static_cast<double>(datagrams)};
     const auto start = std::chrono::steady_clock::now();
     std::size_t sent = 0;
     for (std::size_t off = 0; off < ts.size(); off += k_datagram) {
@@ -125,16 +169,66 @@ auto main(int argc, char** argv) -> int
 
   std::this_thread::sleep_for(k_drain);
   const std::uint64_t frames = dec.frames().head();
-  const bool failed = dec.failed();
+  const decoder::stage_counters counters = dec.counters();
   dec.stop();
 
-  fprintf(stderr, "[decode_file] frames published to the frame ring: %llu "
-                  "failed=%d\n",
-          static_cast<unsigned long long>(frames), failed ? 1 : 0);
-  printf("fixture=%s codec=%s frames=%llu failed=%d\n", argv[1],
+  printf("fixture=%s codec=%s frames=%llu failed=%d demux=%llu dec=%llu "
+         "sink=%llu state=%s stalled=%d\n",
+         fixture.c_str(),
          in_codec == codec::av1 ? "av1"
          : in_codec == codec::h264 ? "h264"
                                    : "h265",
-         static_cast<unsigned long long>(frames), failed ? 1 : 0);
+         static_cast<unsigned long long>(frames), counters.failed ? 1 : 0,
+         static_cast<unsigned long long>(counters.demux_buffers),
+         static_cast<unsigned long long>(counters.decoder_buffers),
+         static_cast<unsigned long long>(counters.sink_buffers),
+         gst_element_state_get_name(counters.state), counters.stalled ? 1 : 0);
+  fflush(stdout);
+  fprintf(stderr,
+          "[decode_file] frames published to the frame ring: %llu "
+          "failed=%d demux=%llu dec=%llu sink=%llu state=%s stalled=%d\n",
+          static_cast<unsigned long long>(frames), counters.failed ? 1 : 0,
+          static_cast<unsigned long long>(counters.demux_buffers),
+          static_cast<unsigned long long>(counters.decoder_buffers),
+          static_cast<unsigned long long>(counters.sink_buffers),
+          gst_element_state_get_name(counters.state), counters.stalled ? 1 : 0);
+
+  if (expect_frames < 0) {
+    return 0;
+  }
+
+  // Assertions. An unlinked drop branch leaves the bin in ASYNC with zero
+  // frames decoded, so the state check and the frame floor fail together.
+  const auto expected = static_cast<std::uint64_t>(expect_frames);
+  const auto floor = static_cast<std::uint64_t>(
+      std::ceil(static_cast<double>(expected) * k_published_fraction));
+  int failures = 0;
+  const auto check = [&failures](bool ok, const char* what) -> void {
+    if (!ok) {
+      fprintf(stderr, "FAIL: %s\n", what);
+      ++failures;
+    }
+  };
+  check(counters.state == GST_STATE_PLAYING, "pipeline did not reach PLAYING");
+  check(!counters.failed, "decode stage reported an error");
+  check(!counters.stalled, "decode stage stalled");
+  check(counters.demux_buffers > 0, "tsdemux produced no video buffers");
+  check(counters.decoder_buffers > 0, "decoder emitted no frames");
+  check(counters.sink_buffers > 0, "appsink received nothing");
+  check(frames >= floor,
+        "published frame count below the expected floor");
+  if (failures != 0) {
+    fprintf(stderr,
+            "FAIL: %d check(s); frames=%llu floor=%llu of expected=%llu\n",
+            failures, static_cast<unsigned long long>(frames),
+            static_cast<unsigned long long>(floor),
+            static_cast<unsigned long long>(expected));
+    return 1;
+  }
+  fprintf(stderr, "PASS: %llu frames published (floor %llu of %llu), state %s\n",
+          static_cast<unsigned long long>(frames),
+          static_cast<unsigned long long>(floor),
+          static_cast<unsigned long long>(expected),
+          gst_element_state_get_name(counters.state));
   return 0;
 }

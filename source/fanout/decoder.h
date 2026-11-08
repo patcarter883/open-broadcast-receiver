@@ -74,6 +74,21 @@ public:
     return m_failed.load(std::memory_order_relaxed);
   }
 
+  // One sample of the staged counters and the state the pipeline reached. The
+  // periodic log line renders the same data; this accessor exists so a test can
+  // assert on it instead of parsing text.
+  struct stage_counters {
+    std::uint64_t in_chunks = 0;
+    std::uint64_t demux_buffers = 0;
+    std::uint64_t decoder_buffers = 0;
+    std::uint64_t sink_buffers = 0;
+    GstState state = GST_STATE_VOID_PENDING;
+    bool stalled = false;
+    bool failed = false;
+  };
+
+  [[nodiscard]] auto counters() const -> stage_counters;
+
 private:
   auto worker() -> void;
   auto build_pipeline(std::string& err) -> bool;
@@ -110,6 +125,7 @@ private:
   std::atomic<std::uint64_t> m_sink_buffers {0};
   // Set while the decode appsrc sits at its byte limit; the feed thread keeps
   // polling rather than blocking, so this only drives the stall report.
+  std::atomic_bool m_stalled {false};
   std::chrono::steady_clock::time_point m_stall_since {};
 
   GstElement* m_pipeline = nullptr;

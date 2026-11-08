@@ -203,6 +203,22 @@ auto decoder::log(const std::string& msg) const -> void
   }
 }
 
+auto decoder::counters() const -> stage_counters
+{
+  stage_counters out;
+  out.in_chunks = m_in_chunks.load(std::memory_order_relaxed);
+  out.demux_buffers = m_demux_buffers.load(std::memory_order_relaxed);
+  out.decoder_buffers = m_decoder_buffers.load(std::memory_order_relaxed);
+  out.sink_buffers = m_sink_buffers.load(std::memory_order_relaxed);
+  out.stalled = m_stalled.load(std::memory_order_relaxed);
+  out.failed = m_failed.load(std::memory_order_relaxed);
+  if (m_pipeline != nullptr) {
+    GstState pending = GST_STATE_VOID_PENDING;
+    gst_element_get_state(m_pipeline, &out.state, &pending, 0);
+  }
+  return out;
+}
+
 auto decoder::stop() -> void
 {
   m_stopping.store(true, std::memory_order_release);
@@ -371,7 +387,7 @@ auto decoder::log_stats() -> void
       gst_element_state_get_name(state),
       gst_element_state_change_return_get_name(scr),
       gst_element_state_get_name(pending),
-      m_stall_since == std::chrono::steady_clock::time_point {} ? 0 : 1));
+      m_stalled.load(std::memory_order_relaxed) ? 1 : 0));
 }
 
 auto decoder::start() -> bool
@@ -529,6 +545,7 @@ auto decoder::worker() -> void
       const auto now = now_steady();
       if (m_stall_since == std::chrono::steady_clock::time_point {}) {
         m_stall_since = now;
+        m_stalled.store(true, std::memory_order_relaxed);
         log("decode appsrc full: the decode chain is not consuming\n");
       } else if (!stall_reported && now - m_stall_since > k_stall_timeout) {
         stall_reported = true;
@@ -540,6 +557,7 @@ auto decoder::worker() -> void
     } else {
       if (m_stall_since != std::chrono::steady_clock::time_point {}) {
         m_stall_since = std::chrono::steady_clock::time_point {};
+        m_stalled.store(false, std::memory_order_relaxed);
         stall_reported = false;
         log("decode appsrc draining again\n");
       }
