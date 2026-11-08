@@ -27,5 +27,15 @@ set -- --bind 0.0.0.0 --rist-port 5000
 # will only accept H.265 live via enhanced RTMP -- so the H.265-to-YouTube route
 # requires the node to set OBR_ALLOW_ENHANCED_RTMP.
 [ -n "${OBR_ALLOW_ENHANCED_RTMP:-}" ] && set -- "$@" --allow-enhanced-rtmp
+# Standby slate. The node sets OBR_STANDBY=1 when the plan wants a slate on
+# air; anything but an explicit 0/false forces it on (absent included, so a
+# node that predates the variable keeps the slate). OBR_STANDBY=0 is the
+# operator kill switch: --no-standby beats both the /start body and the
+# default. The brand image is a path inside this container.
+case "$(printf '%s' "${OBR_STANDBY:-}" | tr '[:upper:]' '[:lower:]')" in
+  0 | false) set -- "$@" --no-standby ;;
+  *)         set -- "$@" --standby-slate ;;
+esac
+[ -n "${OBR_STANDBY_BRAND:-}" ] && set -- "$@" --standby-brand "$OBR_STANDBY_BRAND"
 
 exec open-broadcast-receiver "$@"
