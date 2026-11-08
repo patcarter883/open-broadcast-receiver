@@ -160,6 +160,12 @@ private:
       -> GstPadProbeReturn;
   static auto muxer_first_buffer(GstPad* pad, GstPadProbeInfo* info,
                                  gpointer self) -> GstPadProbeReturn;
+  // Reports the caps and the first buffer count on the muxer's audio pad. A
+  // linked audio pad that never receives a buffer is indistinguishable from a
+  // healthy one in the stats, and the caps (stream-format=raw + codec_data) are
+  // what flvmux needed the branch to be built for.
+  static auto muxer_audio_first_buffer(GstPad* pad, GstPadProbeInfo* info,
+                                       gpointer self) -> GstPadProbeReturn;
   auto build_pipeline(std::string& err) -> bool;
   auto destroy_pipeline() -> void;
   auto set_state(run_state next) -> void;
@@ -205,6 +211,9 @@ private:
   // a buffer is how flvmux stalls with no error anywhere.
   bool m_audio_probe_done {false};
   bool m_muxer_input_logged {false};
+  // Set when the muxer's audio pad has been reported with the caps it received,
+  // so the report names the negotiated format (raw + codec_data) once.
+  std::atomic_bool m_muxer_audio_logged {false};
   std::atomic<uint64_t> m_bytes_sent {0};
   std::atomic_bool m_audio_dropped {false};
   // Buffers the muxer's audio pad actually received. Caps on that pad are not

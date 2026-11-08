@@ -939,6 +939,7 @@ auto output::run_once() -> bool
   m_audio_linked.store(false, std::memory_order_relaxed);
   m_first_video_push = std::chrono::steady_clock::time_point {};
   m_audio_probe_done = false;
+  m_muxer_audio_logged.store(false);
   m_first_output_logged.store(false);
   m_feed = feed_stats {};
   m_feed.since = m_run_started;
@@ -1108,6 +1109,8 @@ auto output::attach_audio_branch(GstPad* demux_pad) -> void
   if (caps_src != nullptr && mux_audio != nullptr) {
     gst_pad_add_probe(mux_audio, GST_PAD_PROBE_TYPE_BUFFER, &count_buffer_probe,
                       &m_audio_frames, nullptr);
+    gst_pad_add_probe(mux_audio, GST_PAD_PROBE_TYPE_BUFFER,
+                      &output::muxer_audio_first_buffer, this, nullptr);
     linked = gst_pad_link(caps_src, mux_audio) == GST_PAD_LINK_OK;
     if (!linked) {
       // A requested-but-unlinked audio pad is exactly the state that stalls
@@ -1335,6 +1338,30 @@ auto output::muxer_first_buffer(GstPad* /*pad*/, GstPadProbeInfo* /*info*/,
                          ms));
   }
   return GST_PAD_PROBE_PASS;
+}
+
+auto output::muxer_audio_first_buffer(GstPad* pad, GstPadProbeInfo* /*info*/,
+                                      gpointer self) -> GstPadProbeReturn
+{
+  auto* out = static_cast<output*>(self);
+  if (out->m_muxer_audio_logged.exchange(true)) {
+    // Report once: the caps of one audio stream do not change mid-attempt in
+    // the way a video sequence header can.
+    return GST_PAD_PROBE_REMOVE;
+  }
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  std::string rendered = "none";
+  if (caps != nullptr) {
+    gchar* text = gst_caps_to_string(caps);
+    if (text != nullptr) {
+      rendered = text;
+      g_free(text);
+    }
+    gst_caps_unref(caps);
+  }
+  out->log(std::format("output {}: muxer audio in: {}\n", out->m_cfg.id,
+                       rendered));
+  return GST_PAD_PROBE_REMOVE;
 }
 
 auto output::appsrc_drained(GstPad* /*pad*/, GstPadProbeInfo* /*info*/,

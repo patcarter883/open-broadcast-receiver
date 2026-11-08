@@ -5,9 +5,10 @@
 # receiver_e2e_local.sh — end-to-end exercise of the WHOLE receiver binary with
 # no rig and no network dependency:
 #
-#   AV1-in-MPEG-TS fixture -> rist_feed (real RIST/ADVANCED ingest) ->
-#   open-broadcast-receiver -> POST /start -> decode (vaav1dec) ->
-#   transcode (vah264enc) -> flvmux -> rtmp2sink -> local MediaMTX
+#   AV1-in-MPEG-TS fixture (with an AAC-LC track) -> rist_feed (real
+#   RIST/ADVANCED ingest) -> open-broadcast-receiver -> POST /start ->
+#   decode (vaav1dec) -> transcode (vah264enc) -> flvmux -> rtmp2sink ->
+#   local MediaMTX
 #
 # Everything runs on this machine: the RIST sender, the receiver, and the RTMP
 # sink. The only non-loopback hop is receiver -> sink, which is an address of
@@ -18,8 +19,10 @@
 # It judges the run the way an operator would, not by trusting the receiver's
 # own counters:
 #   * fixture validity  — ffprobe + a tsdemux parse-back that must expose a
-#                         video/x-av1 pad (and the PMT bytes: stream_type 0x06
-#                         with the AV1G registration descriptor and av1C).
+#                         video/x-av1 pad, and an audio/mpeg pad that aacparse
+#                         accepts when the fixture carries audio (and the PMT
+#                         bytes: stream_type 0x06 with the AV1G registration
+#                         descriptor and av1C).
 #   * decode progress   — the decoder's own staged counters in its log lines
 #                         (in chunks / demux / decoded / sink / state).
 #   * publish           — the RTMP SERVER's byte counter for the path
@@ -28,12 +31,18 @@
 #                         transcode output `bytes_sent` counts NV12 frames
 #                         pushed into the video appsrc, so it grows even when
 #                         nothing reaches RTMP.
+#   * stream readback   — the stream is pulled back OUT of the RTMP server and
+#                         probed with `ffprobe -count_packets`: real packet
+#                         counts for h264 video, plus for aac audio when the
+#                         fixture carries it. A stream that is declared but
+#                         carries 0 packets fails the run.
 #
 # Usage:
 #   test/harness/receiver_e2e_local.sh
 #
-# Env overrides: BIN FEED FIXTURE FIXTURE_FRAMES CTRL_PORT RIST_PORT RTMP_PORT
-#                MTX_API_PORT SINK_HOST LOG_DIR KEEP=1 (leave processes up)
+# Env overrides: BIN FEED FIXTURE FIXTURE_FRAMES FIXTURE_AUDIO CTRL_PORT
+#                RIST_PORT RTMP_PORT MTX_API_PORT SINK_HOST LOG_DIR
+#                KEEP=1 (leave processes up)
 #
 # Exit status: 0 = decode + publish both proven, 1 = a stage stopped (the log
 # says which), 2 = the harness could not run (missing binary/element/port).
@@ -44,7 +53,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${BIN:-${REPO_ROOT}/build/open-broadcast-receiver}"
 FEED="${FEED:-${REPO_ROOT}/build/test/rist_feed}"
 BUILD_DIR="${REPO_ROOT}/build"
-FIXTURE="${FIXTURE:-${BUILD_DIR}/fixtures/e2e-av1.ts}"
+# The name states the tracks the fixture carries: the audio checks below are
+# assertions about this file, so a reused video-only file under an audio name
+# would quietly make them vacuous.
+FIXTURE="${FIXTURE:-${BUILD_DIR}/fixtures/e2e-av1-aac.ts}"
 FIXTURE_FRAMES="${FIXTURE_FRAMES:-300}"        # 10 s at 30 fps
 FIXTURE_FPS=30
 CTRL_PORT="${CTRL_PORT:-18180}"
@@ -142,6 +154,15 @@ echo "fixture: ${FIXTURE} (${fixture_bytes} bytes, ${FIXTURE_FRAMES} frames @ ${
     d. ! queue ! av1parse ! video/x-av1,stream-format=obu-stream,alignment=frame \
     ! fakesink num-buffers=3 2>&1 \
     | grep -E "GstQueue:queue0.GstPad:(sink|src)|GstAV1Parse|ERROR|WARNING" | head -6
+  if ffprobe -v error -select_streams a -show_entries stream=codec_name \
+      -of csv=p=0 "${FIXTURE}" 2>/dev/null | grep -q aac; then
+    echo
+    echo "--- gst: audio pad of the same TS (aacparse accepts it) ---"
+    gst-launch-1.0 -v filesrc location="${FIXTURE}" ! tsparse ! tsdemux name=d \
+      d. ! queue ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts,framed=true \
+      ! fakesink num-buffers=3 2>&1 \
+      | grep -E "GstAacParse|GstQueue:queue0.GstPad:(sink|src)|ERROR|WARNING" | head -4
+  fi
   echo
   echo "--- PMT as it exists in the file (stream_type + descriptors) ---"
   python3 - "${FIXTURE}" <<'PY'
@@ -363,15 +384,36 @@ echo "sink bytesReceived   ${first_sink_bytes:-0} -> ${last_sink_bytes} (growth 
 echo "output state         running in ${out_running} sample(s)"
 
 pull_ok=0
+# Whether the fixture carries audio decides whether the readback has to prove an
+# AAC stream: a video-only ingest publishing without audio is correct, and the
+# point of the check is that audio is not silently lost when the source has it.
+audio_expected=0
+if ffprobe -v error -select_streams a -show_entries stream=codec_name \
+    -of csv=p=0 "${FIXTURE}" 2>/dev/null | grep -q aac; then
+  audio_expected=1
+fi
+video_packets=0
+audio_packets=0
 if [[ -s "${PULL_FILE}" ]]; then
-  pulled=$(ffprobe -v error -count_frames -select_streams v:0 \
-    -show_entries stream=codec_name,width,height,nb_read_frames \
-    -of default=noprint_wrappers=1 "${PULL_FILE}" 2>/dev/null | tr '\n' ' ')
-  echo "read back from sink  ${pulled:-<unprobeable>}($(wc -c < "${PULL_FILE}") B pulled)"
-  # Any probeable H.264 video with frames read back proves the publish carried
-  # a real elementary stream (the size is printed, not asserted: the fixture
-  # resolution is a harness input).
-  [[ "${pulled}" == *codec_name=h264* && "${pulled}" == *nb_read_frames=* ]] && pull_ok=1
+  streams=$(ffprobe -v error -count_packets \
+    -show_entries stream=index,codec_type,codec_name,width,height,nb_read_packets \
+    -of json "${PULL_FILE}" 2>/dev/null)
+  echo "read back from sink  ($(wc -c < "${PULL_FILE}") B pulled, ffprobe -count_packets)"
+  jq -r '.streams[] | "  stream \(.index): \(.codec_type)/\(.codec_name)" +
+           (if .width then " \(.width)x\(.height)" else "" end) +
+           " packets=\(.nb_read_packets // "?")"' <<<"${streams}" 2>/dev/null
+  video_packets=$(jq '[.streams[] | select(.codec_type=="video" and .codec_name=="h264")
+                       | (.nb_read_packets|tonumber)] | add // 0' <<<"${streams}" 2>/dev/null)
+  audio_packets=$(jq '[.streams[] | select(.codec_type=="audio" and .codec_name=="aac")
+                       | (.nb_read_packets|tonumber)] | add // 0' <<<"${streams}" 2>/dev/null)
+  video_packets=${video_packets:-0}
+  audio_packets=${audio_packets:-0}
+  # Packets, not streams: a declared-but-empty stream reads back with
+  # nb_read_packets=0 and proves nothing left the receiver.
+  if [[ "${video_packets}" -gt 0 ]] \
+     && { [[ "${audio_expected}" -eq 0 ]] || [[ "${audio_packets}" -gt 0 ]]; }; then
+    pull_ok=1
+  fi
 else
   echo "read back from sink  nothing pulled (see ${LOG_DIR}/pull.log)"
 fi
@@ -400,12 +442,19 @@ elif [[ "${sink_growth}" -lt 32768 ]]; then
   echo "         pushed into the video appsrc, not bytes on the wire."
   verdict=1
 elif [[ "${pull_ok}" -ne 1 ]]; then
-  echo "VERDICT: PARTIAL — sink received ${sink_growth} B but the pulled stream was not"
-  echo "         a probeable H.264 1280x720 stream; treat the publish as unproven."
+  echo "VERDICT: PARTIAL — sink received ${sink_growth} B but the pulled stream did not"
+  echo "         read back as h264 video (${video_packets} packets) plus the fixture's"
+  echo "         AAC audio (${audio_packets} packets, expected when the fixture carries"
+  echo "         audio); treat the publish as unproven."
   verdict=1
 else
   echo "VERDICT: PUBLISHES — ${decoded} frames decoded by ${decoder_elem}, sink received ${sink_growth} B,"
-  echo "         and a decodable H.264 stream reads back out of the RTMP server"
+  if [[ "${audio_expected}" -eq 1 ]]; then
+    echo "         and BOTH streams read back out of the RTMP server:"
+    echo "         h264 video ${video_packets} packets, aac audio ${audio_packets} packets"
+  else
+    echo "         and an h264 stream (${video_packets} packets) reads back out of the RTMP server"
+  fi
 fi
 
 echo

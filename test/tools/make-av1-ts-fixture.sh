@@ -34,6 +34,8 @@
 #
 #   FIXTURE_ENCODER=av1enc   force the software encoder (also: vaav1enc)
 #   FIXTURE_FRAMES=150       frame count (default 150 = 5 s at 30 fps)
+#   FIXTURE_AUDIO=0          omit the AAC track (default: AAC-LC 48 kHz stereo,
+#                            ADTS-framed, the source the RTMP fixup is built for)
 #
 # Exit status: 0 = fixture written (and, unless --no-verify, proven decodable by
 # tsdemux); non-zero with a diagnostic otherwise. One command, no arguments
@@ -114,16 +116,46 @@ esac
 echo "fixture: encoder=$encoder frames=$frames -> $out"
 
 rm -f "$out"
+# The mux is named and both branches are attached with request pads (`m.`),
+# because a mux that is itself the tail of the video chain has no second request
+# pad and the audio branch then fails with "not-linked".
+#
+# AUDIO is AAC-LC 48 kHz stereo, ADTS-framed: the source the receiver is built
+# for (source/fanout/output.cpp hardcodes `stream-format=raw, rate=48000,
+# channels=2, codec_data=1190` for flvmux). mpegtsmux only takes mpegversion=4
+# with `framed=true`, so aacparse's output is pinned to that. One AAC buffer is
+# 1024 samples, so it is sized to the same wall time as the video.
+duration_ms=$(( frames * 1000 / 30 ))
+audio_buffers=$(( duration_ms * 48000 / (1024 * 1000) ))
+[ "$audio_buffers" -gt 0 ] || audio_buffers=1
+# The chain is one token string: gst-parse starts a new chain at `m.`, and the
+# audio statement is present only when audio is enabled, so FIXTURE_AUDIO=0
+# produces a single-branch video-only TS.
+chain="mpegtsmux alignment=7 enable-custom-mappings=true name=m
+  videotestsrc num-buffers=$frames pattern=smpte is-live=false
+  ! video/x-raw,format=I420,width=${FIXTURE_WIDTH:-1280},height=${FIXTURE_HEIGHT:-720},framerate=30/1
+  ! videoconvert
+  ! $encoder $enc_args
+  ! av1parse
+  ! video/x-av1,stream-format=obu-stream,alignment=frame
+  ! m."
+if [ "${FIXTURE_AUDIO:-1}" != "0" ]; then
+  chain="$chain
+  audiotestsrc num-buffers=$audio_buffers wave=sine freq=440 is-live=false
+  ! audio/x-raw,rate=48000,channels=2
+  ! avenc_aac bitrate=128000
+  ! aacparse
+  ! audio/mpeg,mpegversion=4,stream-format=adts,framed=true
+  ! m."
+fi
+chain="$chain
+  m. ! filesink location=$out"
+
+# unquoted on purpose: the chain is a token stream for gst-launch, split on
+# whitespace. Every token is composed above from values without spaces.
+# shellcheck disable=SC2086
 # -e: send EOS so the muxer flushes the final PSI/PES before the filesink closes.
-if ! gst-launch-1.0 -e -q \
-    videotestsrc num-buffers="$frames" pattern=smpte is-live=false \
-    ! video/x-raw,format=I420,width="${FIXTURE_WIDTH:-1280}",height="${FIXTURE_HEIGHT:-720}",framerate=30/1 \
-    ! videoconvert \
-    ! "$encoder" $enc_args \
-    ! av1parse \
-    ! video/x-av1,stream-format=obu-stream,alignment=frame \
-    ! mpegtsmux alignment=7 enable-custom-mappings=true \
-    ! filesink location="$out"
+if ! gst-launch-1.0 -e -q $chain
 then
   echo "$0: muxing failed" >&2
   exit 1
@@ -135,17 +167,24 @@ echo "fixture: wrote $size bytes"
 
 if [ "$verify" -eq 1 ]; then
   # The check a fabricated TS fails: tsdemux must expose a video/x-av1 stream
-  # and av1parse must accept it. `num-buffers=1` bounds it; a non-zero exit or
-  # an "erroneous pipeline"/"no valid or supported streams" log is a failure.
-  # The status, not a grep, decides -- an error pattern list always misses one.
+  # and av1parse must accept it, and -- when the fixture carries audio -- an
+  # audio/mpeg stream that aacparse accepts. `num-buffers=1` bounds it; a
+  # non-zero exit or an "erroneous pipeline"/"no valid or supported streams" log
+  # is a failure. The status, not a grep, decides -- an error pattern list
+  # always misses one.
   log=$(mktemp "${TMPDIR:-/tmp}/av1-fixture-verify.XXXXXX")
   trap 'rm -f "$log"' EXIT
-  if ! gst-launch-1.0 -e -q \
-      filesrc location="$out" \
-      ! tsparse \
-      ! tsdemux \
-      ! av1parse \
-      ! fakesink sync=false num-buffers=1 >"$log" 2>&1
+  vchain="filesrc location=$out
+    ! tsparse
+    ! tsdemux name=d
+    d. ! queue ! av1parse ! fakesink sync=false num-buffers=1"
+  if [ "${FIXTURE_AUDIO:-1}" != "0" ]; then
+    vchain="$vchain
+    d. ! queue ! aacparse ! audio/mpeg,mpegversion=4,stream-format=adts,framed=true
+    ! fakesink sync=false num-buffers=1"
+  fi
+  # shellcheck disable=SC2086
+  if ! gst-launch-1.0 -e -q $vchain >"$log" 2>&1
   then
     echo "$0: tsdemux/av1parse rejected the fixture:" >&2
     sed -n '1,20p' "$log" >&2
@@ -156,5 +195,9 @@ if [ "$verify" -eq 1 ]; then
     sed -n '1,20p' "$log" >&2
     exit 1
   fi
-  echo "fixture: tsdemux exposes an AV1 elementary stream (verified)"
+  if [ "${FIXTURE_AUDIO:-1}" != "0" ]; then
+    echo "fixture: tsdemux exposes an AV1 elementary stream and an AAC one (verified)"
+  else
+    echo "fixture: tsdemux exposes an AV1 elementary stream (verified)"
+  fi
 fi
