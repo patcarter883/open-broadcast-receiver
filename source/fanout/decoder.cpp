@@ -48,7 +48,7 @@ auto registry_has_element(const char* name) -> bool
 // Route tsdemux's dynamic src pads to the video branch BY CAPS. The decode stage
 // only needs video: the audio in the ingest is carried independently (the rtmp
 // transcode branch re-demuxes the source TS for its AAC), so an audio pad here is
-// ignored rather than linked to something that cannot take it.
+// sunk to the drop funnel.
 static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data)
 {
   auto* targets = static_cast<pad_targets*>(data);
@@ -67,24 +67,39 @@ static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data
   const char* name = gst_structure_get_name(gst_caps_get_structure(caps, 0));
   const bool is_video = name != nullptr && g_str_has_prefix(name, "video/");
   gst_caps_unref(caps);
-  // Video goes to the branch; every other pad goes to adrop. Leaving a pad
-  // unlinked is NOT safe: tsdemux returns GST_FLOW_NOT_LINKED until it has a
-  // linked src pad, and the live ingest exposes audio first.
-  GstElement* dest = is_video ? vqueue : adrop;
-  if (dest == nullptr) {
+
+  GstPadLinkReturn lr = GST_PAD_LINK_REFUSED;
+  if (is_video && vqueue != nullptr) {
+    GstPad* sink = gst_element_get_static_pad(vqueue, "sink");
+    if (sink != nullptr) {
+      if (!gst_pad_is_linked(sink)) {
+        lr = gst_pad_link(pad, sink);
+      }
+      gst_object_unref(sink);
+    }
+    if (lr != GST_PAD_LINK_OK) {
+      fprintf(stderr, "[decoder] demux video pad link failed: %s\n",
+              gst_pad_link_get_name(lr));
+    }
     return;
   }
-  GstPad* sink = gst_element_get_static_pad(dest, "sink");
-  if (sink != nullptr) {
-    if (!gst_pad_is_linked(sink)) {
-      const GstPadLinkReturn lr = gst_pad_link(pad, sink);
-      if (lr != GST_PAD_LINK_OK) {
-        fprintf(stderr, "[decoder] demux pad link (%s) failed: %s\n",
-                is_video ? "video" : "other", gst_pad_link_get_name(lr));
-      }
-    }
-    gst_object_unref(sink);
+
+  // Non-video: a fresh request pad on the funnel. Leaving it unlinked is not an
+  // option -- tsdemux returns GST_FLOW_NOT_LINKED and stops the whole demux.
+  if (adrop == nullptr) {
+    return;
   }
+  GstPad* fsink = gst_element_request_pad_simple(adrop, "sink_%u");
+  if (fsink == nullptr) {
+    fprintf(stderr, "[decoder] no drop funnel pad for a non-video pad\n");
+    return;
+  }
+  lr = gst_pad_link(pad, fsink);
+  if (lr != GST_PAD_LINK_OK) {
+    fprintf(stderr, "[decoder] demux non-video pad link failed: %s\n",
+            gst_pad_link_get_name(lr));
+  }
+  gst_object_unref(fsink);
 }
 
 // Counts buffers on one pad. Attached to the pads whose counters are reported in
@@ -147,6 +162,11 @@ auto decoder_template(codec /*in_codec*/,
   // runtime can never pick an element the preflight did not check.
   // Branch queues are named and linked per pad: tsdemux src pads are dynamic,
   // and a pad-agnostic `d.` link would hand the audio pad to the video branch.
+  // The demuxer is deliberately NOT linked to the branch in the template: a
+  // static `d ! queue` in a parse string installs gst_parse_launch's own
+  // delayed link, which attaches whichever pad appears FIRST (the audio pad on
+  // this ingest) to the video branch. build_pipeline() routes the pads by caps
+  // instead, and the unlinked queue head is tolerated by gst_parse_launch.
   return std::format(
       // tsparse requires explicit caps on its source.
       "appsrc name=dsrc is-live=true do-timestamp=true format=time "
@@ -155,8 +175,11 @@ auto decoder_template(codec /*in_codec*/,
       "! tsdemux name=d "
       "queue name=vqueue ! {} ! {} ! videoconvert ! video/x-raw,format=NV12 "
       "! appsink name=dsink sync=false max-buffers=8 drop=true "
-      // tsdemux fails with NOT_LINKED until every src pad it exposes is linked.
-      "fakesink name=adrop sync=false",
+      // Everything that is not video is discarded through the funnel. `async=false`
+      // is REQUIRED, not cosmetic: a sink that never prerolls (because its pad
+      // never appears, or has not yet) keeps the whole pipeline in ASYNC state
+      // forever, which is indistinguishable from a hang: no errors, no frames.
+      "funnel name=adrop ! fakesink sync=false async=false",
       source_parser,
       decoder);
 }
