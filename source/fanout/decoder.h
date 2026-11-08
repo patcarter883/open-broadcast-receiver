@@ -94,7 +94,6 @@ public:
   };
 
   [[nodiscard]] auto counters() const -> stage_counters;
-
   // The decoder element of the attempt currently (or last) running. Copied
   // under the name lock: the feeder thread replaces it when it degrades.
   [[nodiscard]] auto decoder_element() const -> std::string
@@ -158,10 +157,16 @@ private:
   std::size_t m_attempt = 0;
   std::string m_decoder_name;
   mutable std::mutex m_name_mutex;  // guards m_decoder_name for the accessor
-  std::chrono::steady_clock::time_point m_attempt_start {};
-  // Decoder-output count when the attempt started: a decoder that produced
-  // nothing since then is what the no-frame window measures.
-  std::uint64_t m_attempt_base_decoder = 0;
+  // Measured from the first TS chunk, not from pipeline build: the stream can
+  // start seconds after /start, and a window that expires before any data
+  // arrives would call a healthy decoder dead. Both are written by the feed
+  // thread and read by the monitor thread.
+  std::atomic<std::int64_t> m_attempt_start_ns {0};
+  std::atomic<std::uint64_t> m_attempt_base_decoder {0};
+  // Whether the stage has ever received a TS chunk. The first wait is longer:
+  // a session's stream legitimately starts seconds after /start, whereas a
+  // retry that has already seen data and gets nothing is a failed attempt.
+  std::atomic<bool> m_ever_fed {false};
   bool m_simulate_failure = false;
 
   // Decode-stage counters, read only by the periodic line: TS chunks pushed into

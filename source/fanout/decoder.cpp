@@ -36,10 +36,18 @@ constexpr int k_publish_burst = 8;
 // preroll, and it is the bound that turns a silently wedged hardware decoder
 // (pipeline parked in ASYNC, no bus error) into a fallback instead of a stall.
 constexpr auto k_attempt_window = std::chrono::seconds(3);
+constexpr auto k_ingest_wait = std::chrono::seconds(10);
 
 auto now_steady() -> std::chrono::steady_clock::time_point
 {
   return std::chrono::steady_clock::now();
+}
+
+auto steady_ns() -> std::int64_t
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             now_steady().time_since_epoch())
+      .count();
 }
 
 auto registry_has_element(const char* name) -> bool
@@ -546,6 +554,172 @@ auto decoder::check_attempt_health() -> bool
   return false;
 }
 
+auto decoder::start_attempt(std::size_t index, std::string& err) -> bool
+{
+  m_attempt = index;
+  {
+    const std::scoped_lock lock {m_name_mutex};
+    m_decoder_name = m_chain[index];
+  }
+  m_using_fallback.store(index > 0, std::memory_order_relaxed);
+
+  if (!build_pipeline(err, m_decoder_name)) {
+    destroy_pipeline();
+    return false;
+  }
+  if (gst_element_set_state(m_pipeline, GST_STATE_PLAYING)
+      == GST_STATE_CHANGE_FAILURE) {
+    err = "pipeline refused PLAYING";
+    destroy_pipeline();
+    return false;
+  }
+
+  // Report what the pipeline reached and whether the demux exposed anything: a
+  // bare "Internal data stream error" says nothing about which of the two
+  // failed, and this is cheap. ASYNC is expected here -- preroll completes in
+  // the background and the no-frame window is what bounds it.
+  GstState st = GST_STATE_VOID_PENDING;
+  GstState pending = GST_STATE_VOID_PENDING;
+  const GstStateChangeReturn scr =
+      gst_element_get_state(m_pipeline, &st, &pending, GST_SECOND);
+  log(std::format("{} attempt decoder={} state={} ({}) pending={}\n",
+                  index == 0 ? "primary" : "fallback", m_decoder_name,
+                  gst_element_state_get_name(st),
+                  gst_element_state_change_return_get_name(scr),
+                  gst_element_state_get_name(pending)));
+
+  m_attempt_start_ns.store(steady_ns(), std::memory_order_relaxed);
+  m_attempt_base_decoder.store(
+      m_decoder_buffers.load(std::memory_order_relaxed),
+      std::memory_order_relaxed);
+  m_stall_since = std::chrono::steady_clock::time_point {};
+  return true;
+}
+
+auto decoder::degrade(const std::string& reason) -> bool
+{
+  const std::string failed_name = m_decoder_name;
+
+  // Tear down first: the log line that follows describes an attempt that no
+  // longer exists, and the stage counters are reset so the next stats line is
+  // about the new attempt rather than the dead one.
+  destroy_pipeline();
+  m_demux_buffers.store(0, std::memory_order_relaxed);
+  m_decoder_buffers.store(0, std::memory_order_relaxed);
+  m_sink_buffers.store(0, std::memory_order_relaxed);
+  m_stall_since = std::chrono::steady_clock::time_point {};
+
+  if (m_attempt + 1 >= m_chain.size()) {
+    log(std::format(
+        "decoder {} failed: {}; no decoder left for {} -- transcode outputs "
+        "stop here\n",
+        failed_name, reason, to_string(m_in_codec)));
+    m_failed.store(true, std::memory_order_relaxed);
+    return false;
+  }
+
+  log(std::format(
+      "decoder {} failed: {}; rebuilding with {} (software fallback)\n",
+      failed_name, reason, m_chain[m_attempt + 1]));
+
+  while (m_attempt + 1 < m_chain.size()) {
+    std::string err;
+    if (start_attempt(m_attempt + 1, err)) {
+      log(std::format("fallback decoder {} is running ({} failed)\n",
+                      m_decoder_name, failed_name));
+      return true;
+    }
+    log(std::format("fallback decoder {} could not be built: {}\n",
+                    m_chain[m_attempt + 1], err));
+  }
+
+  log(std::format("no decoder left for {} -- transcode outputs stop here\n",
+                  to_string(m_in_codec)));
+  m_failed.store(true, std::memory_order_relaxed);
+  return false;
+}
+
+auto decoder::check_attempt_health() -> bool
+{
+  if (m_simulate_failure && m_attempt == 0) {
+    // Test hook: the same retire-and-rebuild path a real failure takes.
+    m_simulate_failure = false;
+    return degrade("simulated decoder failure (test hook)");
+  }
+
+  if (m_bus != nullptr) {
+    GstMessage* msg = gst_bus_pop_filtered(m_bus, GST_MESSAGE_ERROR);
+    if (msg != nullptr) {
+      GError* gerr = nullptr;
+      gchar* dbg = nullptr;
+      gst_message_parse_error(msg, &gerr, &dbg);
+      // Name the element and keep GStreamer's own debug string: the generic
+      // "Internal data stream error" only says SOMETHING failed to negotiate,
+      // `dbg` carries which element and the flow error (not-negotiated (-4)).
+      GstObject* src = GST_MESSAGE_SRC(msg);
+      const std::string who =
+          (src != nullptr && GST_OBJECT_NAME(src) != nullptr)
+          ? GST_OBJECT_NAME(src)
+          : "?";
+      std::string text =
+          (gerr != nullptr && gerr->message != nullptr) ? gerr->message
+                                                        : "unknown";
+      if (dbg != nullptr) {
+        std::string detail {dbg};
+        std::replace(detail.begin(), detail.end(), '\n', ' ');
+        if (detail.size() > 400) {
+          detail.resize(400);
+          detail += "...";
+        }
+        text += " -- " + detail;
+      }
+      if (gerr != nullptr) {
+        g_error_free(gerr);
+      }
+      g_free(dbg);
+      gst_message_unref(msg);  // before degrade: it frees the pipeline
+      return degrade(who + " posted " + text);
+    }
+  }
+
+  // No bus error. A decoder that emitted nothing inside the window is just as
+  // dead: av1parse on this box posts NOT_NEGOTIATED while the pipeline is still
+  // prerolling, so the error can arrive after -- or not at all -- and this
+  // window is what still makes the stage recover.
+  const auto attempt_start_ns = m_attempt_start_ns.load(std::memory_order_relaxed);
+  const bool fed = m_in_chunks.load(std::memory_order_relaxed) > 0;
+  const auto window = (fed || m_ever_fed.load(std::memory_order_relaxed))
+                          ? k_attempt_window
+                          : k_ingest_wait;
+  if (m_pipeline != nullptr && attempt_start_ns != 0
+      && steady_ns() - attempt_start_ns
+             >= std::chrono::duration_cast<std::chrono::nanoseconds>(window)
+                    .count()) {
+    if (!fed) {
+      GstState st = GST_STATE_VOID_PENDING;
+      GstState pending = GST_STATE_VOID_PENDING;
+      gst_element_get_state(m_pipeline, &st, &pending, 0);
+      log_stats();
+      return degrade(std::format("no TS chunk in {} s (state={}, pending={})",
+                                 k_ingest_wait.count(),
+                                 gst_element_state_get_name(st),
+                                 gst_element_state_get_name(pending)));
+    }
+    if (m_decoder_buffers.load(std::memory_order_relaxed)
+        == m_attempt_base_decoder.load(std::memory_order_relaxed)) {
+      GstState st = GST_STATE_VOID_PENDING;
+      GstState pending = GST_STATE_VOID_PENDING;
+      gst_element_get_state(m_pipeline, &st, &pending, 0);
+      log_stats();
+      return degrade(std::format("no decoded frame in {} s (state={}, pending={})",
+                                 k_attempt_window.count(),
+                                 gst_element_state_get_name(st),
+                                 gst_element_state_get_name(pending)));
+    }
+  }
+  return false;
+}
+
 auto decoder::start() -> bool
 {
   m_consumer = m_ring.add_consumer();
@@ -689,6 +863,11 @@ auto decoder::worker() -> void
           log("first TS chunk fed to the decode stage: " + std::to_string(got)
               + " bytes\n");
           announced_first_feed = true;
+          m_ever_fed.store(true, std::memory_order_relaxed);
+          m_attempt_start_ns.store(steady_ns(), std::memory_order_relaxed);
+          m_attempt_base_decoder.store(
+              m_decoder_buffers.load(std::memory_order_relaxed),
+              std::memory_order_relaxed);
         }
         GstBuffer* gbuf = gst_buffer_new_allocate(nullptr, got, nullptr);
         gst_buffer_fill(gbuf, 0, tsbuf.data(), got);

@@ -10,20 +10,26 @@
 // --expect-frames it asserts on them, which is how CTest runs it
 // (test/tools/run_decode_fixture.sh).
 //
-// The fixture MUST be muxed the way the product's encoder muxes:
-//   gst-launch-1.0 -e videotestsrc num-buffers=150 \
-//     ! video/x-raw,format=I420,width=1280,height=720,framerate=30/1 \
-//     ! av1enc cpu-used=8 lag-in-frames=0 row-mt=true tile-columns=2 \
-//       target-bitrate=4000 keyframe-max-dist=30 \
-//     ! av1parse ! video/x-av1,stream-format=obu-stream,alignment=frame \
-//     ! mpegtsmux alignment=7 enable-custom-mappings=true \
-//     ! filesink location=/tmp/av1.ts
-// av1parse is required: av1enc emits alignment=tu and mpegtsmux only accepts
+// The fixture MUST be muxed the way the product's encoder muxes -- and there is
+// exactly one supported way to produce one, so use the committed generator
+// rather than an ad-hoc pipeline:
+//
+//   make fixture              # -> build/av1-fixture.ts
+//   ./build/test/decode_file build/av1-fixture.ts av1
+//
+// test/tools/make-av1-ts-fixture.sh encodes 150 frames (5 s) with the
+// deployment's AV1 encoder and muxes with
+//
+//   av1parse ! video/x-av1,stream-format=obu-stream,alignment=frame
+//     ! mpegtsmux alignment=7 enable-custom-mappings=true
+//
+// av1parse is required: encoders emit alignment=tu and mpegtsmux only accepts
 // alignment=frame; the encoder's own chain has the same av1parse (encode.cpp).
-// format=I420 matters too: any other chroma makes av1enc emit profile=high,
-// which vaav1dec's sink caps (profile=main) refuse. A TS muxed without
-// enable-custom-mappings has no AV1 stream type and tsdemux exposes no
-// video/x-av1 pad for it.
+// `enable-custom-mappings=true` is the one that matters most: MPEG-TS has no
+// standardised AV1 stream type, so a TS muxed without it has no AV1 stream type
+// and tsdemux exposes no video/x-av1 pad ("This stream contains no valid or
+// supported streams") -- a fixture like that proves nothing about the decoder.
+// alignment=7 = 1316-byte buffers = the RIST datagram the receiver feeds.
 //
 // Usage: decode_file <fixture.ts> [codec] [--expect-frames N] [--duration S]
 //   codec: av1 (default) | h264 | h265
