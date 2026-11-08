@@ -12,3 +12,5 @@ AppDir/
 # full/local test build trees (not artefacts of the product)
 /build-full/
 /build-tests/
+
+build*/

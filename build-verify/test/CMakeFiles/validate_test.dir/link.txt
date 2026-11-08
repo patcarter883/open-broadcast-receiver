@@ -1,1 +1,0 @@
-/usr/sbin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/validate_test.dir/link.d CMakeFiles/validate_test.dir/source/validate_test.cpp.o CMakeFiles/validate_test.dir/__/source/lib/lib.cpp.o -o validate_test  ../source/lib/libreceiver_lib.a
