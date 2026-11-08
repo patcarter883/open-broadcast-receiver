@@ -93,10 +93,17 @@ cleanup() {
     echo "KEEP=1: leaving pid(s) ${feed_pid:-} ${receiver_pid:-} ${sink_pid:-} running"
     return ${rc}
   fi
-  # Confirm nothing this script started survives.
-  local survivors=""
+  # Confirm nothing this script started survives. A signalled process can take a
+  # moment to leave (mediamtx closes its RTMP connections on the way out), so the
+  # check polls instead of sampling once and reporting a process that is still
+  # shutting down.
+  local survivors="" pid waited
   for pid in "${feed_pid}" "${receiver_pid}" "${sink_pid}"; do
     [[ -n "${pid}" ]] || continue
+    for waited in $(seq 1 20); do
+      kill -0 "${pid}" 2>/dev/null || break
+      sleep 0.1
+    done
     if kill -0 "${pid}" 2>/dev/null; then survivors+=" ${pid}"; fi
   done
   if [[ -n "${survivors}" ]]; then
