@@ -109,3 +109,82 @@ download. A stalling disk makes this consumer take ring drops; it can never touc
    (this is what makes per-output errors local by construction).
 8. The producer (RIST thread) writes the ring even while outputs rebuild — a reconnecting output rejoins live
    at the current head, it does not replay backlog.
+
+---
+
+## 6. AV1-in-MPEG-TS fixture (decode acceptance)
+
+The decode stage is exercised without a rig by one committed command, which both
+builds the fixture and runs the stage over it:
+
+```
+make fixture-decode
+```
+
+`make fixture` alone writes `build/av1-fixture.ts`; `test/tools/make-av1-ts-fixture.sh`
+is the generator (see its header for the encoder settings it mirrors).
+
+**Why the fixture is generated and not hand-made.** MPEG-TS has no standardised
+stream type for AV1. `mpegtsmux` refuses AV1 by default — *"Failed to determine
+stream type or mapping is not supported ... you may have to set the
+enable-custom-mappings property to TRUE"* — so the only representative fixture
+is one muxed the way the product's encoder muxes it
+(`open-broadcast-encoder`, `pipeline_build_sink`):
+
+```
+mpegtsmux alignment=7 enable-custom-mappings=true
+```
+
+after `av1parse ! video/x-av1,stream-format=obu-stream,alignment=frame`. The
+resulting PMT carries a private stream (stream type `0x06`, registration `AV1G`),
+which `tsdemux` maps to `video/x-av1`. A TS muxed *without* the flag has no AV1
+mapping, `tsdemux` exposes no video pad, and the chain dies with *"This stream
+contains no valid or supported streams"* — a synthetic TS like that tests the
+fixture, not the decoder.
+
+`decode_file` feeds the fixture through a real `ts_ring` in 1316-byte RIST
+datagrams and prints the stage's own counters; `frames=` is the measurement.
+
+---
+
+## 7. Decoder selection: hardware first, software as the safety net
+
+The decode stage does not commit to one decoder. `transcode_decoder_alternatives()`
+(`lib.cpp`) lists, per source codec, the hardware decoder first and the software
+decoder for the same codec second — `{vaav1dec, av1dec}`,
+`{vah265dec, avdec_h265}`, `{vah264dec, avdec_h264}` — and `transcode_decoder_chain()`
+keeps the entries the registry actually has, in that order.
+
+`decoder` builds the **first** chain entry. That attempt is retired, and the next
+entry built in its place, when either happens:
+
+- the attempt posts a bus **error** (which is what a decoder whose sink caps the
+  stream cannot satisfy reports — `av1parse` carries the `not-negotiated (-4)`
+  upstream), or
+- the attempt produces **no decoded frame within 3 s** of its own start while TS
+  bytes have been fed to it — the bound for a decoder that wedges without saying
+  anything, leaving the pipeline in `ASYNC`.
+
+The failure is logged once, naming the element and GStreamer's own debug string,
+before the rebuild. The camera-side requirement is unchanged: hardware decode is
+the preference, and the software decoder exists only for a driver/element
+combination that advertises a profile it cannot negotiate (VAAPI on RDNA4
+advertises `VAProfileAV1Profile0` while `vaav1dec`'s sink caps are
+`profile=main` only, so any non-main AV1 stream is refused outright).
+
+The periodic decode line carries the decision, so an operator can tell the two
+apart without reading startup logs:
+
+```
+in=800 chunks/2524 KiB demux=172 decoded=118 sink=118 level=0 KiB dec=vaav1dec fallback=0 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
+in=469 chunks/2282 KiB demux=113 decoded=86  sink=86  level=0 KiB dec=av1dec    fallback=1 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
+```
+
+`dec=` is the decoder element in use; `fallback=1` means it is not the
+hardware-preferred first entry. `decoded=` is the decoder output buffer count.
+
+`decode_fallback_test` (ctest) asserts the chain for av1, generates a
+`profile=high` 4:4:4 fixture that `vaav1dec` refuses and checks that frames still
+flow on `av1dec`, checks the 4:2:0 stream stays on the hardware decoder, drives a
+forced first-attempt failure, and checks that an undecodable stream exhausts the
+chain instead of retrying forever.
