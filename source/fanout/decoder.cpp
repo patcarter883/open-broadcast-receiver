@@ -4,6 +4,7 @@
 #include "fanout/decoder.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <format>
 #include <string>
@@ -81,10 +82,9 @@ static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data
   }
   const char* name = gst_structure_get_name(gst_caps_get_structure(caps, 0));
   const bool is_video = name != nullptr && g_str_has_prefix(name, "video/");
-  gst_caps_unref(caps);
 
-  GstPadLinkReturn lr = GST_PAD_LINK_REFUSED;
   if (is_video && vqueue != nullptr) {
+    GstPadLinkReturn lr = GST_PAD_LINK_REFUSED;
     GstPad* sink = gst_element_get_static_pad(vqueue, "sink");
     if (sink != nullptr) {
       if (!gst_pad_is_linked(sink)) {
@@ -93,11 +93,21 @@ static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data
       gst_object_unref(sink);
     }
     if (lr != GST_PAD_LINK_OK) {
+      // The branch's caps filter restricts the parse output to what the decoder
+      // declares, and a queue forwards that query upstream, so a stream in
+      // another profile is refused HERE, at the demux pad, rather than later by
+      // the decoder. tsdemux's pad caps already carry the profile, so this is
+      // where the exact reason is available.
       fprintf(stderr, "[decoder] demux video pad link failed: %s\n",
               gst_pad_link_get_name(lr));
+      if (targets->owner != nullptr) {
+        targets->owner->observe_source_caps(caps);
+      }
     }
+    gst_caps_unref(caps);
     return;
   }
+  gst_caps_unref(caps);
 
   // Non-video: a fresh request pad on the funnel. Leaving it unlinked is not an
   // option -- tsdemux returns GST_FLOW_NOT_LINKED and stops the whole demux.
@@ -109,12 +119,119 @@ static void on_demux_pad_added(GstElement* /*demux*/, GstPad* pad, gpointer data
     fprintf(stderr, "[decoder] no drop funnel pad for a non-video pad\n");
     return;
   }
-  lr = gst_pad_link(pad, fsink);
+  const GstPadLinkReturn lr = gst_pad_link(pad, fsink);
   if (lr != GST_PAD_LINK_OK) {
     fprintf(stderr, "[decoder] demux non-video pad link failed: %s\n",
             gst_pad_link_get_name(lr));
   }
   gst_object_unref(fsink);
+}
+
+// The caps a decoder declares on its sink pad. The fields it fixes to one value
+// are the terms the parser has to produce the stream in; the fields it lists or
+// leaves as ranges are choices, and pinning one of those would narrow the
+// element for no reason.
+auto decoder_template_caps(const char* decoder) -> GstCaps*
+{
+  GstElementFactory* factory = gst_element_factory_find(decoder);
+  if (factory == nullptr) {
+    return nullptr;
+  }
+  // The list holds GstStaticPadTemplate entries, not pad template objects.
+  GstStaticPadTemplate* tmpl = nullptr;
+  const GList* templates = gst_element_factory_get_static_pad_templates(factory);
+  for (const GList* node = templates; node != nullptr; node = node->next) {
+    auto* candidate = static_cast<GstStaticPadTemplate*>(node->data);
+    if (candidate != nullptr && candidate->direction == GST_PAD_SINK
+        && g_strcmp0(candidate->name_template, "sink") == 0) {
+      tmpl = candidate;
+      break;
+    }
+  }
+  GstCaps* caps =
+      tmpl != nullptr ? gst_static_pad_template_get_caps(tmpl) : nullptr;
+  gst_object_unref(factory);
+  return caps;  // transfer full; null when the element has no sink template
+}
+
+auto fixed_string_fields(const GstStructure* st) -> std::string
+{
+  std::string out;
+  const int fields = gst_structure_n_fields(st);
+  for (int idx = 0; idx < fields; ++idx) {
+    const char* field = gst_structure_nth_field_name(st, idx);
+    const GValue* value = gst_structure_get_value(st, field);
+    if (field == nullptr || value == nullptr || !G_VALUE_HOLDS_STRING(value)) {
+      continue;
+    }
+    gchar* text = gst_value_serialize(value);
+    out += std::format(",{}={}", field, text != nullptr ? text : "");
+    g_free(text);
+  }
+  return out;
+}
+
+// The caps the stream actually carries, in the fields that decide whether a
+// decoder can take it. Every one of these is logged: "not-negotiated" on its own
+// says nothing about which field the decoder refused.
+constexpr std::array<const char*, 8> k_stream_caps_fields = {
+    "profile", "chroma-format", "bit-depth-luma", "width",
+    "height",  "stream-format", "alignment",       "level"};
+
+auto describe_caps(const GstCaps* caps) -> std::string
+{
+  if (caps == nullptr || gst_caps_get_size(caps) == 0) {
+    return "none";
+  }
+  const GstStructure* st = gst_caps_get_structure(caps, 0);
+  std::string out = gst_structure_get_name(st);
+  for (const char* field : k_stream_caps_fields) {
+    const GValue* value = gst_structure_get_value(st, field);
+    if (value == nullptr) {
+      continue;
+    }
+    gchar* text = gst_value_serialize(value);
+    out += std::format(" {}={}", field, text != nullptr ? text : "?");
+    g_free(text);
+  }
+  return out;
+}
+
+// Which of the decoder's fixed fields the stream cannot satisfy, each with the
+// value the stream carries and the value the decoder accepts.
+auto caps_mismatch(const GstCaps* stream, const GstCaps* decoder) -> std::string
+{
+  if (stream == nullptr || decoder == nullptr
+      || gst_caps_get_size(stream) == 0 || gst_caps_get_size(decoder) == 0) {
+    return {};
+  }
+  const GstStructure* want = gst_caps_get_structure(decoder, 0);
+  const GstStructure* have = gst_caps_get_structure(stream, 0);
+  std::string out;
+  const int fields = gst_structure_n_fields(want);
+  for (int idx = 0; idx < fields; ++idx) {
+    const char* field = gst_structure_nth_field_name(want, idx);
+    const GValue* wanted = gst_structure_get_value(want, field);
+    const GValue* actual = gst_structure_get_value(have, field);
+    if (wanted == nullptr || actual == nullptr) {
+      continue;
+    }
+    GValue common = G_VALUE_INIT;
+    const bool matches = gst_value_intersect(&common, wanted, actual) != FALSE;
+    if (matches) {
+      g_value_unset(&common);
+      continue;
+    }
+    gchar* wtext = gst_value_serialize(wanted);
+    gchar* atext = gst_value_serialize(actual);
+    out += std::format("{}{}={}, the decoder accepts {}={}",
+                       out.empty() ? "" : "; ", field,
+                       atext != nullptr ? atext : "?",
+                       field, wtext != nullptr ? wtext : "?");
+    g_free(wtext);
+    g_free(atext);
+  }
+  return out;
 }
 
 // Counts buffers on one pad. Attached to the pads whose counters are reported in
@@ -125,6 +242,26 @@ auto count_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer data)
 {
   auto* counter = static_cast<std::atomic<std::uint64_t>*>(data);
   counter->fetch_add(1, std::memory_order_relaxed);
+  return GST_PAD_PROBE_PASS;
+}
+
+// The parser's caps event is where the stream's real profile, chroma, bit depth
+// and layout first exist. The probe sits on the parser's src pad and filters
+// downstream events, so it sees the caps on their way out even when the decoder
+// downstream is what refuses them.
+auto on_parser_caps(GstPad* /*pad*/, GstPadProbeInfo* info, gpointer data)
+    -> GstPadProbeReturn
+{
+  auto* self = static_cast<decoder*>(data);
+  GstEvent* event = GST_PAD_PROBE_INFO_EVENT(info);
+  if (event == nullptr || GST_EVENT_TYPE(event) != GST_EVENT_CAPS) {
+    return GST_PAD_PROBE_PASS;
+  }
+  GstCaps* caps = nullptr;
+  gst_event_parse_caps(event, &caps);
+  if (caps != nullptr) {
+    self->observe_source_caps(caps);
+  }
   return GST_PAD_PROBE_PASS;
 }
 
@@ -168,6 +305,22 @@ auto find_child(GstElement* pipeline, const char* factory) -> GstElement*
 }
 }  // namespace
 
+auto decoder_branch_caps(const char* decoder) -> std::string
+{
+  GstCaps* caps = decoder_template_caps(decoder);
+  if (caps == nullptr || gst_caps_get_size(caps) == 0) {
+    if (caps != nullptr) {
+      gst_caps_unref(caps);
+    }
+    return {};
+  }
+  const GstStructure* st = gst_caps_get_structure(caps, 0);
+  std::string out = std::format("{}{}", gst_structure_get_name(st),
+                                fixed_string_fields(st));
+  gst_caps_unref(caps);
+  return out;
+}
+
 auto decoder_template(codec /*in_codec*/,
                       const char* source_parser,
                       const char* decoder) -> std::string
@@ -182,13 +335,24 @@ auto decoder_template(codec /*in_codec*/,
   // delayed link, which attaches whichever pad appears FIRST (the audio pad on
   // this ingest) to the video branch. build_pipeline() routes the pads by caps
   // instead, and the unlinked queue head is tolerated by gst_parse_launch.
+  // The parser's output is pinned to the fields the decoder fixes on its own
+  // sink pad. Without that pin av1parse keeps its default layout (alignment=tu,
+  // which is what av1dec wants) and the term the hardware decoder needs
+  // (alignment=frame) exists only if the negotiation happens to ask for it --
+  // so the same stream decodes on one attempt and is refused on the next. The
+  // caps come from the element, not from a list here, so they cannot drift from
+  // what the decoder in this chain declares.
+  const std::string caps = decoder_branch_caps(decoder);
+  const std::string branch = caps.empty()
+                                 ? std::string {" ! "} + decoder
+                                 : " ! " + caps + " ! " + decoder;
   return std::format(
       // tsparse requires explicit caps on its source.
       "appsrc name=dsrc is-live=true do-timestamp=true format=time "
       "block=false max-bytes=4194304 caps=video/mpegts,systemstream=true "
       "! tsparse set-timestamps=true alignment=7 "
       "! tsdemux name=d "
-      "queue name=vqueue ! {} ! {} ! videoconvert ! video/x-raw,format=NV12 "
+      "queue name=vqueue ! {}{} ! videoconvert ! video/x-raw,format=NV12 "
       "! appsink name=dsink sync=false max-buffers=8 drop=true "
       // Everything that is not video is discarded through the funnel. `async=false`
       // is REQUIRED, not cosmetic: a sink that never prerolls (because its pad
@@ -196,7 +360,7 @@ auto decoder_template(codec /*in_codec*/,
       // forever, which is indistinguishable from a hang: no errors, no frames.
       "funnel name=adrop ! fakesink sync=false async=false",
       source_parser,
-      decoder);
+      branch);
 }
 
 decoder::decoder(ts_ring& ring, codec in_codec, log_fn log)
@@ -243,6 +407,10 @@ auto decoder::destroy_pipeline() -> void
 {
   if (m_pipeline != nullptr) {
     gst_element_set_state(m_pipeline, GST_STATE_NULL);
+  }
+  if (m_decoder_caps != nullptr) {
+    gst_caps_unref(m_decoder_caps);
+    m_decoder_caps = nullptr;
   }
   if (m_bus != nullptr) {
     gst_object_unref(m_bus);
@@ -308,7 +476,7 @@ auto decoder::build_pipeline(std::string& err, const std::string& decoder_name)
     destroy_pipeline();
     return false;
   }
-  pad_targets targets {vqueue, adrop};
+  pad_targets targets {vqueue, adrop, this};
   m_pad_targets = targets;
   g_signal_connect(demux, "pad-added", G_CALLBACK(on_demux_pad_added), &m_pad_targets);
   gst_object_unref(demux);
@@ -323,12 +491,35 @@ auto decoder::build_pipeline(std::string& err, const std::string& decoder_name)
     return false;
   }
   gst_app_src_set_max_bytes(GST_APP_SRC(m_appsrc), k_appsrc_max_bytes);
-  attach_probes(decoder_name.c_str());
+  m_decoder_caps = decoder_template_caps(decoder_name.c_str());
+  attach_probes(parser->c_str(), decoder_name.c_str());
   m_bus = gst_element_get_bus(m_pipeline);
   return true;
 }
 
-auto decoder::attach_probes(const char* decoder_name) -> void
+auto decoder::observe_source_caps(GstCaps* caps) -> void
+{
+  // One report per attempt: the parser re-sends caps when the sequence header
+  // changes, and that repeat is the same stream, not new information.
+  if (m_caps_reported.exchange(true, std::memory_order_relaxed)) {
+    return;
+  }
+  const std::string stream = describe_caps(caps);
+  if (m_decoder_caps != nullptr
+      && !gst_caps_can_intersect(caps, m_decoder_caps)) {
+    const std::string why = caps_mismatch(caps, m_decoder_caps);
+    std::scoped_lock lock {m_caps_mutex};
+    m_caps_refusal = std::format(
+        "{} cannot take this stream ({}): {}", decoder_element(), stream,
+        why.empty() ? "no field in common with its sink caps" : why);
+    return;
+  }
+  log(std::format("parse out: {} -- {} accepts it\n", stream,
+                  decoder_element()));
+}
+
+auto decoder::attach_probes(const char* parser_name, const char* decoder_name)
+    -> void
 {
   // vqueue's sink pad receives exactly what the demuxer's video pad produced.
   GstElement* vqueue = gst_bin_get_by_name(GST_BIN(m_pipeline), "vqueue");
@@ -341,6 +532,20 @@ auto decoder::attach_probes(const char* decoder_name) -> void
     }
     gst_object_unref(vqueue);
   }
+  // The parser's src pad carries the stream's real caps: profile, chroma, bit
+  // depth and the layout it settled on. Reporting them once per attempt turns a
+  // bare not-negotiated into a named refusal.
+  GstElement* parser = find_child(m_pipeline, parser_name);
+  if (parser != nullptr) {
+    GstPad* src = gst_element_get_static_pad(parser, "src");
+    if (src != nullptr) {
+      gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                        &on_parser_caps, this, nullptr);
+      gst_object_unref(src);
+    }
+    gst_object_unref(parser);
+  }
+
   // Probe the decoder's src pad, not its sink: the sink pad can accept a buffer
   // the decoder then never emits (a frame it cannot complete).
   GstElement* dec = find_child(m_pipeline, decoder_name);
@@ -399,6 +604,11 @@ auto decoder::start_attempt(std::size_t index, std::string& err) -> bool
     m_decoder_name = m_chain[index];
   }
   m_using_fallback.store(index > 0, std::memory_order_relaxed);
+  m_caps_reported.store(false, std::memory_order_relaxed);
+  {
+    std::scoped_lock lock {m_caps_mutex};
+    m_caps_refusal.clear();
+  }
 
   if (!build_pipeline(err, m_decoder_name)) {
     destroy_pipeline();
@@ -482,6 +692,21 @@ auto decoder::check_attempt_health() -> bool
     // Test hook: the same retire-and-rebuild path a real failure takes.
     m_simulate_failure = false;
     return degrade("simulated decoder failure (test hook)");
+  }
+
+  // A refusal recorded by the parser's caps probe is the precise form of what
+  // the bus reports as not-negotiated: it names the field the decoder objects
+  // to. Rebuild on it immediately instead of spending the no-frame window on a
+  // decoder that has already been told no.
+  {
+    std::string refusal;
+    {
+      const std::scoped_lock lock {m_caps_mutex};
+      refusal.swap(m_caps_refusal);
+    }
+    if (!refusal.empty()) {
+      return degrade(refusal);
+    }
   }
 
   if (m_bus != nullptr) {

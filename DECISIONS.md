@@ -399,3 +399,29 @@ recipe is a no-op here, and it would only ever cover code inside this image (not
 Also rejected: `AI_ADDRCONFIG` (silently drops AAAA records and only reflects the *local* address config, which
 is exactly the thing that is wrong in this failure); and a happy-eyeballs connect loop in the sink path (more
 moving parts than the bug).
+
+## 19. The decode branch pins the parser's output to the decoder's sink caps
+
+**Choice.** `decoder_branch_caps()` reads the chosen decoder's sink template from the registry, keeps the fields
+it fixes to a single value, and `decoder_template()` puts them on a caps filter between the source parser and the
+decoder: `av1parse ! video/x-av1,profile=main,alignment=frame ! vaav1dec` for the hardware path,
+`av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! av1dec` for the software path, and
+`h264parse ! video/x-h264,alignment=au ! vah264dec` for H.264. Fields the element lists or leaves as ranges
+(`profile` on `vah264dec`, `width`) are not pinned. The parser's caps event, and a refused video pad on the
+demuxer, are inspected against the same template; when they cannot intersect, the attempt is retired with the
+field that was refused (`profile=high, the decoder accepts profile=main`).
+
+**Rationale.** `av1parse` accepts `alignment={obu,tu,frame}` on its src pad and produces `alignment=tu` when
+nothing constrains it — the software decoder's layout — while `vaav1dec` takes `alignment=frame` and nothing
+else. Frame alignment therefore existed on the branch only if negotiation happened to ask for it, and the wrong
+outcome was a hardware decoder fed a stream it refuses: `not-negotiated (-4)` from `av1parse`, the pipeline parked
+in `ASYNC`, an empty frame ring, and an output that never sends a byte. Reading the caps from the element rather
+than writing them in the receiver keeps the two in step when a plugin changes what it declares, and makes the
+refusal name a field instead of a flow error. Decoding the same main-profile stream TU-aligned fails and
+frame-aligned succeeds, which is the whole of the bug.
+
+**Rejected.** `decodebin`/`decodebin3` (the requirement is declared-codec branches and a named hardware decoder,
+not discovery). A hardcoded per-codec caps table in the receiver (drifts silently from the installed plugin).
+`av1parse`'s own default layout plus waiting for `not-negotiated` to be reported by the bus: the failure then
+costs the no-frame window and names no field, and on a session whose only output is a transcode tier the whole
+output is down for those seconds.

@@ -32,10 +32,13 @@
 // A decoder failure is contained: the feeder logs and stops producing, the
 // session and copy outputs are unaffected, and transcode outputs simply idle.
 // Which decoder: hardware first (the driver is asked to hold on the GPU), with
-// the software decoder for the same codec as the last resort. An attempt that
-// posts an error or produces no frame inside k_attempt_window is torn down and
-// the next entry in the chain is built, so a hardware decoder that advertises a
-// profile it cannot negotiate costs one attempt instead of the whole stage.
+// the software decoder for the same codec as the last resort. The parser's
+// output is pinned to the sink caps the decoder declares, so the stream is
+// produced in the layout the hardware decoder takes instead of whatever
+// av1parse defaults to. An attempt whose caps cannot be met, that posts an
+// error, or that produces no frame inside k_attempt_window is torn down and the
+// next entry in the chain is built -- with the reason naming the field the
+// decoder refused when the caps are what failed.
 // Where each tsdemux src pad goes. Both destinations exist in the bin from
 // build_pipeline(): tsdemux returns GST_FLOW_NOT_LINKED while it has no linked
 // src pad, and the live ingest exposes its AUDIO pad before its video pad, so
@@ -47,6 +50,7 @@
 struct pad_targets {
   GstElement* video = nullptr;  // transcode branch: queue -> parser -> decoder
   GstElement* other = nullptr;  // funnel every non-video pad is linked into
+  class decoder* owner = nullptr;  // reports a refused video pad's caps
 };
 
 class decoder
@@ -99,6 +103,12 @@ public:
   // NOT_NEGOTIATED or a silent no-frame decoder takes.
   auto simulate_first_attempt_failure() -> void { m_simulate_failure = true; }
 
+  // Entry point of the parser's caps-event probe: records the caps the parser
+  // produced (once per attempt) and, when the running decoder's sink template
+  // cannot intersect them, the reason -- which the feeder thread turns into the
+  // rebuild. Called from a streaming thread.
+  auto observe_source_caps(GstCaps* caps) -> void;
+
 private:
   auto worker() -> void;
   auto build_pipeline(std::string& err, const std::string& decoder_name) -> bool;
@@ -115,7 +125,7 @@ private:
   // decoder when one remains. Returns true when the pipeline was replaced.
   auto check_attempt_health() -> bool;
   // Attach the buffer-count probes: demux output, decoder output, appsink input.
-  auto attach_probes(const char* decoder_name) -> void;
+  auto attach_probes(const char* parser_name, const char* decoder_name) -> void;
   // One compact line per k_stats_period with the stage counters, the decoder in
   // use and the state the pipeline actually reached.
   auto log_stats() -> void;
@@ -170,6 +180,13 @@ private:
   GstElement* m_pipeline = nullptr;
   GstElement* m_appsrc = nullptr;  // ref held via gst_bin_get_by_name
   GstElement* m_appsink = nullptr;
+  // The running decoder's sink template caps, and the caps the parser produced
+  // on this attempt. m_caps_refusal is written by the streaming thread and
+  // consumed by the feeder, which owns the rebuild.
+  GstCaps* m_decoder_caps = nullptr;
+  std::atomic_bool m_caps_reported {false};
+  std::mutex m_caps_mutex;
+  std::string m_caps_refusal;
   // Kept alive for the lifetime of the pad-added signal connection, which is passed
   // a pointer to this rather than to one element, because both destinations are
   // needed to keep tsdemux flowing.
@@ -184,5 +201,13 @@ private:
 auto decoder_template(codec in_codec,
                       const char* source_parser,
                       const char* decoder) -> std::string;
+
+// The caps `decoder` declares on its sink pad, reduced to the fields it fixes
+// to a single value (vaav1dec: profile=main, alignment=frame; av1dec:
+// alignment=tu). The decode branch pins exactly these between the parser and
+// the decoder, so the parser is told which layout to produce instead of
+// negotiating its default and letting the decoder refuse it. Empty when the
+// element is not in the registry.
+auto decoder_branch_caps(const char* decoder) -> std::string;
 
 #endif  // OPEN_BROADCAST_RECEIVER_SOURCE_FANOUT_DECODER_H

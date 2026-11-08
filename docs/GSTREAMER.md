@@ -147,7 +147,7 @@ datagrams and prints the stage's own counters; `frames=` is the measurement.
 
 ---
 
-## 7. Decoder selection: hardware first, software as the safety net
+## 7. Decoder selection: hardware first, and negotiated on the decoder's terms
 
 The decode stage does not commit to one decoder. `transcode_decoder_alternatives()`
 (`lib.cpp`) lists, per source codec, the hardware decoder first and the software
@@ -155,22 +155,72 @@ decoder for the same codec second — `{vaav1dec, av1dec}`,
 `{vah265dec, avdec_h265}`, `{vah264dec, avdec_h264}` — and `transcode_decoder_chain()`
 keeps the entries the registry actually has, in that order.
 
-`decoder` builds the **first** chain entry. That attempt is retired, and the next
-entry built in its place, when either happens:
+**The parser's output is pinned to the decoder's own sink caps.** A decoder
+declares the layout it takes on its sink pad, and the two AV1 decoders disagree:
 
-- the attempt posts a bus **error** (which is what a decoder whose sink caps the
-  stream cannot satisfy reports — `av1parse` carries the `not-negotiated (-4)`
-  upstream), or
+| element | sink caps it fixes |
+|---|---|
+| `vaav1dec` (VAAPI, hardware) | `profile=main`, `alignment=frame` |
+| `av1dec` (software) | `stream-format=obu-stream`, `alignment=tu` |
+
+`av1parse` accepts all of `alignment={obu,tu,frame}` on its src pad and, left
+alone, produces **`alignment=tu`** — the software decoder's layout. Frame
+alignment, the only thing `vaav1dec` takes, then exists on the branch only if
+something downstream constrains the negotiation to it. That is a race against
+however the branch happens to be linked, and the wrong outcome is a hardware
+decoder that is fed a layout it refuses (`not-negotiated (-4)`), a pipeline that
+stays `ASYNC`, an empty frame ring and an output that never sends a byte.
+
+`decoder_branch_caps()` (`fanout/decoder.cpp`) reads the decoder's sink template
+from the registry, keeps the fields it fixes to a single value, and the template
+puts them on a caps filter between the parser and the decoder:
+
+```
+queue name=vqueue ! av1parse ! video/x-av1,profile=main,alignment=frame ! vaav1dec ! ...
+queue name=vqueue ! av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! av1dec ! ...
+```
+
+The caps come from the element, so they cannot drift from what the installed
+decoder declares. Fields the element lists or leaves as ranges (`profile` on
+`vah264dec`, `width`) are not pinned. A queue forwards a caps query upstream, so
+a stream that cannot satisfy the pin is refused at the demux pad — before it can
+wedge the pipeline — and the attempt is retired at once rather than after the
+no-frame window.
+
+`decoder` builds the **first** chain entry. That attempt is retired, and the next
+entry built in its place, when any of these happens:
+
+- the pinned caps cannot be met (the parser's caps event, or the demux pad's
+  caps, do not intersect the decoder's sink caps) — this is the precise form of
+  what the bus only calls `not-negotiated`,
+- the attempt posts a bus **error**, or
 - the attempt produces **no decoded frame within 3 s** of its own start while TS
   bytes have been fed to it — the bound for a decoder that wedges without saying
   anything, leaving the pipeline in `ASYNC`.
 
-The failure is logged once, naming the element and GStreamer's own debug string,
-before the rebuild. The camera-side requirement is unchanged: hardware decode is
-the preference, and the software decoder exists only for a driver/element
-combination that advertises a profile it cannot negotiate (VAAPI on RDNA4
-advertises `VAProfileAV1Profile0` while `vaav1dec`'s sink caps are
-`profile=main` only, so any non-main AV1 stream is refused outright).
+The failure is logged once, naming the element, the stream's real caps and the
+field the decoder refused:
+
+```
+decoder vaav1dec failed: vaav1dec cannot take this stream (video/x-av1 profile=high
+chroma-format=4:2:0 bit-depth-luma=8 stream-format=obu-stream alignment=frame):
+profile=high, the decoder accepts profile=main; rebuilding with av1dec (software fallback)
+```
+
+and a successful hardware attempt reports what it negotiated:
+
+```
+parse out: video/x-av1 profile=main chroma-format=4:2:0 bit-depth-luma=8 width=1920
+height=1080 stream-format=obu-stream alignment=frame level=4.0 -- vaav1dec accepts it
+```
+
+The software decoder is therefore the last resort for a stream the hardware
+decoder genuinely cannot take: another profile (VAAPI on RDNA4 advertises
+`VAProfileAV1Profile0` while `vaav1dec`'s sink caps are `profile=main` only, so a
+4:4:4 `profile=high` stream is refused outright), or a driver that cannot be
+initialised. It is never the normal path: on this hardware the AV1 the encoder
+produces (`profile=main`, 4:2:0, 8- or 10-bit) matches `vaav1dec` exactly and
+runs on the GPU.
 
 The periodic decode line carries the decision, so an operator can tell the two
 apart without reading startup logs:
@@ -183,8 +233,12 @@ in=469 chunks/2282 KiB demux=113 decoded=86  sink=86  level=0 KiB dec=av1dec    
 `dec=` is the decoder element in use; `fallback=1` means it is not the
 hardware-preferred first entry. `decoded=` is the decoder output buffer count.
 
-`decode_fallback_test` (ctest) asserts the chain for av1, generates a
-`profile=high` 4:4:4 fixture that `vaav1dec` refuses and checks that frames still
-flow on `av1dec`, checks the 4:2:0 stream stays on the hardware decoder, drives a
-forced first-attempt failure, and checks that an undecodable stream exhausts the
-chain instead of retrying forever.
+`decode_fallback_test` (ctest) asserts the branch caps derived for each AV1
+decoder, generates the encoder-representative fixture (NV12 1080p into the
+hardware AV1 encoder, `av1parse`, frame-aligned caps, `mpegtsmux alignment=7
+enable-custom-mappings=true`), reads that fixture's real caps back through
+`tsdemux ! av1parse` and asserts `profile=main`, 4:2:0, 8-bit, 1080p, then
+asserts the hardware decoder ran it (`dec=vaav1dec fallback=0`, no failed
+attempt). A `profile=high` 4:4:4 fixture checks the refusal is named and that
+frames still flow on `av1dec`; a forced first-attempt failure and an undecodable
+stream check the rebuild path and that the chain is finite.
