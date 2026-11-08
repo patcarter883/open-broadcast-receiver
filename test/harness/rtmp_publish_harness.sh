@@ -20,7 +20,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HARNESS_BIN="${HARNESS_BIN:-${REPO_ROOT}/build/test/rtmp_publish_harness}"
-MODES="${MODES:-transcode-av transcode-video-only copy-av copy-video-only}"
+MODES="${MODES:-transcode-av transcode-video-only copy-av copy-av-audio-first copy-video-only}"
 RTMP_PORT="${RTMP_PORT:-11935}"
 STAT_PORT="${STAT_PORT:-18080}"
 IMAGE="${IMAGE:-alfg/nginx-rtmp:latest}"

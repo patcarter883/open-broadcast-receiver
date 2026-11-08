@@ -46,6 +46,7 @@ do not), and it is what the harness reads.
 | `transcode-av1` | AV1-in-MPEG-TS on the ts_ring, decoded by the receiver's own decode stage into the frame ring (`--fixture`, `FIXTURE=`) | publishes, with `vaav1dec` having produced frames |
 | `transcode-video-only` | NV12 frames, no audio at all | publishes once the audio-pad probe retires the capless pad (unlink + EOS) |
 | `copy-av` | H.264+AAC MPEG-TS | publishes |
+| `copy-av-audio-first` | H.264+AAC MPEG-TS muxed so tsdemux exposes its **audio** pad first (the same clip, audio branch declared first) | publishes; `demux pad order` must start with the audio pad |
 | `copy-video-only` | H.264-only MPEG-TS | does **not** publish (the copy template has no timeout unlink, so flvmux waits for audio forever) |
 
 `copy-video-only` is a test of a known gap, not a flake: it passes when the
@@ -86,6 +87,7 @@ Against `alfg/nginx-rtmp` on this box, with `vah264enc`:
 | --- | --- | --- |
 | `transcode-av` | PASS | 61 frames pushed, 61 video + 90 audio buffers at the muxer, 138 emitted, server +608 689 B; encoder input `video/x-raw,format=NV12`; muxer video `profile=high, chroma-format=4:2:0, bit-depth-luma=8` |
 | `copy-av` | PASS | 69 video + 109 audio buffers at the muxer, 90 emitted, server +283 032 B |
+| `copy-av-audio-first` | PASS | same numbers as `copy-av`, with `demux pad order audio_0_0041 (audio/mpeg), video_0_0042 (video/x-h264)` |
 | `copy-video-only` | PASS (expected stall) | 53 video buffers at the muxer, 0 emitted, server +288 B (handshake only) |
 | `transcode-video-only` | PASS | 109 video buffers at the muxer, 132 emitted, server +1 190 073 B, no audio buffer at the muxer |
 

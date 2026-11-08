@@ -61,12 +61,19 @@ auto main() -> int
   transcode_config h265;
   h265.target = transcode_target::h265;
 
-  // Copy-only templates are unchanged (legacy flvmux, no encoder element).
+  // Copy-only templates keep legacy flvmux and no encoder. The demuxer's pads
+  // are dispatched by caps in demux_pad_added, so the template must not leave
+  // pad selection to a `d.` link.
   {
     const std::string rtmp =
         output_template(output_proto::rtmp, transcode_config {}, nullptr);
     expect(has(rtmp, "flvmux name=mux") && !has(rtmp, "name=venc"),
            "copy rtmp keeps flvmux and has no encoder");
+    expect(!has(rtmp, "d. !"), "copy rtmp has no arrival-order demux links");
+    expect(has(rtmp, "queue name=vq ! h264parse"), "copy rtmp video branch");
+    expect(has(rtmp, "queue name=aq ! aacparse"), "copy rtmp audio branch");
+    expect(has(rtmp, "funnel name=adrop ! fakesink sync=false async=false"),
+           "copy rtmp has a drop funnel for unclaimed pads");
     expect(parses(rtmp), "copy rtmp template parses");
 
     const std::string srt =

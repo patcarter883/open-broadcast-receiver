@@ -29,12 +29,17 @@
 //                         clip in the ts_ring (the audio copy branch).
 //   copy-av               copy-only tier (tsparse/tsdemux/flvmux) fed an
 //                         H.264+AAC MPEG-TS clip.
+//   copy-av-audio-first   same tier, same clip, muxed so tsdemux exposes its
+//                         AUDIO pad before its video pad. The copy template
+//                         dispatches both pads by caps, so the video still
+//                         reaches h264parse and the stream publishes.
 //   copy-video-only       copy-only tier fed a video-only MPEG-TS clip. Expected
-//                         to STALL: the copy template links its audio pad by
-//                         request pad and has no timeout unlink, so flvmux waits
-//                         for audio forever. The harness asserts that
-//                         expectation, which is what makes it a test of a known
-//                         gap rather than a flaky failure.
+//                         to STALL: the template declares an AAC audio branch,
+//                         so flvmux requests an audio pad that nothing ever
+//                         feeds and the copy path has no audio-pad timeout
+//                         unlink. The harness asserts that expectation, which is
+//                         what makes it a test of a known gap rather than a
+//                         flaky failure.
 //
 // Exit status 0 = observed behaviour matched the mode's expectation, 1 = it did
 // not (or the harness could not run). The numbers are always printed.
@@ -88,6 +93,7 @@ enum class mode
   transcode_av,
   transcode_av1,
   copy_av,
+  copy_av_audio_first,
   copy_video_only
 };
 
@@ -119,6 +125,8 @@ struct options
       return "transcode-av1";
     case mode::copy_av:
       return "copy-av";
+    case mode::copy_av_audio_first:
+      return "copy-av-audio-first";
     case mode::copy_video_only:
       return "copy-video-only";
   }
@@ -127,7 +135,8 @@ struct options
 
 [[nodiscard]] auto is_copy_mode(mode m) -> bool
 {
-  return m == mode::copy_av || m == mode::copy_video_only;
+  return m == mode::copy_av || m == mode::copy_av_audio_first
+      || m == mode::copy_video_only;
 }
 
 // What the mode must do for the harness to call the run a pass.
@@ -141,7 +150,17 @@ struct options
 // retire the capless pad).
 [[nodiscard]] auto has_audio(mode m) -> bool
 {
-  return m == mode::transcode_av || m == mode::copy_av;
+  return m == mode::transcode_av || m == mode::copy_av
+      || m == mode::copy_av_audio_first;
+}
+
+// The copy template dispatches tsdemux's pads by caps for both orders; this is
+// the mode that feeds the order in which the audio pad arrives FIRST, and it
+// additionally requires the pipeline to have seen that order, so the fixture
+// cannot silently degenerate into a second video-first run.
+[[nodiscard]] auto wants_audio_first(mode m) -> bool
+{
+  return m == mode::copy_av_audio_first;
 }
 
 // Modes whose frame ring is filled by the real decode stage from an AV1
@@ -155,7 +174,7 @@ auto usage(const char* argv0) -> void
 {
   std::fprintf(stderr,
                "usage: %s [--mode transcode-av|transcode-video-only|"
-               "transcode-av1|copy-av|"
+               "transcode-av1|copy-av|copy-av-audio-first|"
                "copy-video-only]\n"
                "          [--host 127.0.0.1] [--port 11935] [--app live] "
                "[--stream test]\n"
@@ -178,6 +197,9 @@ auto usage(const char* argv0) -> void
   }
   if (text == "copy-av") {
     return mode::copy_av;
+  }
+  if (text == "copy-av-audio-first") {
+    return mode::copy_av_audio_first;
   }
   if (text == "copy-video-only") {
     return mode::copy_video_only;
@@ -442,20 +464,30 @@ auto make_ts(const std::string& description) -> std::vector<std::uint8_t>
       frames, bitrate_bps));
 }
 
+// The muxer's declaration order is what sets the PMT stream order, and tsdemux
+// creates its src pads in that order -- verified with a pad-added probe: video
+// branch declared first yields video_0 then audio_0, audio branch first yields
+// the reverse. `audio_first` is therefore the whole fixture change needed to
+// feed the copy path a TS whose audio pad arrives before its video pad.
 [[nodiscard]] auto make_h264_aac_ts(int width, int height, int bitrate_kbps,
-                                    int seconds) -> std::vector<std::uint8_t>
+                                    int seconds, bool audio_first = false)
+    -> std::vector<std::uint8_t>
 {
   const int frames = (48000 / 1024) * seconds;
-  return make_ts(std::format(
+  const std::string video = std::format(
       "videotestsrc is-live=false num-buffers={} ! "
       "video/x-raw,format=NV12,width={},height={},framerate=30/1 ! "
       "x264enc tune=zerolatency key-int-max=30 bitrate={} ! "
-      "h264parse config-interval=-1 ! mux. "
+      "h264parse config-interval=-1 ! mux. ",
+      seconds * 30, width, height, bitrate_kbps);
+  const std::string audio = std::format(
       "audiotestsrc is-live=false num-buffers={} wave=sine ! "
       "audio/x-raw,rate=48000,channels=2 ! avenc_aac bitrate=128000 ! "
-      "aacparse ! mux. "
-      "mpegtsmux name=mux alignment=7 ! appsink name=sink sync=false",
-      seconds * 30, width, height, bitrate_kbps, frames));
+      "aacparse ! mux. ",
+      frames);
+  return make_ts(std::format(
+      "{}{}mpegtsmux name=mux alignment=7 ! appsink name=sink sync=false",
+      audio_first ? audio : video, audio_first ? video : audio));
 }
 
 [[nodiscard]] auto make_h264_ts(int width, int height, int bitrate_kbps,
@@ -512,6 +544,9 @@ struct instruments
   std::mutex mutex;
   std::string video_caps;
   std::string audio_caps;
+  // Order in which tsdemux exposed its src pads, with each pad's caps name. This
+  // is what says whether a run actually exercised the audio-first order.
+  std::vector<std::string> demux_pads;
   std::vector<std::string> bus_events;
   std::vector<std::string> output_log;
 
@@ -617,12 +652,63 @@ auto bus_sync_handler(GstBus* /*bus*/, GstMessage* message, gpointer data)
   return GST_BUS_PASS;
 }
 
+// Records the order in which the demuxer exposes its src pads. Pad selection is
+// by caps, so the order must not change the verdict -- printing it (and
+// requiring it in the audio-first mode) is what keeps that a measured statement
+// instead of an assumption about which order a run exercised.
+auto demux_pad_added_order(GstElement* /*demux*/, GstPad* pad, gpointer data)
+    -> void
+{
+  auto* inst = static_cast<instruments*>(data);
+  std::string entry = GST_PAD_NAME(pad) != nullptr ? GST_PAD_NAME(pad) : "?";
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  if (caps != nullptr) {
+    if (gst_caps_get_size(caps) > 0) {
+      entry += std::format(
+          " ({})", gst_structure_get_name(gst_caps_get_structure(caps, 0)));
+    }
+    gst_caps_unref(caps);
+  }
+  std::lock_guard<std::mutex> guard(inst->mutex);
+  inst->demux_pads.push_back(entry);
+}
+
 auto install_instruments(instruments& inst, GstElement* pipeline) -> void
 {
   inst.pipeline = GST_ELEMENT(gst_object_ref(pipeline));
   inst.bus = gst_element_get_bus(inst.pipeline);
   if (inst.bus != nullptr) {
     gst_bus_set_sync_handler(inst.bus, &bus_sync_handler, &inst, nullptr);
+  }
+  // The demuxer's pad order is part of the verdict for the audio-first mode.
+  // Connect before any pad exists and record any that arrived first, so an
+  // install that loses a race with the first TS bytes still sees the order.
+  if (GstElement* demux = gst_bin_get_by_name(GST_BIN(inst.pipeline), "d");
+      demux != nullptr) {
+    g_signal_connect(demux, "pad-added", G_CALLBACK(&demux_pad_added_order),
+                     &inst);
+    GstIterator* pads = gst_element_iterate_src_pads(demux);
+    GValue item = G_VALUE_INIT;
+    bool done = false;
+    while (!done) {
+      switch (gst_iterator_next(pads, &item)) {
+        case GST_ITERATOR_OK:
+          demux_pad_added_order(demux, GST_PAD(g_value_get_object(&item)),
+                                &inst);
+          g_value_reset(&item);
+          break;
+        case GST_ITERATOR_RESYNC:
+          gst_iterator_resync(pads);
+          break;
+        case GST_ITERATOR_ERROR:
+        case GST_ITERATOR_DONE:
+          done = true;
+          break;
+      }
+    }
+    g_value_unset(&item);
+    gst_iterator_free(pads);
+    gst_object_unref(demux);
   }
   GstElement* mux = gst_bin_get_by_name(GST_BIN(inst.pipeline), "mux");
   if (mux == nullptr) {
@@ -888,7 +974,7 @@ auto main(int argc, char** argv) -> int
   } else if (is_copy_mode(opts.run_mode)) {
     ts_clip = has_audio(opts.run_mode)
         ? make_h264_aac_ts(opts.width, opts.height, opts.bitrate_kbps,
-                           fixture_seconds)
+                           fixture_seconds, wants_audio_first(opts.run_mode))
         : make_h264_ts(opts.width, opts.height, opts.bitrate_kbps,
                        fixture_seconds);
     if (ts_clip.empty()) {
@@ -1108,6 +1194,11 @@ auto main(int argc, char** argv) -> int
   // additional assertions about behaviour that "bytes arrived" alone would not
   // pin down. Diagnostics must run while the attempt's pipeline still exists.
   const auto mux_audio_final = inst.mux_audio_buffers.load();
+  std::vector<std::string> demux_pads;
+  {
+    std::lock_guard<std::mutex> guard(inst.mutex);
+    demux_pads = inst.demux_pads;
+  }
   bool ok = server_grew == expects_publish(opts.run_mode);
   std::string mode_failure;
   if (ok && server_grew && has_audio(opts.run_mode) && mux_audio_final == 0) {
@@ -1117,6 +1208,15 @@ auto main(int argc, char** argv) -> int
   if (ok && server_grew && !has_audio(opts.run_mode) && mux_audio_final != 0) {
     ok = false;
     mode_failure = "audio reached the muxer in a video-only mode";
+  }
+  // The audio-first mode exists to feed the order that used to break the copy
+  // template. If the fixture did not actually expose its audio pad first, the
+  // run is a second video-first run and proves nothing about pad ordering.
+  if (ok && server_grew && wants_audio_first(opts.run_mode)
+      && (demux_pads.empty()
+          || demux_pads.front().find("(audio/") == std::string::npos)) {
+    ok = false;
+    mode_failure = "the fixture did not expose the audio pad first";
   }
   // The decode mode exists to prove the AV1 -> NV12 -> H.264 -> RTMP chain, so
   // publishing without the decode stage having produced frames would be a pass
@@ -1230,6 +1330,13 @@ auto main(int argc, char** argv) -> int
                 gst_element_state_get_name(decode_counters.state),
                 decode_counters.stalled ? "yes" : "no",
                 decode_counters.failed ? "yes" : "no");
+  }
+  if (!demux_pads.empty()) {
+    std::string order;
+    for (const auto& entry : demux_pads) {
+      order += (order.empty() ? "" : ", ") + entry;
+    }
+    std::printf("demux pad order      %s\n", order.c_str());
   }
   std::printf("mux sink video       %llu buffers / %llu bytes\n",
               static_cast<unsigned long long>(
