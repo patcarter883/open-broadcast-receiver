@@ -1,0 +1,42 @@
+# Unit tests on every push/PR.
+#
+# This runs the fast lane only (OBR_TESTS_ONLY: no GStreamer, no librist, no
+# network). The end-to-end guard (`receiver_e2e_guard`, the ctest target that
+# feeds AV1-in-MPEG-TS over real RIST and asserts vaav1dec reached PLAYING and
+# the RTMP output reported running) is deliberately NOT run here:
+#
+#   * it needs hardware AV1 decode — a VA-API driver and a usable
+#     /dev/dri/renderD* node (this product has no software AV1 decoder);
+#   * it needs the media stack's elements (vaav1dec, vah264enc, mpegtsmux,
+#     rtmp2sink) and a `mediamtx` binary;
+#   * it needs a non-loopback IPv4 on the box, because the receiver's egress
+#     policy refuses loopback destinations unconditionally.
+#
+# No self-hosted runner with that hardware is configured for this repository,
+# so the guard stays a local gate: run `ctest --test-dir build -R
+# receiver_e2e_guard` on a machine with an AMD/Intel VA-API render node. It
+# skips (exit 77) on a box without one rather than failing.
+name: Unit tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ nlohmann-json3-dev
+      - name: Configure (tests-only lane)
+        run: cmake -S . -B build-tests -G Ninja -DOBR_TESTS_ONLY=ON -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build-tests
+      - name: Run unit tests
+        run: ctest --test-dir build-tests --output-on-failure

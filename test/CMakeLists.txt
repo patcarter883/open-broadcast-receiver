@@ -130,6 +130,23 @@ if(NOT OBR_TESTS_ONLY)
   target_link_libraries(rist_feed PRIVATE ristnet Threads::Threads)
   target_compile_features(rist_feed PRIVATE cxx_std_20)
 
+  # receiver_e2e_guard is the regression gate for the whole shipped binary:
+  # an AV1-in-MPEG-TS fixture over real RIST -> vaav1dec -> vah264enc ->
+  # RTMP into a MediaMTX the guard starts and stops itself. It fails when the
+  # decoder is not PLAYING, decoded nothing, decoded with anything but
+  # vaav1dec, or the output never reports running; it exits 77 when this box
+  # has no usable /dev/dri render node or no VA-API stack. Ports are chosen
+  # from the free set, so it can run beside the hand harness.
+  add_test(NAME receiver_e2e_guard
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/harness/receiver_e2e_guard.sh
+            $<TARGET_FILE:open-broadcast-receiver_exe>
+            $<TARGET_FILE:rist_feed>
+            ${CMAKE_CURRENT_BINARY_DIR}/fixtures/e2e-guard.ts)
+  set_tests_properties(receiver_e2e_guard PROPERTIES
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+    LABELS "e2e;media")
+
   # Local RTMP publish harness: drives the real output pipeline against a local
   # nginx-rtmp sink and judges it by the server's own byte count. It publishes,
   # so it is built with the full lane but only registered with CTest when a sink

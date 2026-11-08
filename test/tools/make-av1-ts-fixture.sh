@@ -34,6 +34,7 @@
 #
 #   FIXTURE_ENCODER=av1enc   force the software encoder (also: vaav1enc)
 #   FIXTURE_FRAMES=150       frame count (default 150 = 5 s at 30 fps)
+#   FIXTURE_BITRATE=4000     CBR bitrate in kbit/s (default 4000)
 #   FIXTURE_AUDIO=0          omit the AAC track (default: AAC-LC 48 kHz stereo,
 #                            ADTS-framed, the source the RTMP fixup is built for)
 #
@@ -103,14 +104,16 @@ pick_encoder()
 
 encoder=$(pick_encoder)
 frames=${FIXTURE_FRAMES:-150}
+bitrate=${FIXTURE_BITRATE:-4000}
 
-# Encoder-side settings per element. Both are CBR 4 Mbit/s with a 60-frame
-# keyframe interval, matching the encoder repo's AV1 chain closely enough that
-# the receiver sees the same SH/sequence-header cadence a live stream has.
+# Encoder-side settings per element. CBR at FIXTURE_BITRATE (default 4 Mbit/s)
+# with a 60-frame keyframe interval, matching the encoder repo's AV1 chain
+# closely enough that the receiver sees the same SH/sequence-header cadence a
+# live stream has.
 case "$encoder" in
-  vaav1enc) enc_args="bitrate=4000 rate-control=cbr key-int-max=60" ;;
-  av1enc)   enc_args="target-bitrate=4000 cpu-used=8 lag-in-frames=0 row-mt=true tile-columns=2 keyframe-max-dist=60" ;;
-  *)        enc_args="bitrate=4000" ;;
+  vaav1enc) enc_args="bitrate=$bitrate rate-control=cbr key-int-max=60" ;;
+  av1enc)   enc_args="target-bitrate=$bitrate cpu-used=8 lag-in-frames=0 row-mt=true tile-columns=2 keyframe-max-dist=60" ;;
+  *)        enc_args="bitrate=$bitrate" ;;
 esac
 
 echo "fixture: encoder=$encoder frames=$frames -> $out"

@@ -5,6 +5,7 @@ by what the server received rather than by the receiver's own counters.
 
 | runner | what it proves |
 | --- | --- |
+| `receiver_e2e_guard.sh` | ctest `receiver_e2e_guard`: the same path in ~9 s, asserting only the four things that must never regress (see below) |
 | `receiver_e2e_local.sh` | the whole product path from an AV1-only TS: RIST → decode → frame ring → transcode → RTMP, with the sink's byte count and a stream read back out of the server |
 | `rist_av1_publish_e2e.sh` | the same path from an AV1+AAC TS, judged by the media the sink recorded |
 | `rtmp_publish_harness.sh` | the `output` object alone, driven in-process per mode (no RIST, no decode) |
@@ -76,6 +77,41 @@ fixture built with `FIXTURE_FRAMES=150` is not fed at half speed.
 - **Nothing time-based gates the first frame.** The muxer's audio pad is requested
   only when the source TS exposes an audio pad, so a video-only ingest publishes on
   its first encoded frame.
+
+## `receiver_e2e_guard.sh` — the ctest gate
+
+    ctest --test-dir build -R receiver_e2e_guard --output-on-failure
+
+Registered from `test/CMakeLists.txt` in the full lane only, because it needs
+`rist_feed`, GStreamer and the receiver binary. It is the regression gate for
+AV1 ingest → hardware decode → RTMP publish, and it is self-contained: it
+generates (or reuses) a 3 s 640x360 AV1-only TS fixture, picks four currently
+free ports, starts its own MediaMTX, starts the receiver, POSTs `/start`, feeds
+the fixture over RIST, and stops every process it started before returning —
+including when CTest kills it on timeout.
+
+It fails if, by the time the whole fixture has been fed:
+
+- the decoder never logged counters, or its last line is not `state=PLAYING`;
+- `decoded=0`;
+- `dec=` is anything other than `vaav1dec` (a software fallback is a
+  regression: this product requires hardware decode);
+- the output never reports `running`, or the RTMP sink's `bytesReceived`
+  stayed at 0.
+
+It exits 77 (CTest SKIP) with the reason on a box with no usable
+`/dev/dri/renderD*`, without the required elements/tools, or without a
+non-loopback IPv4 to publish to. It never needs root and nothing leaves the
+host.
+
+```
+[decoder] in=31 chunks/440 KiB demux=126 decoded=86 sink=86 level=0 KiB dec=vaav1dec fallback=0 state=PLAYING (SUCCESS) pending=VOID_PENDING stalled=0
+[output local-rtmp] running=1 sink_bytesReceived=470601
+GUARD OK: 86 frames decoded by vaav1dec, output running, sink received 470601 bytes
+```
+
+Two consecutive `ctest -R receiver_e2e_guard` runs take ~9 s each and leave no
+`mediamtx`, `rist_feed` or receiver process behind.
 
 ## `rist_av1_publish_e2e.sh` — the same path with audio, judged by the recording
 
