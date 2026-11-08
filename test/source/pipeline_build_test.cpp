@@ -89,6 +89,14 @@ auto main() -> int
     expect(has(tmpl, "stream-format=raw,rate=48000,channels=2,"
                     "codec_data=(buffer)1190"),
            "h264 rtmp declares the AAC-LC 48 kHz stereo codec_data");
+    // The audio branch stops at the capsfilter: the muxer's audio pad is
+    // requested from demux_pad_added() only, so a video-only source never
+    // hands flvmux an audio pad to wait on and video publishes immediately.
+    expect(has(tmpl, "aacparse ! capsfilter name=acaps "
+                     "caps=audio/mpeg,mpegversion=4"),
+           "h264 rtmp audio branch is a named capsfilter");
+    expect(tmpl.find("codec_data=(buffer)1190 ! mux.") == std::string::npos,
+           "h264 rtmp audio branch is not pre-linked to the muxer");
     // The encoder input is pinned: the destinations are 4:2:0 8-bit, and the
     // encoder's own sink caps would otherwise accept 4:4:4 or 10-bit layouts.
     expect(has(tmpl, "video/x-raw,format=NV12 ! vah264enc name=venc"),

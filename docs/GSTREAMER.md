@@ -76,6 +76,13 @@ Connection properties set programmatically (never in the parse string): `scheme`
 **hostname** — TLS certificate validation against the real hostname is the rebinding defence for TLS
 destinations, and SNI/verification break on a bare IP (recorded in DECISIONS.md).
 
+Transcode variant (§7): encoded video comes from the shared frame ring (`appsrc name=osrc` → queue → pinned
+NV12 → encoder → parser → `mux.`) and AAC audio is copied from the ts_ring by a second branch
+(`appsrc name=asrc ! tsparse ! tsdemux name=ad ! queue name=aq ! aacparse ! capsfilter name=acaps`). That
+branch **stops at the capsfilter**: the muxer's audio pad is requested from `demux_pad_added()`, i.e. only
+when the source TS actually exposes an audio pad. A video-only ingest therefore hands `flvmux` a video pad
+alone and publishes on the first encoded frame; nothing time-based decides whether video flows.
+
 ---
 
 ## 4. Recording consumer

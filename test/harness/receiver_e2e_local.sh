@@ -225,6 +225,9 @@ rtsp: no
 hls: no
 webrtc: no
 srt: no
+# MoQ binds a fixed global port (8892) and nothing here publishes MoQ; leaving it
+# on makes a second harness run fail to start while another one is live.
+moq: no
 rtmp: yes
 rtmpAddress: ${SINK_HOST}:${RTMP_PORT}
 rtmpEncryption: "no"
