@@ -1,6 +1,6 @@
 # Local harnesses
 
-Four runners, all publishing to a throwaway local server and all judging the run
+Five runners, all publishing to a throwaway local server and all judging the run
 by what the server received rather than by the receiver's own counters.
 
 | runner | what it proves |
@@ -10,6 +10,23 @@ by what the server received rather than by the receiver's own counters.
 | `rist_av1_publish_e2e.sh` | the same path from an AV1+AAC TS, judged by the media the sink recorded |
 | `rtmp_publish_harness.sh` | the `output` object alone, driven in-process per mode (no RIST, no decode) |
 | `standby_fanout_e2e.sh` | the standby slate fan-out: ONE destination connection across slate → live → slate, an encoder restart with a PTS reset, and a video-only ingest |
+| `rist_oob_linkstats_e2e.sh` | the ABR telemetry path: receiver `/stats` link figures are live, and the 5-byte link block reaches the encoder's OOB reader through a `rist2rist` bridge |
+
+## `rist_oob_linkstats_e2e.sh` — link statistics reach the encoder
+
+    test/harness/build-rist2rist.sh <librist-src> <librist-build>
+    test/harness/rist_oob_linkstats_e2e.sh
+
+Three real processes, no network: `rist_feed` (the encoder stand-in) →
+`rist2rist` (the bridge, built from `test/rig/rist2rist-tool.c` — the same file
+the router image compiles) → this tree's receiver. `rist_feed` decodes OOB
+exactly as the encoder does (5-byte packed `wan_telemetry`, big-endian RTT) and
+prints `oob link_quality=<q> rtt_ms=<rtt>`.
+
+It requires a `rist2rist` built from the patched source; the system/upstream
+tool has no `-P`/`--out-profile` and no OOB relay. `build-rist2rist.sh` produces
+one against the system libRIST. Without it the harness exits 77.
+
 
 ## `receiver_e2e_local.sh` — the end-to-end proof
 

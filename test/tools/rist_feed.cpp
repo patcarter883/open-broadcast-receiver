@@ -20,9 +20,27 @@
 #include <tuple>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <unistd.h>
 
 #include "RISTNet.h"
+
+namespace {
+
+// Byte-for-byte the encoder's wan_telemetry (open-broadcast-encoder
+// source/lib/lib.h): the 5-byte OOB payload the receiver sends on its
+// control channel. Anything else on the OOB channel is not link telemetry
+// and is ignored here, exactly as the encoder ignores it.
+struct __attribute__((packed)) wan_telemetry
+{
+  std::uint8_t link_quality;
+  std::uint32_t worst_case_rtt;  // network byte order on the wire
+};
+
+static_assert(sizeof(wan_telemetry) == 5,
+              "wan_telemetry must be exactly 5 bytes");
+
+}  // namespace
 
 auto main(int argc, char** argv) -> int
 {
@@ -51,6 +69,24 @@ auto main(int argc, char** argv) -> int
     std::fprintf(stderr, "rist_feed: initSender failed\n");
     return 1;
   }
+
+  // Print the link telemetry the receiver sends back over RIST OOB, decoded
+  // the way the encoder decodes it: 5-byte wan_telemetry, quality 0..100 and
+  // RTT in milliseconds, big-endian on the wire.
+  sender.networkOOBDataCallback =
+      [](const std::uint8_t* buf, std::size_t size,
+         std::shared_ptr<RISTNetSender::NetworkConnection>&, rist_peer*) {
+        if (size != sizeof(wan_telemetry) || buf == nullptr) {
+          return;
+        }
+        wan_telemetry tel;
+        std::memcpy(&tel, buf, sizeof(tel));
+        const std::uint32_t rtt_ms = ntohl(tel.worst_case_rtt);
+        std::fprintf(stderr, "rist_feed: oob link_quality=%u rtt_ms=%u\n",
+                     static_cast<unsigned>(tel.link_quality),
+                     static_cast<unsigned>(rtt_ms));
+        std::fflush(stderr);
+      };
 
   constexpr std::size_t k_chunk = 7 * 188;
   std::vector<uint8_t> buf(k_chunk);
