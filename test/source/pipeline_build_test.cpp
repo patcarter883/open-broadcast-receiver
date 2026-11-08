@@ -61,12 +61,25 @@ auto main() -> int
   transcode_config h265;
   h265.target = transcode_target::h265;
 
-  // Copy-only templates are unchanged (legacy flvmux, no encoder element).
+  // Copy-only templates keep legacy flvmux and no encoder. The demuxer's pads
+  // are dispatched by caps in demux_pad_added, so the template must not leave
+  // pad selection to a `d.` link.
   {
     const std::string rtmp =
         output_template(output_proto::rtmp, transcode_config {}, nullptr);
     expect(has(rtmp, "flvmux name=mux") && !has(rtmp, "name=venc"),
            "copy rtmp keeps flvmux and has no encoder");
+    // Nothing links the demuxer's pads in the template: a template link joins
+    // whichever pad tsdemux announces first, and the pad-to-parser decision is
+    // made from each pad's caps in demux_pad_added.
+    expect(!has(rtmp, "d. !") && !has(rtmp, "tsdemux name=d !"),
+           "copy rtmp links no demuxer pad from the template");
+    expect(has(rtmp, "queue name=vq ! h264parse config-interval=-1"),
+           "copy rtmp names the video branch");
+    expect(has(rtmp, "queue name=aq ! aacparse"),
+           "copy rtmp names the audio branch");
+    expect(has(rtmp, "funnel name=ddrop ! fakesink sync=false async=false"),
+           "copy rtmp has a drop funnel for pads no branch handles");
     expect(parses(rtmp), "copy rtmp template parses");
 
     const std::string srt =
@@ -104,7 +117,7 @@ auto main() -> int
     // A video-only ingest makes the audio branch's tsdemux expose a video pad;
     // left unlinked it fails the pipeline with "streaming stopped, reason=
     // not-linked". The funnel is where that pad goes.
-    expect(has(tmpl, "funnel name=adrop ! fakesink sync=false async=false"),
+    expect(has(tmpl, "funnel name=ddrop ! fakesink sync=false async=false"),
            "h264 rtmp has a drop funnel for the audio branch's non-audio pads");
     expect(parses(tmpl), "h264 rtmp transcode template parses");
   }
