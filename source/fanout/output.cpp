@@ -948,7 +948,13 @@ auto output::run_once() -> bool
           terminal = is_codec_terminal(
               gerr, GST_ELEMENT(GST_MESSAGE_SRC(msg)));
           set_last_error(terminal ? "rtmp_codec_unsupported" : text);
-          log("bus error: " + text + "\n");
+          // The element name is ours (venc/mux/h264parse/...), so naming it is
+          // safe and it is the only way to tell a negotiation failure in the
+          // encoder chain from the sink's transport error.
+          GstObject* src_obj = GST_MESSAGE_SRC(msg);
+          const char* who = (src_obj != nullptr && GST_OBJECT_NAME(src_obj))
+              ? GST_OBJECT_NAME(src_obj) : "?";
+          log(std::format("bus error from {}: {}\n", who, text));
           if (gerr != nullptr) {
             g_error_free(gerr);
           }
