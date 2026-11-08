@@ -38,10 +38,14 @@ feed="$root/build/test/rist_feed"
 work="${WORK:-$root/build/e2e}"
 fixture="$work/av1-aac-fixture.ts"
 rec_dir="$work/rec"
-control_port=18081
-rtmp_port=1935
-api_port=9997
-rist_port=5000
+# These are overridable because a fixed 5000/UDP collides with anything else on
+# the box that listens there (a rist2rist proxy, another harness). Without an
+# override the run "passes" the fixture check, ships its packets to the other
+# socket, and fails with bytes_sent=0 and no explanation.
+control_port="${CONTROL_PORT:-18081}"
+rtmp_port="${RTMP_PORT:-1935}"
+api_port="${API_PORT:-9997}"
+rist_port="${RIST_PORT:-5000}"
 
 for bin in "$receiver" "$feed" mediamtx gst-launch-1.0 pv ffprobe curl jq; do
   if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$bin" ]; then
@@ -56,6 +60,15 @@ done
 mkdir -p "$work"
 lan_ip="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)"
 [ -n "$lan_ip" ] || { echo "SKIP: no non-loopback IPv4 address" >&2; exit 77; }
+
+# A crash here is worth 3 wasted minutes: the receiver's listener binds happily
+# next to another owner of the same UDP port and the packets go to the other
+# socket, so the run reports a healthy RIST handshake and zero decoded frames.
+if holder="$(ss -lunpH "sport = :$rist_port" 2>/dev/null | head -1)" && [ -n "$holder" ]; then
+  echo "FAIL: udp/$rist_port is already held by $holder" >&2
+  echo "      that socket will take the feed; rerun with RIST_PORT=<free port>" >&2
+  exit 2
+fi
 
 cleanup() {
   [ -n "${receiver_pid:-}" ] && kill "$receiver_pid" 2>/dev/null || true
@@ -118,7 +131,7 @@ curl -sf "http://127.0.0.1:$api_port/v3/config/global/get" >/dev/null \
   || { echo "FAIL: mediamtx API did not come up" >&2; exit 1; }
 
 # ---- 3) the receiver, ingesting over RIST and publishing to the sink -------
-"$receiver" --control-port "$control_port" --egress-allow-private \
+"$receiver" --control-port "$control_port" --rist-port "$rist_port" --egress-allow-private \
   > "$work/receiver.log" 2>&1 &
 receiver_pid=$!
 sleep 1
