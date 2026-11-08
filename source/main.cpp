@@ -87,7 +87,8 @@ auto print_usage(const char* argv0) -> void
       << "The receiver terminates one RIST/TS ingest and fans it out, copy-only\n"
       << "(H.264+AAC), to up to 8 RTMP/RTMPS/SRT/RIST outputs over an in-process\n"
       << "ring — one independent pipeline per output. An output may opt into\n"
-      << "the transcode tier (outputs[].transcode). POST /start (schema 3)\n"
+      << "the transcode tier (outputs[].transcode). POST /start (schema "
+      << k_schema_version << ")\n"
       << "configures outputs; see docs/CONTRACT.md.\n";
 }
 
@@ -618,7 +619,8 @@ auto main(int argc, char** argv) -> int
             << ":" << control_port << "  rist @[::]:" << rist_port
             << (token.empty() ? "  [NO-AUTH]" : "  [token auth]")
             << (opts.psk.empty() ? "" : "  [psk]") << "\n"
-            << "Copy-only fan-out by default (schema 3): POST /start with "
+            << "Copy-only fan-out by default (schema " << k_schema_version
+            << "): POST /start with "
             << "outputs[]. Ctrl-C to quit." << std::endl;
 
   // --- idle-timeout watchdog (§1.5) -----------------------------------------
