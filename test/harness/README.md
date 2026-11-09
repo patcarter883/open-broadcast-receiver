@@ -65,9 +65,12 @@ VERDICT: PUBLISHES — 297 frames decoded by vaav1dec, sink received 6830743 B,
 The verdict needs all of: a `running` output, `reconnects 0` (a publish that only
 happened across rebuilt attempts is not a publish), the sink's own counter growing
 by ≥ 32 KiB, and an H.264 stream at the ingest resolution read back out of the
-server. `out_bytes_published` (the /stats `bytes_published_total`) tracks the
-server's counter to within a percent in the samples above, but it is measured at
-the sink pad and so cannot prove arrival: the verdict still rests on the server.
+server. `out_bytes_published` (the /stats `bytes_published_total`, serialised
+again as `bytes_sent`) tracks the server's counter to within a percent in the
+samples above, but it is measured at the sink pad and so cannot prove arrival:
+the verdict still rests on the server. On a transcode output `bytes_pushed`
+counts NV12 frames pushed into the appsrc and grows even when nothing reaches
+RTMP, so it is printed and never decides.
 
 Two configuration facts it depends on:
 
@@ -169,11 +172,15 @@ locally; the destination is a local nginx-rtmp sink.
     test/harness/rtmp_publish_harness.sh
 
 The point is the verdict rule: **the server's own byte count decides**. The
-receiver's `bytes_published_total` is measured at the destination sink pad and
-tracks the server closely, but it cannot prove the bytes arrived, so the harness
-never trusts it. Likewise the muxer's sink pads are probed rather than the
+receiver's `bytes_published_total` / `bytes_sent` is measured at the destination
+sink pad and tracks the server closely, but it cannot prove the bytes arrived, so
+the harness never trusts it alone. `bytes_pushed` counts pushes into the appsrc
+and has read healthy on a rig while the connection sat idle, so it is never
+evidence either. Likewise the muxer's sink pads are probed rather than the
 appsrc's caps, because an appsrc can be negotiated and accepting buffers while
-everything downstream of it is stalled.
+everything downstream of it is stalled. The two receiver counters are asserted
+against each other and against the server's `bytes_in` by ratio, so a transcode
+run cannot pass with raw decoded-frame volume standing in for egress.
 
 ## What it drives
 
@@ -256,6 +263,8 @@ Per-run report:
     mux src emitted      buffers/bytes the muxer actually produced
     server bytes_in      the sink's counter, with baseline and delta
     output published     sink-pad bytes and buffers, printed for comparison only
+    output bytes_sent    the sink pad's egress byte total
+    output bytes_pushed  the appsrc push counter, printed for comparison only
 
 When a mode fails, the report also prints every element's state, each mux sink
 pad's caps and link state, the `osrc`/`asrc` caps, all bus ERROR/WARNING/EOS
@@ -393,9 +402,12 @@ All three, from data the receiver does not produce:
 3. 3 s of the published stream are pulled **back out** of the RTMP server with
    `ffmpeg -c copy` and probe as H.264 video with frames in it.
 
-`bytes_published_total` is printed but never trusted for the verdict: it is the
-bytes handed to the sink pad, so a stalled network path can leave it growing
-while the server takes nothing.
+`bytes_published_total` / `bytes_sent` (the same sink-pad measure under two names)
+is printed but never trusted on its own for the verdict: a stalled network path
+can leave it growing while the server takes nothing, so it is asserted against
+the server's counter, while `bytes_pushed` counts the NV12 frames pushed into the
+video `appsrc` (≈230 MB for 10 s of 720p) and grows healthily even when nothing
+reaches RTMP.
 
 On failure the verdict names the first stage that stopped — RIST ingest, TS
 ring, decode appsrc, tsdemux, decoder, or the output — with the counters that

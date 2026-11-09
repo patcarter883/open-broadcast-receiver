@@ -36,6 +36,7 @@ auto make_stat() -> output_stat
   stat.reconnects = 2;
   stat.bytes_published_total = 1234;
   stat.frames_published_total = 89;
+  stat.bytes_pushed = 98765;
   stat.dropped_bytes = 5;
   stat.audio_dropped = false;
   stat.audio_frames = 3392;
@@ -67,7 +68,10 @@ auto main() -> int
                && stats["frames_published_total"] == 89,
            "stats reports sink truth");
     expect(stats["bytes_sent"] == stats["bytes_published_total"],
-           "bytes_sent is the deprecated alias of bytes_published_total");
+           "bytes_sent carries the same sink-pad measure as bytes_published_total");
+    expect(stats["dropped_bytes"] == 5, "stats keeps byte counters");
+    expect(stats["bytes_pushed"] == 98765,
+           "stats reports appsrc pushes separately from socket egress");
     expect(!stats.contains("type"), "stats omits type");
   }
 

@@ -496,10 +496,13 @@ struct output_stat
   int64_t connected_s = 0;
   uint64_t reconnects = 0;
   // Sink truth: cumulative bytes and media buffers handed to the destination's
-  // protocol element. The JSON's deprecated `bytes_sent` is serialised from
-  // bytes_published_total, so the two cannot disagree.
+  // protocol element. The JSON's `bytes_sent` is serialised from this same
+  // value, so the two cannot disagree.
   uint64_t bytes_published_total = 0;
   uint64_t frames_published_total = 0;
+  // appsrc-push total: raw decoded frames (transcode) or AUs (copy). It is a
+  // superset of bytes_published_total and never the socket counter.
+  uint64_t bytes_pushed = 0;
   uint64_t dropped_bytes = 0;
   bool audio_dropped = false;
   // Buffers the muxer's audio pad received; 0 with audio_dropped=false is an

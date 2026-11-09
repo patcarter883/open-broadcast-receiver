@@ -864,6 +864,7 @@ auto main(int argc, char** argv) -> int
       ostat.reconnects = out->reconnects();
       ostat.bytes_published_total = out->bytes_published_total();
       ostat.frames_published_total = out->frames_published_total();
+      ostat.bytes_pushed = out->bytes_pushed();
       ostat.dropped_bytes = out->dropped_bytes();
       ostat.audio_dropped = out->audio_dropped();
       ostat.audio_frames = out->audio_frames();

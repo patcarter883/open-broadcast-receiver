@@ -200,6 +200,13 @@ public:
   {
     return bytes_published_total();
   }
+  // Bytes pushed into the output's appsrc(s): every decoded frame (raw, before
+  // encode) or transcoded/copied AU handed to the pipeline. Superset of what
+  // leaves the box and useful only for feed diagnostics; never socket egress.
+  [[nodiscard]] auto bytes_pushed() const -> uint64_t
+  {
+    return m_bytes_pushed.load(std::memory_order_relaxed);
+  }
   [[nodiscard]] auto dropped_bytes() const -> uint64_t
   {
     return (m_consumer >= 0) ? m_ring.dropped_bytes(m_consumer) : 0;
@@ -398,6 +405,9 @@ private:
   std::atomic<uint64_t> m_frames_published {0};
   sink_publish_counters m_publish_probe {&m_bytes_published,
                                          &m_frames_published};
+  // What the feed handed the output's appsrc(s): raw decoded frames before
+  // encode, or copied/transcoded AUs. A strict superset of the sink pad count.
+  std::atomic<uint64_t> m_bytes_pushed {0};
   std::atomic_bool m_audio_dropped {false};
   // Buffers the muxer's audio pad actually received. Caps on that pad are not
   // data; a linked pad with no buffers is how flvmux stalls without an error,
