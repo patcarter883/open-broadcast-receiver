@@ -300,8 +300,6 @@ decoder_state=""
 decoder_fallback=1
 out_running=0
 sink_bytes=0
-out_bytes_sent=0
-out_bytes_pushed=0
 feed_done=0
 deadline=$(( SECONDS + 40 ))
 
@@ -317,10 +315,6 @@ while [ "${SECONDS}" -lt "${deadline}" ]; do
   stats=$(curl -s -H "${AUTH_HEADER}" \
     "http://127.0.0.1:${CTRL_PORT}/stats" 2>/dev/null)
   [ "$(jq -r '.outputs[0].state // ""' <<<"${stats}" 2>/dev/null)" = "running" ] && out_running=1
-  sent=$(jq -r '.outputs[0].bytes_sent // 0' <<<"${stats}" 2>/dev/null)
-  pushed=$(jq -r '.outputs[0].bytes_pushed // 0' <<<"${stats}" 2>/dev/null)
-  [[ "${sent:-0}" =~ ^[0-9]+$ ]] && out_bytes_sent=${sent}
-  [[ "${pushed:-0}" =~ ^[0-9]+$ ]] && out_bytes_pushed=${pushed}
   [ "${out_running}" -eq 1 ] || \
     grep -aq "\[output local-rtmp\] running" "${RECEIVER_LOG}" && out_running=1
   sink=$(curl -s "http://127.0.0.1:${MTX_API_PORT}/v3/paths/list" 2>/dev/null)
@@ -353,6 +347,7 @@ final_stats=$(curl -s -H "${AUTH_HEADER}" \
 pub_bytes=$(jq -r '.outputs[0].bytes_published_total // 0' <<<"${final_stats}" 2>/dev/null)
 alias_bytes=$(jq -r '.outputs[0].bytes_sent // 0' <<<"${final_stats}" 2>/dev/null)
 pub_frames=$(jq -r '.outputs[0].frames_published_total // 0' <<<"${final_stats}" 2>/dev/null)
+pub_pushed=$(jq -r '.outputs[0].bytes_pushed // 0' <<<"${final_stats}" 2>/dev/null)
 rist_recv_total=$(jq -r '.rist.received_total // 0' <<<"${final_stats}" 2>/dev/null)
 rist_recv_window=$(jq -r '.rist.received_window // 0' <<<"${final_stats}" 2>/dev/null)
 rist_lost_total=$(jq -r '.rist.lost_total // 0' <<<"${final_stats}" 2>/dev/null)
@@ -372,18 +367,17 @@ echo "${decoder_line:-<no [decoder] counters line>}"
 echo
 echo "=== published ==="
 echo "[output local-rtmp] running=${out_running} sink_bytesReceived=${sink_bytes}"
-echo "bytes_published_total=${pub_bytes:-0} frames_published_total=${pub_frames:-0} bytes_sent=${alias_bytes:-0}"
+echo "bytes_published_total=${pub_bytes:-0} frames_published_total=${pub_frames:-0} bytes_sent=${alias_bytes:-0} bytes_pushed=${pub_pushed:-0}"
 echo "published/sink=${ratio}"
 echo "rist received_total=${rist_recv_total:-0} received_window=${rist_recv_window:-0} lost_total=${rist_lost_total:-0} lost_window=${rist_lost_window:-0}"
 echo "old formula (decoded raw frames + ingest) would have reported ${old_formula} bytes = $(awk -v o="${old_formula}" -v s="${sink_bytes}" 'BEGIN { if (s > 0) printf "%.2fx", o / s; else print "n/a" }') the sink"
-echo "[output local-rtmp] bytes_sent=${out_bytes_sent} bytes_pushed=${out_bytes_pushed}"
 
 # bytes_sent is the bytes the sink took on its sink pad; the socket's own
 # kernel counter (bytes_acked, which includes RTMP chunk and TCP/IP framing on
 # top of that payload) is the independent truth it has to track. No absolute
 # number: the assertion is the ratio between the two counters.
 socket_bytes=0
-if [ "${out_bytes_sent}" -gt 0 ]; then
+if [ "${alias_bytes:-0}" -gt 0 ]; then
   socket_bytes=$(ss -tin dst "${SINK_HOST}:${RTMP_PORT}" 2>/dev/null \
     | grep -o 'bytes_acked:[0-9]*' | cut -d: -f2 | awk '{s += $1} END {print s + 0}')
   [[ "${socket_bytes:-0}" =~ ^[0-9]+$ ]] || socket_bytes=0
@@ -447,13 +441,13 @@ fi
 if [ "${socket_bytes}" -eq 0 ]; then
   echo "FAIL: no bytes_acked for receiver -> ${SINK_HOST}:${RTMP_PORT} (cannot verify bytes_sent)" >&2
   fail=1
-elif ! awk -v sent="${out_bytes_sent}" -v sock="${socket_bytes}" \
+elif ! awk -v sent="${alias_bytes}" -v sock="${socket_bytes}" \
     'BEGIN { exit !(sent >= sock * 0.90 && sent <= sock * 1.02) }'; then
-  echo "FAIL: bytes_sent=${out_bytes_sent} does not track the publish socket's ${socket_bytes} bytes_acked" >&2
+  echo "FAIL: bytes_sent=${alias_bytes} does not track the publish socket's ${socket_bytes} bytes_acked" >&2
   fail=1
 fi
-if [ "${out_bytes_pushed}" -le "${out_bytes_sent}" ]; then
-  echo "FAIL: bytes_pushed=${out_bytes_pushed} is not above socket egress=${out_bytes_sent} on a transcode output" >&2
+if [ "${pub_pushed:-0}" -le "${alias_bytes:-0}" ]; then
+  echo "FAIL: bytes_pushed=${pub_pushed:-0} is not above sink-pad egress=${alias_bytes:-0} on a transcode output" >&2
   fail=1
 fi
 
@@ -465,5 +459,5 @@ if [ "${fail}" -ne 0 ]; then
   exit 1
 fi
 
-echo "GUARD OK: ${decoded} frames decoded by ${decoder_elem}, output running, sink received ${sink_bytes} bytes, /stats bytes_published_total=${pub_bytes:-0} (${ratio}x the sink; the residual is rtmp2sink's not-yet-flushed buffer and the sink's own framing), bytes_sent ${out_bytes_sent} tracked ${socket_bytes} socket bytes"
+echo "GUARD OK: ${decoded} frames decoded by ${decoder_elem}, output running, sink received ${sink_bytes} bytes, /stats bytes_published_total=${pub_bytes:-0} (${ratio}x the sink; the residual is rtmp2sink's not-yet-flushed buffer and the sink's own framing), bytes_sent=${alias_bytes} tracked ${socket_bytes} socket bytes, bytes_pushed=${pub_pushed:-0}"
 exit 0
