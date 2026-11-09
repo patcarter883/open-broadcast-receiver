@@ -176,11 +176,12 @@ receiver's `bytes_published_total` / `bytes_sent` is measured at the destination
 sink pad and tracks the server closely, but it cannot prove the bytes arrived, so
 the harness never trusts it alone. `bytes_pushed` counts pushes into the appsrc
 and has read healthy on a rig while the connection sat idle, so it is never
-evidence either. Likewise the muxer's sink pads are probed rather than the
-appsrc's caps, because an appsrc can be negotiated and accepting buffers while
-everything downstream of it is stalled. The two receiver counters are asserted
-against each other and against the server's `bytes_in` by ratio, so a transcode
-run cannot pass with raw decoded-frame volume standing in for egress.
+evidence either. Both receiver figures are asserted by ratio — `bytes_sent`
+against the publish socket's `bytes_acked`, `bytes_published_total` against the
+server's `bytes_in` — so a transcode run cannot pass with raw decoded-frame
+volume standing in for egress. Likewise the muxer's sink pads are probed rather
+than the appsrc's caps, because an appsrc can be negotiated and accepting
+buffers while everything downstream of it is stalled.
 
 ## What it drives
 

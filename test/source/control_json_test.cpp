@@ -72,6 +72,8 @@ auto main() -> int
     expect(stats["dropped_bytes"] == 5, "stats keeps byte counters");
     expect(stats["bytes_pushed"] == 98765,
            "stats reports appsrc pushes separately from socket egress");
+    expect(stats["bytes_sent"] != stats["bytes_pushed"],
+           "bytes_sent and bytes_pushed are distinct figures");
     expect(!stats.contains("type"), "stats omits type");
   }
 
