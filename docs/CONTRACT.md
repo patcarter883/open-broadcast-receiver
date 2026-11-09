@@ -417,8 +417,8 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
   },
   "ts_in": { "bytes_total": 238100000 },
   "outputs": [
-    { "id": "yt", "state": "running", "bytes_published_total": 18226344, "frames_published_total": 900, "bytes_sent": 18226344, "dropped_bytes": 0, "reconnects": 0 },
-    { "id": "fb", "state": "running", "bytes_published_total": 17900000, "frames_published_total": 898, "bytes_sent": 17900000, "dropped_bytes": 0, "reconnects": 0, "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } }
+    { "id": "yt", "state": "running", "bytes_published_total": 3129436, "frames_published_total": 902, "bytes_sent": 3129436, "bytes_pushed": 328538552, "dropped_bytes": 0, "reconnects": 0 },
+    { "id": "fb", "state": "running", "bytes_published_total": 1790000, "frames_published_total": 898, "bytes_sent": 1790000, "bytes_pushed": 310406400, "dropped_bytes": 0, "reconnects": 0, "transcode": { "codec": "h265", "encoder": "vah265enc", "frames_dropped": 12 } }
   ],
   "recording": { "active": true, "bytes": 912345678, "dropped_bytes": 0 }
 }
@@ -431,8 +431,12 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
   the destination's own framing.
 - **`outputs[].frames_published_total`.** Cumulative media buffers handed to that same sink pad (one per FLV tag /
   TS packet group, so it counts audio tags too when an audio branch is live).
-- **`outputs[].bytes_sent`.** Deprecated alias of `bytes_published_total` — identical value, one release of
-  compatibility. It no longer reports the appsrc-push sum.
+- **`outputs[].bytes_sent`.** The same sink-pad measure as `bytes_published_total`, serialised from that one value
+  under the name older agents read, so the two can never disagree. It is not the appsrc-push sum.
+- **`outputs[].bytes_pushed`.** Bytes pushed into that output's appsrc(s) — raw decoded frames for a transcode
+  output, compressed access units for a copy output. It is a feed-diagnostic superset of `bytes_published_total`
+  and never an egress counter: on the transcode path it runs to tens of times the socket's figure. The two are
+  reported under distinct names and must never be conflated.
 - **`rist.*_window` vs `rist.*_total`.** librist emits its receiver-flow counters as **per-interval deltas**, so a
   single reading is neither a window nor a total. The receiver sums them into two figures:
   - `received_total`, `recovered_total`, `recovered_one_retry_total`, `lost_total` — **cumulative since the
@@ -454,7 +458,6 @@ domain). The handler reads atomics/snapshots only; it MUST NOT take pipeline loc
 - `ring_size_bytes`: the fan-out ring chosen at `/start` — `clamp(10 s × ingest.bandwidth, 16 MiB, 256 MiB)`.
 - `outputs[].dropped_bytes`: ring drop-oldest accounting for that consumer (slow-output back-pressure never
   reaches ingest). `recording` appears when a recorder exists.
-- `ts_in.bytes_total`: total ingest payload bytes (the agent derives bitrate from deltas).
 
 ---
 

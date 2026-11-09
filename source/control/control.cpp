@@ -394,9 +394,11 @@ auto output_stat_json(const output_stat& stat, bool stats_view) -> std::string
   } else {
     obj["bytes_published_total"] = stat.bytes_published_total;
     obj["frames_published_total"] = stat.frames_published_total;
-    // Deprecated alias: same value, so nothing keeps reading the old inflated
-    // appsrc-push figure.
+    // Same measure under the name older readers use.
     obj["bytes_sent"] = stat.bytes_published_total;
+    // The feed's appsrc volume, which on a transcode output is raw decoded
+    // frames and therefore larger than any socket count.
+    obj["bytes_pushed"] = stat.bytes_pushed;
     obj["dropped_bytes"] = stat.dropped_bytes;
     obj["reconnects"] = stat.reconnects;
   }

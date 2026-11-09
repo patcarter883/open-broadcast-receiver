@@ -26,10 +26,13 @@
 #   * decode progress   — the decoder's own staged counters in its log lines
 #                         (in chunks / demux / decoded / sink / state).
 #   * publish           — the RTMP SERVER's byte counter for the path
-#                         (MediaMTX /v3/paths/list bytesReceived). The output's
-#                         own `bytes_sent` aliases bytes_published_total and is
-#                         measured at the destination sink pad, but only the
-#                         server's counter proves the bytes arrived.
+#                         (MediaMTX /v3/paths/list bytesReceived), which cannot
+#                         be inflated by the receiver. The output's own
+#                         `bytes_sent` and `bytes_published_total` are the same
+#                         sink-pad measurement, while `bytes_pushed` is the NV12
+#                         volume fed to the video appsrc, which grows even when
+#                         nothing reaches RTMP; only the server's counter proves
+#                         the bytes arrived.
 #   * stream readback   — the stream is pulled back OUT of the RTMP server and
 #                         probed with `ffprobe -count_packets`: real packet
 #                         counts for h264 video, plus for aac audio when the

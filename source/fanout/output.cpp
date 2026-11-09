@@ -130,9 +130,9 @@ auto count_buffer_probe(GstPad* /*pad*/, GstPadProbeInfo* /*info*/, gpointer dat
 }
 
 // Counts what the destination sink actually takes: buffer bytes and buffer
-// count at the protocol element's sink pad. The appsrc push count upstream of
-// the encoder says nothing about egress — on a transcode output it counts raw
-// decoded frames — so the publish figure is measured here.
+// count at the protocol element's sink pad. These are the bytes the sink is
+// handed, after the muxer (container framing, not raw decoded frames) and
+// before the protocol's own chunk/TCP overhead.
 auto count_published_probe(GstPad* /*pad*/,
                            GstPadProbeInfo* info,
                            gpointer data) -> GstPadProbeReturn
@@ -1565,6 +1565,7 @@ auto output::run_once() -> bool
       set_last_error("appsrc rejected buffer (pipeline flushing)");
       return true;
     }
+    m_bytes_pushed.fetch_add(got, std::memory_order_relaxed);
   }
   return true;  // stopping
 }
@@ -1880,6 +1881,7 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
         {
           break;
         }
+        m_bytes_pushed.fetch_add(agot, std::memory_order_relaxed);
       }
     }
   }
@@ -1917,6 +1919,7 @@ auto output::feed_transcode(bool& video_caps_set) -> bool
       return false;
     }
     ++m_feed.pushed;
+    m_bytes_pushed.fetch_add(vgot, std::memory_order_relaxed);
     if (m_first_video_push == std::chrono::steady_clock::time_point {}) {
       m_first_video_push = std::chrono::steady_clock::now();
     }
@@ -1960,6 +1963,7 @@ auto output::feed_es_audio() -> bool
       set_last_error("audio appsrc rejected buffer (pipeline flushing)");
       return false;
     }
+    m_bytes_pushed.fetch_add(got, std::memory_order_relaxed);
   }
 }
 
@@ -2009,6 +2013,7 @@ auto output::feed_es_copy() -> bool
     return false;
   }
   ++m_feed.pushed;
+  m_bytes_pushed.fetch_add(got, std::memory_order_relaxed);
   if (m_first_video_push == std::chrono::steady_clock::time_point {}) {
     m_first_video_push = std::chrono::steady_clock::now();
   }

@@ -11,7 +11,12 @@
 //
 // Why the server's counter and not the receiver's publish counters: the sink pad
 // proves buffers left the pipeline, but only the server proves they arrived.
-// output::bytes_published_total() measures the same pad, so the two should agree.
+// bytes_sent and bytes_published_total measure that same pad, so both are
+// asserted against the server's count; bytes_pushed counts pushes into the
+// appsrc and reads healthy while nothing leaves the box — publish accepted,
+// egress flat, no GStreamer error. The muxer's sink pads are probed for the same
+// reason an appsrc can be caps'd and accepting buffers while the branch
+// downstream of it is stalled.
 //
 // Modes (all use the production templates; nothing here rebuilds a pipeline by
 // hand):
@@ -55,6 +60,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1734,6 +1740,10 @@ auto main(int argc, char** argv) -> int
   const std::string encoder = out.encoder_name();
   const std::uint64_t bytes_published = out.bytes_published_total();
   const std::uint64_t frames_published = out.frames_published_total();
+  const std::uint64_t bytes_sent = out.bytes_sent();
+  const std::uint64_t bytes_pushed = out.bytes_pushed();
+  const long long server_delta =
+      (last_server ? *last_server : 0) - *baseline.bytes_in;
   const int64_t reconnects = static_cast<int64_t>(out.reconnects());
   const char* state_name = out.state_name();
   // Decode-stage provenance, sampled while the stage is still running.
@@ -1757,6 +1767,33 @@ auto main(int argc, char** argv) -> int
   }
   bool ok = server_grew;
   std::string mode_failure;
+  // bytes_sent has to be socket egress. The RTMP server's own byte count is the
+  // external truth: the two count the same container payload, so they agree to
+  // within protocol framing. bytes_published_total serialises from the same
+  // sink-pad measure and must equal it, while bytes_pushed (raw decoded frames
+  // on a transcode run) must stay above both, which is what proves the two are
+  // not conflated.
+  if (ok && server_delta > 0) {
+    const double rel = std::abs(static_cast<double>(bytes_sent)
+                                - static_cast<double>(server_delta))
+        / static_cast<double>(server_delta);
+    if (bytes_sent == 0 || rel > 0.10) {
+      ok = false;
+      mode_failure = std::format(
+          "bytes_sent {} does not track the server's {} bytes_in ({:.1f}% off)",
+          bytes_sent, server_delta, rel * 100.0);
+    } else if (bytes_published != bytes_sent) {
+      ok = false;
+      mode_failure = std::format(
+          "bytes_published_total {} disagrees with bytes_sent {}", bytes_published,
+          bytes_sent);
+    } else if (bytes_pushed < bytes_sent) {
+      ok = false;
+      mode_failure = std::format(
+          "bytes_pushed {} is below socket egress {} on this output",
+          bytes_pushed, bytes_sent);
+    }
+  }
   if (ok && server_grew && has_audio(opts.run_mode) && mux_audio_final == 0) {
     ok = false;
     mode_failure = "audio never reached the muxer";
@@ -1915,9 +1952,6 @@ auto main(int argc, char** argv) -> int
     dec.reset();
   }
 
-  const long long server_delta =
-      (last_server ? *last_server : 0) - *baseline.bytes_in;
-
   std::printf("\n");
   std::printf("encoder              %s\n",
               encoder.empty() ? "(copy-only)" : encoder.c_str());
@@ -1984,6 +2018,10 @@ auto main(int argc, char** argv) -> int
   std::printf("output published     %llu bytes in %llu sink buffers\n",
               static_cast<unsigned long long>(bytes_published),
               static_cast<unsigned long long>(frames_published));
+  std::printf("output bytes_sent    %llu  (sink pad egress)\n",
+              static_cast<unsigned long long>(bytes_sent));
+  std::printf("output bytes_pushed  %llu  (appsrc pushes, not evidence)\n",
+              static_cast<unsigned long long>(bytes_pushed));
   std::printf("audio pad            dropped=%s caps=%s\n",
               audio_dropped ? "yes" : "no",
               audio_caps.empty() ? "(none)" : audio_caps.c_str());
