@@ -459,10 +459,10 @@ auto plan_slate(const slate_request& req,
   // 40 px from the right edge. gdkpixbufoverlay reads a negative offset-x as
   // "from the right", so the layout does not need the image's pixel width.
   std::string overlays;
-  // A 40 px inset is a sensible fraction of 1080 lines and a third of a 240-line
-  // canvas, so the inset and the asset both scale with the picture. The box is a
-  // sixth of the frame: the slate is branding, not a picture.
-  const int inset = std::max(8, req.height / 27);
+  // The inset is a fixed 40 px, as every slate before this one drew it; the
+  // assets and the caption scale, the margin does not. The box is a sixth of
+  // the frame: the slate is branding, not a picture.
+  constexpr int inset = 40;
   const int box_w = std::max(16, req.width / 6);
   const int box_h = std::max(16, req.height / 6);
   if (!req.logo_path.empty()) {
@@ -480,12 +480,11 @@ auto plan_slate(const slate_request& req,
       "videotestsrc pattern=black num-buffers={} ! "
       "video/x-raw,width={},height={},framerate={}/1,format=I420 ! "
       "{}"
-      "textoverlay text=\"{}\" font-desc=\"Sans {}\" halignment=center "
+      "textoverlay text=\"{}\" font-desc=\"Sans 48\" halignment=center "
       "valignment=bottom ! "
       "videoconvert ! video/x-raw,format=NV12 ! "
       "{} ! {} ! {} ! filesink location=\"{}\"",
       2 * req.fps, req.width, req.height, req.fps, overlays,
-      std::max(10, req.height / 24),
       escape_pipeline_value(req.text),
       encoder_fragment(plan.encoder, req.bitrate_kbps),
       parser_props, slate_parse_caps(cod),
