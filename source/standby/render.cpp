@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -294,6 +295,97 @@ auto slate_cache_key(const slate_request& req) -> std::string
   return key.substr(0, 16);
 }
 
+// The pixel size of an overlay asset, read from its header. gdkpixbufoverlay
+// draws an image at its native size unless overlay-width/height are set, so a
+// 1080-square brand on a small canvas covered the frame. Only the two formats
+// the slate ships are handled; an unknown file is reported as absent and the
+// overlay keeps its native size rather than being distorted.
+bool image_pixel_size(const std::string& path, int& width, int& height)
+{
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return false;
+  }
+  unsigned char head[32] {};
+  in.read(reinterpret_cast<char*>(head), sizeof head);
+  const auto got = in.gcount();
+  if (got < 24) {
+    return false;
+  }
+  // PNG: 8-byte signature, then IHDR length/type, then two big-endian u32.
+  if (head[0] == 0x89 && head[1] == 'P' && head[2] == 'N' && head[3] == 'G') {
+    auto be32 = [](const unsigned char* p) {
+      return (static_cast<int>(p[0]) << 24) | (static_cast<int>(p[1]) << 16)
+          | (static_cast<int>(p[2]) << 8) | static_cast<int>(p[3]);
+    };
+    width = be32(head + 16);
+    height = be32(head + 20);
+    return width > 0 && height > 0;
+  }
+  // JPEG: walk the marker chain to a start-of-frame segment.
+  if (head[0] == 0xFF && head[1] == 0xD8) {
+    in.clear();
+    in.seekg(2);
+    while (in) {
+      unsigned char marker[2] {};
+      in.read(reinterpret_cast<char*>(marker), 2);
+      if (!in || marker[0] != 0xFF) {
+        break;
+      }
+      const unsigned char id = marker[1];
+      if (id == 0xD8 || id == 0x01 || (id >= 0xD0 && id <= 0xD7)) {
+        continue;
+      }
+      unsigned char len_bytes[2] {};
+      in.read(reinterpret_cast<char*>(len_bytes), 2);
+      if (!in) {
+        break;
+      }
+      const int len = (static_cast<int>(len_bytes[0]) << 8) | len_bytes[1];
+      if (len < 2) {
+        break;
+      }
+      const bool sof = id >= 0xC0 && id <= 0xCF && id != 0xC4 && id != 0xC8
+          && id != 0xCC;
+      if (sof) {
+        unsigned char sof_head[5] {};
+        in.read(reinterpret_cast<char*>(sof_head), sizeof sof_head);
+        if (in) {
+          height = (static_cast<int>(sof_head[0]) << 8) | sof_head[1];
+          width = (static_cast<int>(sof_head[2]) << 8) | sof_head[3];
+          return width > 0 && height > 0;
+        }
+        break;
+      }
+      in.seekg(len - 2, std::ios::cur);
+    }
+  }
+  return false;
+}
+
+// An overlay scaled to fit a box, aspect preserved. Returns an empty string when
+// the size is unknown, which leaves the element at its native size.
+std::string scaled_overlay(const std::string& path, int offset_x, int offset_y,
+                           int box_width, int box_height)
+{
+  int width = 0;
+  int height = 0;
+  std::string sizing;
+  if (image_pixel_size(path, width, height)) {
+    const double fit = std::min(static_cast<double>(box_width) / width,
+                                static_cast<double>(box_height) / height);
+    const int scaled_w = std::max(1, static_cast<int>(width * fit));
+    const int scaled_h = std::max(1, static_cast<int>(height * fit));
+    sizing = std::format(" overlay-width={} overlay-height={}", scaled_w,
+                         scaled_h);
+  }
+  return std::format(
+      "gdkpixbufoverlay location=\"{}\" offset-x={} offset-y={}{} ! ",
+      escape_pipeline_value(path), offset_x, offset_y, sizing);
+}
+
+
+  
 auto plan_slate(const slate_request& req,
                 const slate_element_present_fn& present, std::string& err)
     -> std::optional<slate_plan>
@@ -348,7 +440,7 @@ auto plan_slate(const slate_request& req,
     }
   }
 
-  // The brand image is optional by design: a session may have no branding, and
+// The brand image is optional by design: a session may have no branding, and
   // a path that was configured but not uploaded must not cost the session its
   // slate. Anything that is not a readable regular file is treated as absent.
   if (!req.brand_path.empty()) {
@@ -367,14 +459,17 @@ auto plan_slate(const slate_request& req,
   // 40 px from the right edge. gdkpixbufoverlay reads a negative offset-x as
   // "from the right", so the layout does not need the image's pixel width.
   std::string overlays;
+  // A 40 px inset is a sensible fraction of 1080 lines and a third of a 240-line
+  // canvas, so the inset and the asset both scale with the picture. The box is a
+  // sixth of the frame: the slate is branding, not a picture.
+  const int inset = std::max(8, req.height / 27);
+  const int box_w = std::max(16, req.width / 6);
+  const int box_h = std::max(16, req.height / 6);
   if (!req.logo_path.empty()) {
-    overlays += std::format("gdkpixbufoverlay location=\"{}\" offset-x=40 offset-y=40 ! ",
-                            escape_pipeline_value(req.logo_path));
+    overlays += scaled_overlay(req.logo_path, inset, inset, box_w, box_h);
   }
   if (plan.brand_overlay) {
-    overlays += std::format(
-        "gdkpixbufoverlay location=\"{}\" offset-x=-40 offset-y=40 ! ",
-        escape_pipeline_value(req.brand_path));
+    overlays += scaled_overlay(req.brand_path, -inset, inset, box_w, box_h);
   }
 
   // videoconvert + NV12 is not cosmetic: the VA encoders' only system-memory
@@ -385,11 +480,12 @@ auto plan_slate(const slate_request& req,
       "videotestsrc pattern=black num-buffers={} ! "
       "video/x-raw,width={},height={},framerate={}/1,format=I420 ! "
       "{}"
-      "textoverlay text=\"{}\" font-desc=\"Sans 48\" halignment=center "
+      "textoverlay text=\"{}\" font-desc=\"Sans {}\" halignment=center "
       "valignment=bottom ! "
       "videoconvert ! video/x-raw,format=NV12 ! "
       "{} ! {} ! {} ! filesink location=\"{}\"",
       2 * req.fps, req.width, req.height, req.fps, overlays,
+      std::max(10, req.height / 24),
       escape_pipeline_value(req.text),
       encoder_fragment(plan.encoder, req.bitrate_kbps),
       parser_props, slate_parse_caps(cod),
