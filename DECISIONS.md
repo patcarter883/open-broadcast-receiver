@@ -525,3 +525,45 @@ total; exposing only one number forced every consumer to guess, and the node age
 muxer's src pad: identical for RTMP but skips any byte the sink itself adds or drops, and is upstream of the
 protocol exchange. Reporting only a cumulative RIST figure: the OOB ABR signal and the quality ratio are
 window-scoped, so both shapes are needed.
+
+---
+
+## 24. Trunk ingest: connect mode, and the relay as a mode of this binary
+
+**Choice.** `ingest.connect_url` (CLI `--connect-url`, env `OBR_TRUNK_URL`) makes the receiver **dial** a RIST
+peer instead of binding a listener, and `--relay-in`/`--relay-out` make the same binary a packet-pump relay that
+binds both legs. A connect-mode ingest is mutually exclusive with a non-default listen URL and with an explicit
+`--rist-port`; `validate_ingest` refuses the combination rather than half-applying it.
+
+**Rationale.** A BYON venue and a hosted node are each behind NAT, so neither can dial the other; the venue's
+media has to cross a relay that both sides can reach. The relay's **out** leg is a bound (`@`) sender and the
+node's receiver dials it, which is the one shape that needs no signalling and no endpoint exchange: a listening
+sender learns its peer from the first inbound packet, so the relay never needs to know the node's address. The
+relay is part of the receiver image rather than a second container because it shares the pinning, the librist
+build and the entrypoint contract, and because a second image is a second thing to sign, ship and version-skew.
+
+**Verified on this box (librist 0.2.20), three hops (ristsender → relay → connect-mode receiver):**
+
+- `timing-mode=0` (SOURCE) holds on the three-hop chain — no ARRIVAL assertion, no SIGABRT, and no reordering.
+  It is re-measured, not inherited from the two-hop finding (§ the comment at `lib.cpp:513`).
+- SRP: the **connecting** peer authenticates with URL parameters `username=`/`password=` (librist's
+  `RIST_URL_PARAM_SRP_USERNAME`/`_PASSWORD`); the `ristsrppasswd` **verifier file** belongs to the listening
+  sender. Reading that file in connect mode is the wrong mechanism and does not authenticate.
+- The verifier file's 5th field is the credential's hash version (0 = librist's pre-0.2.16 combined hash,
+  1 = the RFC 5054-correct hash), and the 4th field is the constant line-format marker `3`. Serving the wrong
+  line fails the handshake outright (`[EAP-SRP] Authentication failed`), so the lookup serves the version the
+  peer's handshake uses and reports it back (librist derives `eapversion3` from it).
+- `rist_parse_address2(url, NULL)` is the only correct way to seed a `rist_peer_config`: a zero-initialised
+  struct is **not** the defaults (it means `bufmin=0`/`bufmax=0` and `rttmin=rttmax=3`, i.e. recovery effectively
+  off). Measured: with zeroed configs the relay accepted the venue's RIST session and delivered zero payload;
+  with library defaults the same chain delivered every packet.
+
+**Harness.** `test/harness/relay_trunk_e2e.sh` feeds numbered 188-byte packets through ristsender → relay →
+`connect_ingest_probe` (the shipped `rist_receive` in connect mode) and asserts that, after the handshake, the
+sequence set is contiguous: 600 sent, 600 relayed, 600 received, zero gaps, zero duplicates. It also runs a
+wrong-password control and requires zero bytes and an `Authentication failed`, so a broken auth path cannot pass.
+
+**Rejected.** Making the node's receiver the listener (impossible behind NAT, and it was the original bug this
+work exists to fix). Restamping sequence numbers in the relay: hides venue loss from the far end and makes the
+receiver's own loss accounting meaningless. A separate `rist2rist`-based sidecar container: an extra image, an
+extra process to supervise, and no shared config contract.

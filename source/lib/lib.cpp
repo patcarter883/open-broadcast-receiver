@@ -39,6 +39,9 @@ constexpr int k_rtt_max_max = 60000;
 constexpr int k_reorder_max = 10000;
 constexpr int k_default_rtmp_port = 1935;
 constexpr int k_default_rtmps_port = 443;
+// The listen URL an ingest config carries when nobody configured one. A
+// connect-mode ingest must leave it exactly here (validate_ingest).
+constexpr std::string_view k_default_listen_url = "rist://@[::]:5000";
 
 auto fail(std::string code,
           std::string field,
@@ -72,6 +75,73 @@ auto validate_ingest(const ingest_config& ing) -> validation_result
   }
   if (ing.reorder_buffer < 0 || ing.reorder_buffer > k_reorder_max) {
     return fail("out_of_range", "ingest.reorder_buffer", "must be 0..10000");
+  }
+  // Ingest direction. A connect-mode ingest dials a peer and binds nothing, so
+  // the `rist://@` listener rule (and the "must bind" spelling) does not apply
+  // to it — and applying both would be a genuine config error, not a fallback:
+  // a receiver that dials AND binds can look healthy while the media arrives on
+  // the leg nobody is watching.
+  if (!ing.connect_url.empty()) {
+    if (!ing.rist_listen.empty() && ing.rist_listen != k_default_listen_url) {
+      return fail("bad_url",
+                  "ingest.connect_url",
+                  "connect mode never binds: ingest.rist_listen must be left "
+                  "at its default");
+    }
+    if (!ing.connect_url.starts_with("rist://")
+        && !ing.connect_url.starts_with("rist6://"))
+    {
+      return fail("bad_url",
+                  "ingest.connect_url",
+                  "must be a rist:// or rist6:// URL");
+    }
+    if (ing.connect_url.find('@') != std::string::npos) {
+      return fail("bad_url",
+                  "ingest.connect_url",
+                  "'@' means 'this end binds'; a connect-mode URL must not "
+                  "contain it");
+    }
+    std::string host;
+    int port = 0;
+    if (!parse_authority(ing.connect_url, host, port) || host.empty()) {
+      return fail("bad_url",
+                  "ingest.connect_url",
+                  "must name host:port to dial");
+    }
+    // SRP is a pair or nothing. Half a pair cannot be attempted (librist needs
+    // both to answer a challenge) and silently sending one would look like the
+    // relay dropping us.
+    if (ing.srp_username.empty() != ing.srp_password.empty()) {
+      return fail("bad_url",
+                  "ingest.srp_username",
+                  "SRP needs both a username and a password");
+    }
+    if (!ing.srp_username.empty()) {
+      const auto has_control = [](std::string_view value) -> bool {
+        return std::ranges::any_of(
+            value,
+            [](char chr) -> bool
+            { return static_cast<unsigned char>(chr) < 0x20; });
+      };
+      // Only control characters are refused outright. Everything else is
+      // percent-encoded on the way into the URL (see build_connect_url): a
+      // credential containing '&' or '=' must never be able to forge another
+      // RIST parameter — that would authenticate as a different user or quietly
+      // retune the link — and a raw newline could split a log line.
+      if (has_control(ing.srp_username) || has_control(ing.srp_password)) {
+        return fail("bad_url",
+                    "ingest.srp_username",
+                    "SRP credentials must not contain control characters");
+      }
+    }
+    return {};
+  }
+  if (!ing.srp_username.empty() || !ing.srp_password.empty()) {
+    // Listen mode authenticates the CALLER with a PSK or an SRP server file; the
+    // client-side SRP pair has nothing to attach to. Refuse rather than ignore.
+    return fail("bad_url",
+                "ingest.srp_username",
+                "SRP client credentials need ingest.connect_url (trunk mode)");
   }
   if (!ing.rist_listen.starts_with("rist://@")
       && !ing.rist_listen.starts_with("rist6://@"))
@@ -528,6 +598,82 @@ auto build_listener_url(const ingest_config& ingest) -> std::string
       ingest.rtt_min,
       ingest.rtt_max,
       ingest.reorder_buffer);
+}
+
+namespace
+{
+// RFC 3986 percent-encoding of everything outside the unreserved set.
+//
+// librist's URL-parameter parser (udpsocket_parse_url_parameters) splits on '&'
+// and the first '=' and does NOT unescape, so this is a SAFETY boundary, not a
+// transport encoding: its job is to stop a credential from injecting parameters
+// (`password=x&username=admin`, `password=x&timing-mode=2`). A credential whose
+// value actually needs these characters will be presented verbatim as
+// percent-escapes and fail authentication loudly — which is the correct
+// outcome; the alternative is authenticating as somebody else.
+auto url_encode(std::string_view value) -> std::string
+{
+  constexpr std::string_view k_unreserved =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  std::string out;
+  out.reserve(value.size());
+  for (const char chr : value) {
+    if (k_unreserved.find(chr) != std::string_view::npos) {
+      out.push_back(chr);
+      continue;
+    }
+    out += std::format("%{:02X}", static_cast<unsigned char>(chr));
+  }
+  return out;
+}
+}  // namespace
+
+auto ingest_is_connect_mode(const ingest_config& ingest) noexcept -> bool
+{
+  return !ingest.connect_url.empty();
+}
+
+auto build_connect_url(const ingest_config& ingest) -> std::string
+{
+  if (ingest.connect_url.empty()) {
+    return {};
+  }
+  // Base = the configured connect URL up to the first '?', i.e. scheme +
+  // "host:port" with NO '@'. '@' is a direction marker ("this end binds"), and
+  // librist's parser would turn a connect-mode receiver into a listener that
+  // silently waits for a peer nobody dials — exactly the half-bound failure
+  // this mode exists to avoid. validate_ingest rejects '@' outright; stripping
+  // it here as well would hide a bad config instead of refusing it.
+  std::string base = ingest.connect_url.substr(0, ingest.connect_url.find('?'));
+  // Same tuning block as the listener URL, on purpose: the trunk carries the
+  // same flow the direct path does, and a distinct set of recovery parameters
+  // per direction is a second thing to keep in sync. timing-mode=0 (SOURCE) is
+  // NOT cargo-culted from the two-hop finding — it was re-measured on the
+  // three-hop chain (venue sender -> relay -> this receiver). ARRIVAL (1)
+  // asserts packet_time < next->packet_time over *retransmitted* packets and
+  // the extra hop only adds retries that violate it; SOURCE rides the
+  // monotonic timestamp librist stamps and preserved across the relay.
+  std::string url = std::format(
+      "{}?bandwidth={}&buffer-min={}&buffer-max={}&rtt-min={}&rtt-max={}&"
+      "reorder-buffer={}&timing-mode=0",
+      base,
+      ingest.bandwidth,
+      ingest.buffer_min,
+      ingest.buffer_max,
+      ingest.rtt_min,
+      ingest.rtt_max,
+      ingest.reorder_buffer);
+  // SRP client credentials, in librist's own parameter names (`username`,
+  // `password`) — NOT an invented `srp-username`. rist_parse_address2 reads
+  // exactly these two (RIST_URL_PARAM_SRP_USERNAME/_PASSWORD) into
+  // rist_peer_config, and the trunk's out- leg authenticates with the relay's
+  // ristsrppasswd file, so a connect-mode receiver must present them.
+  if (!ingest.srp_username.empty() && !ingest.srp_password.empty()) {
+    url += std::format("&username={}&password={}",
+                       url_encode(ingest.srp_username),
+                       url_encode(ingest.srp_password));
+  }
+  return url;
 }
 
 auto is_pipeline_safe(std::string_view str) noexcept -> bool

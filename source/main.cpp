@@ -30,6 +30,7 @@
 #include "fanout/ring.h"
 #include "lib/lib.h"
 #include "receive/receive.h"
+#include "relay/relay.h"
 #include "standby/controller.h"
 #include "standby/render.h"
 #include "standby/stage.h"
@@ -54,6 +55,26 @@ auto print_usage(const char* argv0) -> void
       << "Usage: " << argv0 << " [options]\n\n"
       << "  --control-port <port>   HTTP control port (default 8080)\n"
       << "  --rist-port <port>      RIST listen port (default 5000)\n"
+      << "  --connect-url <url>     TRUNK ingest: DIAL this rist://host:port\n"
+      << "                          instead of listening. Implies no listen\n"
+      << "                          socket; conflicts with a non-default\n"
+      << "                          --rist-port (connect mode never binds)\n"
+      << "  --srp-user <user>       TRUNK ingest: SRP username for the relay's\n"
+      << "                          authenticated sender leg (needs --srp-pass)\n"
+      << "  --srp-pass <pass>       TRUNK ingest: SRP password (rides the RIST\n"
+      << "                          URL as username=/password=, librist's only\n"
+      << "                          client-side SRP channel; never logged)\n"
+      << "  --relay-in <url>        RELAY mode: RIST leg this process binds and\n"
+      << "                          receives on (must contain '@'). Choosing it\n"
+      << "                          replaces the receiver: no control port, no\n"
+      << "                          fan-out, no GStreamer — packets are pumped\n"
+      << "                          to --relay-out with their sequence intact\n"
+      << "  --relay-out <url>       RELAY mode: RIST leg this process binds and\n"
+      << "                          sends on (must contain '@')\n"
+      << "  --relay-srp <path>      RELAY mode: ristsrppasswd file authenticating\n"
+      << "                          receivers of the out leg\n"
+      << "  --relay-secret <hex>    RELAY mode: AES shared secret for the out leg\n"
+      << "  --relay-aes <128|256>   RELAY mode: out-leg AES key size (256)\n"
       << "  --bind <host>           HTTP bind address (default 127.0.0.1;\n"
       << "                          non-loopback binds REQUIRE a token or the\n"
       << "                          explicit --allow-unauthenticated flag)\n"
@@ -176,7 +197,19 @@ struct session
 
 auto main(int argc, char** argv) -> int
 {
-  gst_init(&argc, &argv);
+  // Relay mode must not run gst_init: it initialises the whole media stack and
+  // GStreamer's own argv handling in a process that will never build a pipeline, and
+  // it strips gst-specific flags from argv before our parser sees them. Detected
+  // by pre-scan so the receiver path keeps gst_init exactly where it was.
+  const bool relay_requested = std::any_of(
+      argv + 1, argv + argc, [](const char* arg) noexcept -> bool {
+        return arg != nullptr
+            && (std::string_view(arg) == "--relay-in"
+                || std::string_view(arg) == "--relay-out");
+      });
+  if (!relay_requested) {
+    gst_init(&argc, &argv);
+  }
 
 #ifndef NDEBUG
   // Debug builds compile the vendored librist WITHOUT -DNDEBUG, which re-arms
@@ -217,6 +250,14 @@ auto main(int argc, char** argv) -> int
   int standby_force = -1;
   std::string standby_brand;  // empty = use the body's standby.brand_image
   std::string standby_assets = "/usr/local/share/open-broadcast";
+  // Trunk ingest: dial this peer instead of binding. Empty = listen (default).
+  std::string connect_url;
+  std::string srp_user;  // SRP client pair for the trunk (relay's sender leg)
+  std::string srp_pass;
+  bool rist_port_explicit = false;
+  // Relay mode. Any --relay-* flag takes the process out of receiver mode
+  // entirely (see the branch after parsing).
+  relay::relay_config relay_cfg;
 
   for (int idx = 1; idx < argc; ++idx) {
     const std::string_view arg = argv[idx];
@@ -249,6 +290,51 @@ auto main(int argc, char** argv) -> int
       if (!next(rist_port)) {
         return 2;
       }
+      rist_port_explicit = true;
+    } else if (arg == "--connect-url") {
+      if (!next_str(connect_url)) {
+        return 2;
+      }
+    } else if (arg == "--srp-user") {
+      if (!next_str(srp_user)) {
+        return 2;
+      }
+    } else if (arg == "--srp-pass") {
+      if (!next_str(srp_pass)) {
+        return 2;
+      }
+    } else if (arg == "--relay-in") {
+      if (!next_str(relay_cfg.in_url)) {
+        return 2;
+      }
+    } else if (arg == "--relay-out") {
+      if (!next_str(relay_cfg.out_url)) {
+        return 2;
+      }
+    } else if (arg == "--relay-srp") {
+      if (!next_str(relay_cfg.srp_path)) {
+        return 2;
+      }
+    } else if (arg == "--relay-secret") {
+      if (!next_str(relay_cfg.secret)) {
+        return 2;
+      }
+    } else if (arg == "--relay-aes") {
+      int val = 0;
+      if (idx + 1 >= argc) {
+        std::cerr << "Missing value for --relay-aes\n";
+        return 2;
+      }
+      try {
+        val = std::stoi(argv[++idx]);
+      } catch (...) {
+        val = 0;
+      }
+      if (val != 128 && val != 256) {
+        std::cerr << "--relay-aes must be 128 or 256\n";
+        return 2;
+      }
+      relay_cfg.aes = val;
     } else if (arg == "--bind") {
       if (!next_str(bind_host)) {
         return 2;
@@ -350,6 +436,42 @@ auto main(int argc, char** argv) -> int
     }
   }
 
+  // ---- Relay mode --------------------------------------------------------
+  // A relay is not a receiver with a different URL: it has no control plane, no
+  // fan-out, no standby and no GStreamer, and it must survive a venue's sender
+  // coming and going without a session lifecycle. Branching here keeps all of
+  // that out of main's session machinery (and keeps gst_init from running in a
+  // process that will never touch a pipeline).
+  if (!relay_cfg.in_url.empty() || !relay_cfg.out_url.empty()) {
+    std::string relay_err;
+    if (!relay::validate_relay_config(relay_cfg, relay_err)) {
+      std::cerr << "FATAL: " << relay_err << "\n";
+      return 2;
+    }
+    // The flags are contradictory, not complementary: relay mode replaces the
+    // receiver, so an operator who passed both gets told rather than silently
+    // getting the relay (their outputs would never start).
+    if (!connect_url.empty() || !srp_user.empty() || !srp_pass.empty()
+        || rist_port_explicit || !token.empty()) {
+      std::cerr << "FATAL: --relay-in/--relay-out replace the receiver; do not "
+                   "combine them with --connect-url, --srp-user, --srp-pass, "
+                   "--rist-port or --token\n";
+      return 2;
+    }
+    std::cerr << "relay: starting " << relay_cfg.in_url << " -> "
+              << relay_cfg.out_url << "\n";
+    return relay::run_relay(relay_cfg, &stderr_log);
+  }
+
+  // Trunk (connect) ingest: a receiver that dials instead of binding. Refuse
+  // the "both directions" config here, at the flag layer, for the same reason
+  // validate_ingest does — an explicit --rist-port alongside --connect-url is a
+  // leftover from the listen form, not a second leg.
+  if (!connect_url.empty() && rist_port_explicit) {
+    std::cerr << "FATAL: --connect-url never binds; drop --rist-port\n";
+    return 2;
+  }
+
   // M1.1: an empty token on a non-loopback bind is an internet-exposed
   // unauthenticated control plane — refuse to start unless the operator
   // explicitly demanded it.
@@ -440,7 +562,8 @@ auto main(int argc, char** argv) -> int
   bool brand_warned = false;
 
   const auto do_start = [&ctx, &lifecycle, &sess, &teardown, &egress, &opts,
-                         &logo_warned, &brand_warned, rist_port, buffer_min,
+                         &logo_warned, &brand_warned, rist_port, connect_url,
+                         srp_user, srp_pass, buffer_min,
                          buffer_max, rtt_min, rtt_max, reorder_buffer,
                          session_timeout, standby_force, standby_brand,
                          standby_assets](receiver_config& cfg,
@@ -454,7 +577,21 @@ auto main(int argc, char** argv) -> int
     // The operator-chosen --rist-port and recovery flags are authoritative
     // for the listen socket and retransmission window. Apply up front so
     // idempotency compares the *effective* config.
-    cfg.ingest.rist_listen = "rist://@[::]:" + std::to_string(rist_port);
+    if (connect_url.empty()) {
+      cfg.ingest.rist_listen = "rist://@[::]:" + std::to_string(rist_port);
+      cfg.ingest.connect_url.clear();
+      cfg.ingest.srp_username.clear();
+      cfg.ingest.srp_password.clear();
+    } else {
+      // Trunk ingest: dial the relay's listening sender and bind NOTHING. The
+      // listen URL is emptied rather than left at its default so
+      // validate_ingest's "both directions" check catches a body that tried to
+      // hand us a listen URL mid-session, instead of quietly ignoring it.
+      cfg.ingest.rist_listen.clear();
+      cfg.ingest.connect_url = connect_url;
+      cfg.ingest.srp_username = srp_user;
+      cfg.ingest.srp_password = srp_pass;
+    }
     cfg.ingest.buffer_min = buffer_min;
     cfg.ingest.buffer_max = buffer_max;
     cfg.ingest.rtt_min = rtt_min;

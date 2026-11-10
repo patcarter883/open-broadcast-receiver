@@ -284,6 +284,43 @@ If any phase encounters blocking issues:
 
 ---
 
+## 5a. Local patches carried by this vendored copy
+
+This directory is not upstream rist-cpp. Two deltas are applied here and MUST be
+carried forward by whatever replaces it:
+
+| Delta | Where | Why |
+|---|---|---|
+| `sendOOBData` logs + returns false instead of tearing down the receiver | `RISTNet.cpp` | A transient OOB write failure used to destroy the whole receiver mid-session (DECISIONS.md §6) |
+| The wire profile is set on the peer config, not just the settings struct | `RISTNet.cpp` | librist reads `profile` from `rist_peer_config`; leaving it at the default silently downgraded ADVANCED peers |
+
+### 5a.1 SRP client authentication (added with the BYON trunk work)
+
+librist offers SRP in two directions: a **listener** authenticates callers
+against a `ristsrppasswd` verifier file (`rist_enable_eap_srp_2(peer, NULL,
+NULL, lookup_fn, data)`), and a **connecting** peer authenticates itself with a
+username/password pair (`rist_enable_eap_srp_2(peer, user, pass, NULL, NULL)`).
+`rist_parse_address2()` already turns the URL parameters `username=` and
+`password=` (RIST_URL_PARAM_SRP_USERNAME / RIST_URL_PARAM_SRP_PASSWORD) into
+`rist_peer_config.srp_username` / `.srp_password` — but populating a config
+field does nothing on its own, and nothing in this wrapper called
+`rist_enable_eap_srp_2()`. A receiver pointed at an SRP-protected sender
+therefore failed every handshake with no diagnostic beyond "no data".
+
+Delta: after `rist_peer_create()`, both `initReceiver()` and `initSender()` now
+call `rist_enable_eap_srp_2(peer, srp_username, srp_password, NULL, NULL)` when
+the parsed URL supplied both fields, and FAIL the init when only one was
+supplied (a half pair means SRP would silently not be attempted). This is
+exactly what `ristreceiver` and `rist2rist` do after their own
+`rist_peer_create()`. Guarded by `#if HAVE_SRP_SUPPORT`.
+
+Measured on librist 0.2.20 (this host): a connect-mode receiver with
+`?username=<user>&password=<pass>` against an `rist2rist -F <srpfile>` listening
+sender delivers the flow; the same URL with a wrong password delivers 0 bytes
+and logs `[EAP-SRP] Authentication failed`.
+
+---
+
 ## 6. Next Steps
 
 ### Immediate Actions (Week 1)

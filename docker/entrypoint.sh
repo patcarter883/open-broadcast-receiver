@@ -22,10 +22,53 @@ if [ "$#" -gt 0 ]; then
   exec open-broadcast-receiver "$@"
 fi
 
+# ---------------------------------------------------------------------------
+# Relay mode — OBR_RELAY_IN/OBR_RELAY_OUT.
+#
+# A relay is a packet pump, not a receiver: it takes no control port, no token
+# and no bind, so this branch must return before any of the receiver flags are
+# built. Both legs are required together; one alone is a misconfiguration that
+# would otherwise start a process with no second leg and die on its own (or,
+# worse, half-bind). Checked here so the failure is one clear line in the agent's
+# log rather than a receiver argv error three layers down.
+# ---------------------------------------------------------------------------
+if [ -n "${OBR_RELAY_IN:-}" ] || [ -n "${OBR_RELAY_OUT:-}" ]; then
+  if [ -z "${OBR_RELAY_IN:-}" ] || [ -z "${OBR_RELAY_OUT:-}" ]; then
+    echo "entrypoint: relay mode needs BOTH OBR_RELAY_IN and OBR_RELAY_OUT (got OBR_RELAY_IN='${OBR_RELAY_IN:-}' OBR_RELAY_OUT='${OBR_RELAY_OUT:-}')" >&2
+    exit 1
+  fi
+  set -- --relay-in "$OBR_RELAY_IN" --relay-out "$OBR_RELAY_OUT"
+  # The SRP file is mounted into the container by the agent; the path here is
+  # the in-container path.
+  [ -n "${OBR_TRUNK_SRP_FILE:-}" ] && set -- "$@" --relay-srp "$OBR_TRUNK_SRP_FILE"
+  [ -n "${OBR_TRUNK_SECRET:-}" ]   && set -- "$@" --relay-secret "$OBR_TRUNK_SECRET"
+  [ -n "${OBR_TRUNK_AES:-}" ]      && set -- "$@" --relay-aes "$OBR_TRUNK_AES"
+  exec open-broadcast-receiver "$@"
+fi
+
 # Hosted receivers bind 0.0.0.0 inside the container (the container IS the
 # isolation boundary); the node reverse proxy fronts control TLS. A token is
 # always set by the backplane, so this is not the M1.1 no-auth footgun.
-set -- --bind 0.0.0.0 --rist-port 5000
+#
+# Trunk ingest (OBR_TRUNK_URL) flips the media direction only: the receiver
+# dials the relay's listening sender and opens NO RIST listen socket, so
+# --rist-port is omitted entirely rather than passed and ignored. The control
+# plane is unchanged — it still binds 0.0.0.0 and still takes the token.
+if [ -n "${OBR_TRUNK_URL:-}" ]; then
+  set -- --bind 0.0.0.0 --connect-url "$OBR_TRUNK_URL"
+  # SRP client pair for the relay's authenticated sender leg. Both or neither:
+  # the receiver refuses half a pair, so passing one through would only move the
+  # error later. Only meaningful in trunk mode (the listener authenticates its
+  # callers instead), which is why they are inside this branch.
+  if [ -n "${OBR_TRUNK_SRP_USER:-}" ] && [ -n "${OBR_TRUNK_SRP_PASS:-}" ]; then
+    set -- "$@" --srp-user "$OBR_TRUNK_SRP_USER" --srp-pass "$OBR_TRUNK_SRP_PASS"
+  elif [ -n "${OBR_TRUNK_SRP_USER:-}" ] || [ -n "${OBR_TRUNK_SRP_PASS:-}" ]; then
+    echo "entrypoint: OBR_TRUNK_SRP_USER and OBR_TRUNK_SRP_PASS must be set together" >&2
+    exit 1
+  fi
+else
+  set -- --bind 0.0.0.0 --rist-port 5000
+fi
 
 [ -n "${OBR_TOKEN:-}" ]        && set -- "$@" --token "$OBR_TOKEN"
 [ -n "${OBR_PSK:-}" ]          && set -- "$@" --psk "$OBR_PSK"

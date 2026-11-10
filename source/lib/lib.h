@@ -245,6 +245,26 @@ struct standby_config
 struct ingest_config
 {
   std::string rist_listen = "rist://@[::]:5000";
+  // Connect-mode ingest (trunk). Empty = listen mode, as today: the receiver
+  // binds rist_listen and waits for the encoder/relay to dial in. Non-empty =
+  // the receiver DIALS this RIST sender instead (no `@`, so librist creates a
+  // Receiver Peer in connecting mode) and never binds a listen socket.
+  //
+  // Why this exists: a BYON venue sender crosses a relay, and the node's
+  // receiver sits behind its own NAT — nothing can dial it, so it has to be
+  // the caller. Setting BOTH a listen URL and connect_url is a config error
+  // (see validate_config): "try both" would half-bind a port nothing reaches
+  // and mask the mistake.
+  std::string connect_url;
+  // SRP client credentials for the trunk. librist's ONLY client-side mechanism
+  // is the URL's `username=` / `password=` parameters (RIST_URL_PARAM_SRP_USERNAME
+  // / _PASSWORD) — rist_parse_address2 fills rist_peer_config.srp_username /
+  // srp_password from them and RISTNet then enables SRP on the peer. There is no
+  // settings-struct field for them, so unlike the PSK they legitimately ride the
+  // URL; the URL is logged only up to its '?' (see receive.cpp) so they never
+  // reach a log line.
+  std::string srp_username;
+  std::string srp_password;
   int bandwidth = receiver_defaults::bandwidth;
   int buffer_min = receiver_defaults::buffer_min_ms;
   int buffer_max = receiver_defaults::buffer_max_ms;
@@ -548,6 +568,18 @@ auto parse_transcode_target(std::string_view str,
 // (see receive.cpp). The PSK never enters this URL (secrets never enter URLs);
 // it travels via RISTNetReceiverSettings.mPSK.
 auto build_listener_url(const ingest_config& ingest) -> std::string;
+
+// Build the CONNECT-mode URL: the one the receiver dials, for a trunk ingest
+// where a relay's listening sender holds the far end. Same tuning parameters
+// as build_listener_url (including timing-mode=0 — the trunk is a THIRD hop and
+// the ARRIVAL assertion is worse over three, not better: measured on the real
+// chain, see DECISIONS.md §24) but the base keeps NO '@', because '@' means
+// "this end binds" and a connect-mode receiver must not bind anything.
+// Returns an empty string when ingest.connect_url is empty.
+auto build_connect_url(const ingest_config& ingest) -> std::string;
+
+// True when this ingest config dials a peer instead of binding a listener.
+auto ingest_is_connect_mode(const ingest_config& ingest) noexcept -> bool;
 
 // Parse the numeric port from a "rist://@[::]:PORT" / "rist://@host:PORT"
 // listen URL. Returns -1 if it cannot be determined.
