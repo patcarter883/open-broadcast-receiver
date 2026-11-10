@@ -93,9 +93,15 @@ auto encoder_fragment(const std::string& encoder, int bitrate_kbps)
     // bitrate_kbps rendered 46 of 60 frames blank, while the same body at
     // 2500 kbps rendered all 60. The slate is a two-second still looped
     // forever, so its size does not matter and its quality does.
+    // `fast` + `stillimage`, not `ultrafast` + `zerolatency`. The slate is one
+    // still rendered once, so latency does not matter and detail does: ultrafast
+    // disables CABAC and the deblocking filter, which is what makes the caption
+    // and the mark look blocky on a 2.5 Mbps stream. Measured on 1080p: fast is
+    // pixel-identical to medium here and renders the whole 60-frame slate in
+    // 0.34 s, so a small node still lands well inside the 5 s render deadline.
     (void)bitrate_kbps;
     return std::format(
-        "{} pass=qual quantizer=18 speed-preset=ultrafast tune=zerolatency "
+        "{} pass=qual quantizer=14 speed-preset=fast tune=stillimage "
         "key-int-max=1",
         encoder);
   }
