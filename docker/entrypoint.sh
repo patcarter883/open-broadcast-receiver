@@ -38,9 +38,25 @@ if [ -n "${OBR_RELAY_IN:-}" ] || [ -n "${OBR_RELAY_OUT:-}" ]; then
     exit 1
   fi
   set -- --relay-in "$OBR_RELAY_IN" --relay-out "$OBR_RELAY_OUT"
-  # The SRP file is mounted into the container by the agent; the path here is
-  # the in-container path.
-  [ -n "${OBR_TRUNK_SRP_FILE:-}" ] && set -- "$@" --relay-srp "$OBR_TRUNK_SRP_FILE"
+  # SRP: the verifier is generated HERE, in the container that owns the librist
+  # that will validate against it. The node agent has no ristsrppasswd (it is not
+  # a librist image), so asking it for one is a failure the whole relay inherits.
+  # A mounted file still wins when given, for a pre-built verifier.
+  srp_file="${OBR_TRUNK_SRP_FILE:-}"
+  if [ -z "$srp_file" ] && [ -n "${OBR_TRUNK_SRP_USER:-}" ] && [ -n "${OBR_TRUNK_SRP_PASS:-}" ]; then
+    srp_file=/tmp/relay-srp.txt
+    if ! ristsrppasswd "$OBR_TRUNK_SRP_USER" "$OBR_TRUNK_SRP_PASS" > "$srp_file"; then
+      echo "entrypoint: relay needs a usable SRP verifier and ristsrppasswd failed (user='${OBR_TRUNK_SRP_USER}')" >&2
+      exit 1
+    fi
+    chmod 600 "$srp_file"
+  fi
+  if [ -n "$srp_file" ]; then
+    set -- "$@" --relay-srp "$srp_file"
+  else
+    echo "entrypoint: relay mode has no SRP verifier (set OBR_TRUNK_SRP_USER + OBR_TRUNK_SRP_PASS, or OBR_TRUNK_SRP_FILE)" >&2
+    exit 1
+  fi
   [ -n "${OBR_TRUNK_SECRET:-}" ]   && set -- "$@" --relay-secret "$OBR_TRUNK_SECRET"
   [ -n "${OBR_TRUNK_AES:-}" ]      && set -- "$@" --relay-aes "$OBR_TRUNK_AES"
   exec open-broadcast-receiver "$@"

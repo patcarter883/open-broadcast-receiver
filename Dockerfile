@@ -27,8 +27,17 @@ COPY . .
 # No version relaxation: the floor is real now that the base meets it.
 RUN cmake -S . -B build -D CMAKE_BUILD_TYPE=Release -D BUILD_TESTING=OFF \
     && cmake --build build -j"$(nproc)"
+# ristsrppasswd ships WITH the image. A relay's SRP verifier is generated inside
+# the container, by the librist that will validate against it — the node agent is
+# not a librist image and has no such tool (measured: relay_failed, "executable
+# file not found in $PATH"). librist already builds its tools as part of the
+# vendored dependency, so this is an install, not a build; the path is found
+# rather than hardcoded because ExternalProject's layout differs between an
+# in-repo build and this one.
+RUN set -eux; tool="$(find /src -type f -name ristsrppasswd | head -1)"; \
+    test -n "$tool"; install -m 0755 "$tool" /usr/local/bin/ristsrppasswd
 
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS runtime
 # libva2 + mesa-va-drivers are REQUIRED, not optional: the transcode tier prefers
 # vah264enc/vah265enc/vaav1dec (see transcode_encoder_alternatives), and without
 # the VAAPI *driver* those elements exist but fail to initialise -- the tier then
@@ -51,6 +60,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
 RUN printf '%s\n' '# IPv4 first: this image runs on nodes without an IPv6 route.' \
                   'precedence ::ffff:0:0/96 100' > /etc/gai.conf
 COPY --from=build /src/build/open-broadcast-receiver /usr/local/bin/
+COPY --from=build /usr/local/bin/ristsrppasswd /usr/local/bin/
 # The slate's wordmark. fonts-dejavu-core above is REQUIRED, not cosmetic:
 # textoverlay renders nothing without a font, so the slate's caption would be
 # invisible in an image that installed none. The placeholder lives in

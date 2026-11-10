@@ -26,6 +26,13 @@ cat > "${stub_dir}/open-broadcast-receiver" <<'STUB'
 printf '%s\n' "$@"
 STUB
 chmod +x "${stub_dir}/open-broadcast-receiver"
+# The relay generates its own SRP verifier in-container; stub the tool so the
+# test never needs librist on the host. The real tool prints one verifier line.
+cat > "${stub_dir}/ristsrppasswd" <<'SRPSTUB'
+#!/bin/sh
+echo "${1}:c2FsdA==:dmVyaWZpZXI=:3:0"
+SRPSTUB
+chmod +x "${stub_dir}/ristsrppasswd"
 
 fail=0
 expect_arg() {  # $1 = description, $2 = expected arg, $3 = argv dump
@@ -107,6 +114,28 @@ expect_arg "relay srp path" "/run/obr/srp.txt" "${argv}"
 expect_arg "relay secret" "--relay-secret" "${argv}"
 expect_arg "relay secret value" "s3cret" "${argv}"
 expect_arg "relay aes" "--relay-aes" "${argv}"
+
+# Relay with credentials instead of a mounted file: the verifier is generated
+# inside the container. The path is ours (/tmp), not an agent-supplied one.
+argv2=$(env -i PATH="${stub_dir}:${PATH}" \
+       OBR_RELAY_IN=rist://@[::]:5000 OBR_RELAY_OUT=rist://@[::]:6010 \
+       OBR_TRUNK_SRP_USER=trunkuser OBR_TRUNK_SRP_PASS=trunkpass \
+       "${ENTRYPOINT}")
+expect_arg "generated relay srp flag" "--relay-srp" "${argv2}"
+if ! grep -qx "/tmp/relay-srp.txt" <<<"${argv2}"; then
+  echo "FAIL: generated relay SRP path should be /tmp/relay-srp.txt:" >&2
+  sed 's/^/    /' <<<"${argv2}" >&2
+  fail=1
+fi
+
+# Neither a file nor a pair: refusing is the contract, because an SRP-less bound
+# sender on a public port accepts anyone who guesses it.
+if env -i PATH="${stub_dir}:${PATH}" \
+     OBR_RELAY_IN=rist://@[::]:5000 OBR_RELAY_OUT=rist://@[::]:6010 \
+     "${ENTRYPOINT}" >/dev/null 2>&1; then
+  echo "FAIL: relay without any SRP credential must refuse to start" >&2
+  fail=1
+fi
 expect_arg "relay aes value" "128" "${argv}"
 expect_no_arg "relay takes no control bind" "--bind" "${argv}"
 expect_no_arg "relay takes no rist port" "--rist-port" "${argv}"
