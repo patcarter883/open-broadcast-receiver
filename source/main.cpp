@@ -74,7 +74,7 @@ auto print_usage(const char* argv0) -> void
       << "  --relay-srp <path>      RELAY mode: ristsrppasswd file authenticating\n"
       << "                          receivers of the out leg\n"
       << "  --relay-secret <hex>    RELAY mode: AES shared secret for the out leg\n"
-      << "  --relay-aes <128|256>   RELAY mode: out-leg AES key size (256)\n"
+      << "  --relay-aes <128|256>   RELAY mode: AES key size, both legs (256)\n"
       << "  --bind <host>           HTTP bind address (default 127.0.0.1;\n"
       << "                          non-loopback binds REQUIRE a token or the\n"
       << "                          explicit --allow-unauthenticated flag)\n"
