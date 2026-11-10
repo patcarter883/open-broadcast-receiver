@@ -319,6 +319,14 @@ auto run_relay(const relay_config& cfg, log_fn log) -> int
   }
   in_peer_config->profile = RIST_PROFILE_ADVANCED;
   in_peer_config->profile_set = 1;
+  if (!cfg.secret.empty()) {
+    // BOTH legs are public hops, so both decrypt: without this the in leg
+    // receives an encrypted venue stream and drops every packet with
+    // "Receiving encrypted data, but configured without keysize" while the
+    // session reports itself healthy and carries nothing.
+    in_peer_config->key_size = cfg.aes;
+    std::strncpy(in_peer_config->secret, cfg.secret.c_str(), k_max_secret_len);
+  }
   struct rist_peer* in_peer = nullptr;
   const int in_rc =
       rist_peer_create(state.receiver_ctx, &in_peer, in_peer_config);
