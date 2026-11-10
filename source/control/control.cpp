@@ -522,7 +522,14 @@ auto control_server::build_status_json() const -> std::string
   // Session state stays "running" while the session is intact — per-output
   // failure is never session-fatal (§1.3). "error" is reserved for
   // session-level failures (idle_timeout, RIST listener death).
-  out["state"] = last_err.empty() ? "running" : "error";
+  const bool session_running = last_err.empty();
+  out["state"] = session_running ? "running" : "error";
+  // The encoder's held-session watchdog asks for this boolean and refuses to act
+  // on anything else ("receiver status carried no is_running boolean"), so it was
+  // retrying with backoff for the whole session and could never see a receiver
+  // that had died. `state` is the human string; this is the machine answer, and
+  // both are derived from the same value so they cannot disagree.
+  out["is_running"] = session_running;
   out["session_id"] = sid;
   out["uptime_s"] = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::steady_clock::now() - started)
