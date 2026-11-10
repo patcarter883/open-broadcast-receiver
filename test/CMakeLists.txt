@@ -48,6 +48,14 @@ add_executable(control_json_test source/control_json_test.cpp)
 target_link_libraries(control_json_test PRIVATE control_lib Threads::Threads)
 target_compile_features(control_json_test PRIVATE cxx_std_20)
 
+add_executable(connect_url_test source/connect_url_test.cpp)
+target_link_libraries(connect_url_test PRIVATE receiver_lib Threads::Threads)
+target_compile_features(connect_url_test PRIVATE cxx_std_20)
+
+add_executable(relay_srp_test source/relay_srp_test.cpp)
+target_link_libraries(relay_srp_test PRIVATE relay_srp_lib Threads::Threads)
+target_compile_features(relay_srp_test PRIVATE cxx_std_20)
+
 add_executable(rist_counter_test source/rist_counter_test.cpp)
 target_link_libraries(rist_counter_test PRIVATE control_lib receiver_lib
     Threads::Threads)
@@ -67,6 +75,8 @@ add_test(NAME start_parse_test COMMAND start_parse_test)
 add_test(NAME transcode_select_test COMMAND transcode_select_test)
 add_test(NAME source_codec_test COMMAND source_codec_test)
 add_test(NAME control_json_test COMMAND control_json_test)
+add_test(NAME connect_url_test COMMAND connect_url_test)
+add_test(NAME relay_srp_test COMMAND relay_srp_test)
 add_test(NAME rist_counter_test COMMAND rist_counter_test)
 add_test(NAME appsrc_cap_test COMMAND appsrc_cap_test)
 
@@ -159,6 +169,25 @@ if(NOT OBR_TESTS_ONLY)
   # to an RFC1918 destination. Exercises the script against a stubbed binary.
   add_test(NAME entrypoint_args_test
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/harness/entrypoint_args_test.sh)
+
+  # Trunk/relay harness. Drives the SHIPPED receive path in connect mode (not a
+  # bespoke libRIST loop) against the relay mode of the same binary, with a real
+  # ristsender as the venue and SRP on the out leg. Judged by sequence continuity
+  # after the handshake, not by "connected" — see the script's header.
+  add_executable(connect_ingest_probe source/connect_ingest_probe.cpp)
+  target_link_libraries(connect_ingest_probe PRIVATE
+    receive_lib
+    Threads::Threads)
+  target_compile_features(connect_ingest_probe PRIVATE cxx_std_20)
+
+  add_test(NAME relay_trunk_e2e
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/harness/relay_trunk_e2e.sh
+            $<TARGET_FILE:open-broadcast-receiver_exe>
+            $<TARGET_FILE:connect_ingest_probe>)
+  set_tests_properties(relay_trunk_e2e PROPERTIES
+    SKIP_RETURN_CODE 77
+    TIMEOUT 180
+    LABELS "e2e;rist")
 
   # Local RTMP publish harness: drives the real output pipeline against a local
   # nginx-rtmp sink and judges it by the server's own byte count. It publishes,

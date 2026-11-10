@@ -99,6 +99,48 @@ who reaches the port could redirect your stream).
 Restreaming to boxes on your own LAN? Destination validation blocks private
 ranges by default (SSRF hygiene) — opt out with `--egress-allow-private`.
 
+### Trunk ingest (dial a relay instead of listening)
+
+By default the receiver **binds** `--rist-port` and waits for the sender to dial
+in. A BYON venue usually cannot dial a hosted node at all (the venue and the node
+are each behind NAT), so the venue's media crosses a relay and the node's
+receiver **dials the relay's listening sender**:
+
+```sh
+./build/open-broadcast-receiver \
+    --connect-url rist://relay.example.net:6010 \
+    --srp-user "$TRUNK_SRP_USER" --srp-pass "$TRUNK_SRP_PASS" \
+    --token "$RECEIVER_TOKEN"
+```
+
+`--connect-url` replaces the listen socket: the process opens **no** RIST port
+and combining it with an explicit `--rist-port` or with a non-default listen URL
+is refused rather than half-applied. The control plane is unchanged.
+`--srp-user`/`--srp-pass` are the trunk's SRP client credentials, sent in
+librist's own URL parameters (`username=`/`password=`, percent-encoded); the URL
+is never logged past its `?`.
+
+### Relay mode (the trunk bridge itself)
+
+The same binary can run as the relay: receive on one bound RIST leg, send on
+another, forwarding every packet unchanged (no remux, no restamp, sequence
+numbers preserved). It takes **no** control port, no token and no pipeline.
+
+```sh
+./build/open-broadcast-receiver \
+    --relay-in  'rist://@[::]:5000' \
+    --relay-out 'rist://@[::]:6010' \
+    --relay-srp /run/obr/trunk-srp.txt        # ristsrppasswd file for the out leg
+    # optional: --relay-secret "$TRUNK_AES_KEY" --relay-aes 256
+```
+
+Both legs bind (`@` required). The out leg authenticates the node's receiver
+with the SRP file; the AES secret rides the peer config, never the URL. A relay
+that cannot bind either leg exits non-zero instead of pumping into nothing.
+Counters are printed once a second as `relay stats: in_packets=… out_packets=…`.
+`test/harness/relay_trunk_e2e.sh` runs the whole chain and judges it by
+sequence continuity after the handshake.
+
 It then idles until the encoder (or `curl`) issues `POST /start` (schema 3):
 
 ```sh

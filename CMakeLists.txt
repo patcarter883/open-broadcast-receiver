@@ -43,6 +43,10 @@ if(OBR_TESTS_ONLY)
   # the slate is not compiled.
   add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/standby)
 
+  # The relay's SRP-file parser is pure logic and must be testable without a
+  # network; the pump half stays in the full lane (source/relay/CMakeLists.txt).
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/relay)
+
   include(CTest)
   add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/test)
   return()
@@ -64,6 +68,7 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/fanout)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/receive)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/control)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/standby)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/source/relay)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -85,6 +90,7 @@ target_link_libraries(open-broadcast-receiver_exe PRIVATE
   fanout_lib
   receive_lib
   control_lib
+  relay_lib
   ristnet
   PkgConfig::gstreamer
   PkgConfig::gstreamer-app

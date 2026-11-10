@@ -378,6 +378,33 @@ bool RISTNetReceiver::initReceiver(std::vector<std::string> &rURLList,
             destroyReceiver();
             return false;
         }
+
+#if HAVE_SRP_SUPPORT
+        /* SRP client credentials. rist_parse_address2() fills srp_username /
+         * srp_password from the URL's `username=` / `password=` parameters, but
+         * something has to hand them to librist -- the peer config alone does
+         * not enable SRP. ristreceiver/rist2rist do exactly this after
+         * rist_peer_create; without it a receiver pointed at an SRP-protected
+         * sender fails every handshake with no diagnostic beyond "no data".
+         * PATTERNS.md: a trunk out-leg is SRP-protected by default. */
+        if (strlen(mRistPeerConfig.srp_username) > 0
+            && strlen(mRistPeerConfig.srp_password) > 0) {
+            if (rist_enable_eap_srp_2(peer, mRistPeerConfig.srp_username,
+                                      mRistPeerConfig.srp_password, NULL, NULL)) {
+                LOGGER(true, LOGG_ERROR, "rist_receiver_enable_eap_srp fail: " << rURL)
+                destroyReceiver();
+                return false;
+            }
+        } else if ((strlen(mRistPeerConfig.srp_username) > 0)
+                   != (strlen(mRistPeerConfig.srp_password) > 0)) {
+            /* Half a credential pair is a config error, not a downgrade: SRP
+             * would silently not be attempted and the leg would look dead. */
+            LOGGER(true, LOGG_ERROR,
+                   "SRP needs both username and password: " << rURL)
+            destroyReceiver();
+            return false;
+        }
+#endif
     }
 
     if (mRistReceiverSettings.mMaxJitter) {
@@ -739,6 +766,20 @@ bool RISTNetSender::initSender(std::vector<std::tuple<std::string,int>> &rPeerLi
             destroySender();
             return false;
         }
+
+#if HAVE_SRP_SUPPORT
+        /* Same contract as the receiver side above: URL credentials are what a
+         * sender authenticating to an SRP server presents. */
+        if (strlen(mRistPeerConfig.srp_username) > 0
+            && strlen(mRistPeerConfig.srp_password) > 0) {
+            if (rist_enable_eap_srp_2(peer, mRistPeerConfig.srp_username,
+                                      mRistPeerConfig.srp_password, NULL, NULL)) {
+                LOGGER(true, LOGG_ERROR, "rist_sender_enable_eap_srp fail: " << peerURL)
+                destroySender();
+                return false;
+            }
+        }
+#endif
     }
 
     if (mRistSenderSettings.mMaxJitter) {

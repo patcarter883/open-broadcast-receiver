@@ -316,17 +316,27 @@ auto rist_receive::start(const receiver_config& cfg,
     settings.mPSKKeySize = opts.psk_aes;
   }
 
-  const std::string url = build_listener_url(cfg.ingest);
-  log("RIST listening on: " + url.substr(0, url.find('?')) + "\n");
+  const bool connect_mode = ingest_is_connect_mode(cfg.ingest);
+  const std::string url =
+      connect_mode ? build_connect_url(cfg.ingest) : build_listener_url(cfg.ingest);
+  // Trunk (connect) mode dials a relay's listening sender, so it binds nothing
+  // and has no port for anything to reach. Say which direction this listener is
+  // going, once, because "no media yet" looks identical from the stats side.
+  log(connect_mode
+          ? "RIST connecting to: " + url.substr(0, url.find('?')) + "\n"
+          : std::string("RIST listening on: ")
+                + url.substr(0, url.find('?')) + "\n");
 
   wire_receiver();
   std::vector<std::string> urls {url};
   if (!m_receiver->initReceiver(urls, settings)) {
     // The default @[::] dual-stack bind fails outright on IPv6-less hosts
     // (containers without ::, v4-only VPSes). Fall back to the v4 any
-    // address once before giving up.
+    // address once before giving up. Connect mode has no bind to fall back
+    // from: a dial failure is a real failure (wrong host/port, or the relay's
+    // sender leg is not up yet), so it is reported as-is.
     constexpr std::string_view k_v6_any = "rist://@[::]:";
-    if (url.starts_with(k_v6_any)) {
+    if (!connect_mode && url.starts_with(k_v6_any)) {
       const std::string v4_url =
           "rist://@0.0.0.0:" + url.substr(k_v6_any.size());
       log("IPv6 listen failed; retrying on "
