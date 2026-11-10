@@ -907,16 +907,13 @@ auto output::build_pipeline(std::string& err) -> bool
           std::format("srt://{}:{}", m_cfg.pinned_ip, m_cfg.port);
       g_object_set(sink, "uri", uri.c_str(), nullptr);
       if (!m_cfg.key_or_streamid.empty()) {
-        // streamid as a property, not in the URI: URIs are loggable.
-        if (has_property(sink, "streamid")) {
-          g_object_set(sink, "streamid", m_cfg.key_or_streamid.c_str(),
-                       nullptr);
-        } else {
-          const std::string with_id = std::format(
-              "srt://{}:{}?streamid={}",
-              m_cfg.pinned_ip, m_cfg.port, m_cfg.key_or_streamid);
-          g_object_set(sink, "uri", with_id.c_str(), nullptr);
+        // streamid as a property, never in the URI: URIs are loggable.
+        if (!has_property(sink, "streamid")) {
+          gst_object_unref(sink);
+          err = "srtsink without streamid property";
+          return false;
         }
+        g_object_set(sink, "streamid", m_cfg.key_or_streamid.c_str(), nullptr);
       }
       break;
     }
