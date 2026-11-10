@@ -27,7 +27,6 @@
 #include <filesystem>
 #include <format>
 #include <string>
-#include <sys/stat.h>
 #include <string_view>
 
 namespace standby
@@ -223,49 +222,23 @@ auto slate_codec_name(slate_codec cod) -> const char*
   return "h264";
 }
 
-// A VA encoder needs a DRM RENDER node, not just the plugin. Every image we ship
-// carries the VA elements, so presence alone says nothing about the host: a VPS
-// with only /dev/dri/card0 selects vah264enc, encodes, and emits garbage. Measured
-// on such a host: 60 access units, 43 of them a uniform grey card, so the slate
-// published as a flicker while every log line said the slate was ready.
-auto has_drm_render_node() -> bool
-{
-  for (int i = 128; i < 136; ++i) {
-    const auto path = std::format("/dev/dri/renderD{}", i);
-    struct stat st {};
-    if (::stat(path.c_str(), &st) == 0 && S_ISCHR(st.st_mode)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-auto is_va_encoder(std::string_view name) -> bool
-{
-  return name.starts_with("va") && name.ends_with("enc");
-}
-
 auto slate_encoder_alternatives(slate_codec cod) -> std::vector<std::string>
 {
-  // Hardware first, software fallback. The slate is generated once and then
-  // never re-encoded, so unlike the transcode tier a CPU fallback here cannot
-  // be mistaken for a GPU tier that ran: it is a two-second still.
-  //
-  // The VA candidates are dropped outright when the host has no render node,
-  // rather than left to fail at run time: a broken slate is worse than a slow
-  // one, and this is the only branch that cannot be validated by the encoder's
-  // own exit status.
-  const bool va_usable = has_drm_render_node();
+  // SOFTWARE ONLY, on every node. The slate is a two-second still rendered once
+  // at /start and then only replayed, so a hardware encoder buys nothing here —
+  // and it costs correctness: the VA elements ship in every image, so plugin
+  // presence says nothing about the host. A cloud node with only /dev/dri/card0
+  // selected vah264enc, encoded 60 access units, and 43 of them were a uniform
+  // grey card, so the slate reached the destination as a flicker while every log
+  // line said the slate was ready. One deterministic renderer for the whole fleet
+  // removes the entire class, and the CPU cost is 60 ultrafast frames per session.
   switch (cod) {
     case slate_codec::h264:
-      return va_usable ? std::vector<std::string> {"vah264enc", "x264enc"}
-                       : std::vector<std::string> {"x264enc"};
+      return {"x264enc"};
     case slate_codec::h265:
-      return va_usable ? std::vector<std::string> {"vah265enc", "x265enc"}
-                       : std::vector<std::string> {"x265enc"};
+      return {"x265enc"};
     case slate_codec::av1:
-      return va_usable ? std::vector<std::string> {"vaav1enc", "av1enc"}
-                       : std::vector<std::string> {"av1enc"};
+      return {"av1enc"};
   }
   return {};
 }
@@ -452,10 +425,15 @@ auto plan_slate(const slate_request& req,
                         req.encoder_override);
       return std::nullopt;
     }
-    if (is_va_encoder(req.encoder_override) && !has_drm_render_node()) {
+    if (req.encoder_override.starts_with("va")
+        && req.encoder_override.ends_with("enc")) {
+      // Slate generation is software on every node (see
+      // slate_encoder_alternatives). A hardware pin is refused here rather than
+      // honoured: the failure mode is a slate that encodes cleanly and arrives
+      // as a grey flicker, which no exit status reports.
       err = std::format(
-          "slate encoder '{}' needs a DRM render node (/dev/dri/renderD*), and "
-          "this host has none: pin a software encoder instead",
+          "slate encoder '{}' is not supported: the slate is rendered in "
+          "software on every node",
           req.encoder_override);
       return std::nullopt;
     }
