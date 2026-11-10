@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Fail if any tracked file is a compiled binary (ELF/PE/Mach-O)
         run: |
           set -euo pipefail

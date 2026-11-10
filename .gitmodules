@@ -1,0 +1,4 @@
+[submodule "external/rist-cpp"]
+	path = external/rist-cpp
+	url = https://github.com/patcarter883/rist-cpp.git
+	branch = master
