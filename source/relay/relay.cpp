@@ -336,6 +336,23 @@ auto run_relay(const relay_config& cfg, log_fn log) -> int
                  cfg.in_url.c_str());
     return 1;
   }
+  if (!cfg.srp_path.empty()) {
+    // BOTH legs authenticate, not just the out leg. The venue peer is the
+    // untrusted one — it is the customer's encoder on the public internet — so
+    // leaving the in leg without a verifier makes the relay accept the stream
+    // anonymously while refusing (or silently ignoring) its SRP handshake:
+    // measured live, every connecting sender died with "EAP authentication
+    // requested but credentials have not been configured!" and the relay
+    // carried nothing while the session reported itself healthy.
+    const int srp_rc = rist_enable_eap_srp_2(in_peer, nullptr, nullptr,
+                                             &srp_lookup, &state.srp_path);
+    if (srp_rc != 0) {
+      std::fprintf(stderr,
+                   "relay: in leg SRP enabling failed (%d) for %s\n", srp_rc,
+                   cfg.srp_path.c_str());
+      return 1;
+    }
+  }
   say(state, "relay: in leg URL listening mode: " + cfg.in_url + "\n");
 
   // ---- out leg: a bound (listening) sender --------------------------------
