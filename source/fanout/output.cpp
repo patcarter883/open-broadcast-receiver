@@ -907,16 +907,13 @@ auto output::build_pipeline(std::string& err) -> bool
           std::format("srt://{}:{}", m_cfg.pinned_ip, m_cfg.port);
       g_object_set(sink, "uri", uri.c_str(), nullptr);
       if (!m_cfg.key_or_streamid.empty()) {
-        // streamid as a property, not in the URI: URIs are loggable.
-        if (has_property(sink, "streamid")) {
-          g_object_set(sink, "streamid", m_cfg.key_or_streamid.c_str(),
-                       nullptr);
-        } else {
-          const std::string with_id = std::format(
-              "srt://{}:{}?streamid={}",
-              m_cfg.pinned_ip, m_cfg.port, m_cfg.key_or_streamid);
-          g_object_set(sink, "uri", with_id.c_str(), nullptr);
+        // streamid as a property, never in the URI: URIs are loggable.
+        if (!has_property(sink, "streamid")) {
+          gst_object_unref(sink);
+          err = "srtsink without streamid property";
+          return false;
         }
+        g_object_set(sink, "streamid", m_cfg.key_or_streamid.c_str(), nullptr);
       }
       break;
     }
@@ -1539,9 +1536,12 @@ auto output::run_once() -> bool
       confirm_publish();
     }
 
-    // 3) feed: ring → appsrc. The push never blocks, so a stalled sink leaves
-    // this cursor behind and the ring's drop-oldest takes over — ingest never
-    // notices.
+    // 3) feed: ring → appsrc, gated on the appsrc's own level. While the sink
+    // is draining, the gate never closes and the feed runs at ingest rate; once
+    // the queue is pinned at its cap it holds this cursor instead of pushing,
+    // and the ring's per-consumer drop-oldest takes the backlog at TS-packet
+    // boundaries. A hold that outlives the stall window ends the attempt, so
+    // the worker rebuilds this output alone.
     if (m_cfg.transcode.target != transcode_target::none) {
       if (!feed_transcode(video_caps_set)) {
         return true;  // attempt over: flushing appsrc or stopping
@@ -1553,6 +1553,9 @@ auto output::run_once() -> bool
         return true;  // attempt over: flushing appsrc or stopping
       }
       continue;
+    }
+    if (!gate_copy_appsrc()) {
+      return true;  // attempt over: stalled sink, or stopping
     }
     const std::size_t got =
         m_ring.read(m_consumer, buf.data(), buf.size(), k_read_timeout);
@@ -1968,9 +1971,10 @@ auto output::feed_es_audio() -> bool
 }
 
 // Copy feed in ES mode: one video AU per pass from the video es_ring, plus
-// whatever audio the audio es_ring holds. The push never blocks, so a stalled
-// sink leaves this cursor behind and the ring's drop-oldest takes over — the
-// same invariant as the ts path, at AU granularity instead of packet granularity.
+// whatever audio the audio es_ring holds. The video push is gated on the
+// appsrc's level, so a stalled sink holds this cursor and the es_ring's
+// drop-oldest takes over at AU boundaries — the same invariant as the ts path,
+// at AU granularity instead of packet granularity.
 auto output::feed_es_copy() -> bool
 {
   if (!feed_es_audio()) {
@@ -1978,6 +1982,9 @@ auto output::feed_es_copy() -> bool
   }
   if (m_appsrc == nullptr || m_es.video == nullptr || m_es_video_consumer < 0) {
     return !m_stopping.load(std::memory_order_acquire);
+  }
+  if (!gate_copy_appsrc()) {
+    return false;  // attempt over: stalled sink, or stopping
   }
   ++m_feed.iters;
   es_ring::au_meta meta;
@@ -2085,6 +2092,19 @@ auto output::appsrc_drained(GstPad* /*pad*/, GstPadProbeInfo* /*info*/,
   // the feed thread's level check costs one poll interval, not a frame.
   static_cast<output*>(self)->m_feed_cv.notify_all();
   return GST_PAD_PROBE_PASS;
+}
+
+// Copy-tier gate, the transcode path's level check applied to a copy feed.
+// The ring is this tier's dropper, not the appsrc: holding the cursor lets the
+// per-consumer drop-oldest shed the backlog at TS-packet (or AU) boundaries,
+// while a push under block=false would grow the queue without bound.
+auto output::gate_copy_appsrc() -> bool
+{
+  const guint64 cap = gst_app_src_get_max_bytes(GST_APP_SRC(m_appsrc));
+  if (gst_app_src_get_current_level_bytes(GST_APP_SRC(m_appsrc)) < cap) {
+    return true;
+  }
+  return wait_appsrc_drain(cap);
 }
 
 auto output::wait_appsrc_drain(guint64 cap) -> bool

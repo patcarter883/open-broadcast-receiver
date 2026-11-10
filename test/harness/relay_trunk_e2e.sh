@@ -105,9 +105,14 @@ grep -q "Initialized Sender Peer, listening mode" "${work}/relay.log" \
 note "relay bound: in=@:${IN_PORT} out=@:${OUT_PORT} (both listening)"
 
 # ---- venue sender --------------------------------------------------------
+# The relay authenticates BOTH legs (a venue sender is the untrusted end), so
+# the venue sender has to present the same SRP pair the receiver does. The
+# rist tools have no client-side SRP flags — the only channel is the URL
+# parameters librist's parser reads (RIST_URL_PARAM_SRP_USERNAME/_PASSWORD),
+# which is exactly the channel the receiver's connect mode uses.
 ristsender \
   -i "udp://127.0.0.1:${FEED_PORT}" \
-  -o "rist://127.0.0.1:${IN_PORT}?timing-mode=0" \
+  -o "rist://127.0.0.1:${IN_PORT}?timing-mode=0&username=trunkuser&password=trunkpass" \
   -p 2 -S 0 -f 1 \
   > "${work}/sender.log" 2>&1 &
 pids+=("$!")

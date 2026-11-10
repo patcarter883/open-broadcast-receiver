@@ -6,8 +6,8 @@
 // Two halves, in this order:
 //   1. The strings. Every pipeline the renderer can build is asserted for the
 //      elements and properties that make it correct, without running anything:
-//      the encoder choice per codec, the parser, the ES framing caps, the
-//      optional brand overlay, the 2*fps length, and the cache key.
+//      the software-only encoder choice per codec, the parser, the ES framing
+//      caps, the optional brand overlay, the 2*fps length, and the cache key.
 //   2. One real render, at the smallest geometry that proves the chain links
 //      (320x180@2, h264), skipped with an explanation when the box has no
 //      software h264 encoder. It is the only place the GStreamer graph is
@@ -89,11 +89,16 @@ auto test_plan() -> void
   req.out_dir = scratch.string();
 
   // --- h264, hardware present -------------------------------------------
+  // The slate is rendered in software on every node (see
+  // slate_encoder_alternatives): a VA encoder present on the box must not be
+  // chosen, because plugin presence says nothing about the host's render node.
   std::string err;
 
   const auto h264 = standby::plan_slate(req, make_present({"vah264enc", "x264enc"}), err);
   expect(h264.has_value(), "h264 plan builds");
-  expect(h264->encoder == "vah264enc", "h264 prefers the hardware encoder");
+  expect(h264->encoder == "x264enc",
+         "h264 is rendered with the software encoder even when vah264enc "
+         "is present");
 
   const std::string& v = h264->video_pipeline;
   expect(v.find("videotestsrc pattern=black num-buffers=60") != std::string::npos,
@@ -104,7 +109,8 @@ auto test_plan() -> void
   expect(v.find("framerate=30/1") != std::string::npos, "framerate");
   expect(v.find("format=I420") != std::string::npos, "generated as I420");
   expect(v.find("video/x-raw,format=NV12") != std::string::npos,
-         "NV12 before the encoder (the VA encoders accept nothing else)");
+         "NV12 before the encoder (the slate's encoder chain states its sink "
+         "format rather than negotiating it)");
   expect(v.find("gdkpixbufoverlay location=\"/usr/share/open-broadcast/logo.png\" offset-x=40 offset-y=40")
              != std::string::npos,
          "logo overlay at the configured inset");
@@ -113,9 +119,11 @@ auto test_plan() -> void
          "brand overlay, 40 px from the right edge");
   expect(v.find("textoverlay text=\"stream standby\" font-desc=\"Sans 48\"") != std::string::npos,
          "caption");
-  expect(v.find("vah264enc bitrate=1500") != std::string::npos, "h264 encoder");
-  expect(v.find("key-int-max=1") != std::string::npos,
-         "the slate is all-intra: every AU is independently decodable");
+  expect(v.find("x264enc pass=qual quantizer=14 speed-preset=fast "
+                "tune=stillimage key-int-max=1") != std::string::npos,
+         "h264 encoder at constant quality, all-intra");
+  expect(v.find("vah264enc") == std::string::npos,
+         "no VA encoder reaches the h264 slate pipeline");
   expect(v.find("h264parse config-interval=-1") != std::string::npos,
          "h264 parse with SPS/PPS on every keyframe");
   expect(v.find("video/x-h264,stream-format=byte-stream,alignment=au") != std::string::npos,
@@ -146,21 +154,35 @@ auto test_plan() -> void
   expect(a.find("filesink location=\"" + h264->audio_path + "\"") != std::string::npos,
          "audio sink writes the cache path");
 
-  // --- the software fallback and the other two codecs -------------------
+  // --- the same policy for the other two codecs -------------------------
   {
     const auto plan = standby::plan_slate(req, make_present({"x264enc"}), err);
     expect(plan.has_value() && plan->encoder == "x264enc",
-           "software h264 is chosen when the VA encoder is absent");
-    expect(plan->video_pipeline.find("x264enc bitrate=1500") != std::string::npos,
+           "software h264 is the only h264 slate encoder");
+    expect(plan->video_pipeline.find("pass=qual quantizer=14") != std::string::npos,
            "x264 fragment");
+  }
+  // A pinned VA encoder is refused outright: it is the configuration that
+  // produced a grey slate on a node whose render node could not encode.
+  {
+    standby::slate_request pinned = req;
+    pinned.encoder_override = "vah264enc";
+    const auto plan = standby::plan_slate(pinned, make_present({"vah264enc"}), err);
+    expect(!plan.has_value(), "a pinned VA encoder is refused");
+    expect(err.find("software on every node") != std::string::npos,
+           "the refusal says the slate is software-only");
   }
   {
     standby::slate_request h265 = req;
     h265.codec = "h265";
-    const auto plan = standby::plan_slate(h265, make_present({"vah265enc"}), err);
+    const auto plan = standby::plan_slate(h265, make_present({"vah265enc", "x265enc"}), err);
     expect(plan.has_value(), "h265 plan builds");
-    expect(plan->video_pipeline.find("vah265enc bitrate=1500") != std::string::npos,
+    expect(plan->encoder == "x265enc",
+           "h265 is software too, even when vah265enc is present");
+    expect(plan->video_pipeline.find("x265enc pass=qual") != std::string::npos,
            "h265 encoder");
+    expect(plan->video_pipeline.find("vah265enc") == std::string::npos,
+           "no VA encoder reaches the h265 slate pipeline");
     expect(plan->video_pipeline.find("h265parse config-interval=-1") != std::string::npos,
            "h265 parser");
     expect(plan->video_pipeline.find("video/x-h265,stream-format=byte-stream") != std::string::npos,
@@ -221,9 +243,10 @@ auto test_plan() -> void
 
     const auto none = standby::plan_slate(req, present_none, err);
     expect(!none.has_value(), "no encoder installed is a refusal");
-    expect(err.find("vah264enc") != std::string::npos
-               && err.find("x264enc") != std::string::npos,
-           "the reason names the alternatives it tried");
+    expect(err.find("x264enc") != std::string::npos,
+           "the reason names the alternative it tried");
+    expect(err.find("vah264enc") == std::string::npos,
+           "the reason does not offer a hardware encoder");
   }
 
   // --- the cache key ----------------------------------------------------
@@ -245,6 +268,80 @@ auto test_plan() -> void
       expect((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
              "the key is hex");
     }
+  }
+
+  // --- cache pruning -----------------------------------------------------
+  // The cache is one directory per host, so without a bound it grows with every
+  // distinct slate and every per-account brand image for the life of the
+  // container. Prune keeps the most recently used entries inside the caps and
+  // drops the rest; entries touched inside the quiet period are never touched,
+  // because another session may be mid-render.
+  {
+    const std::filesystem::path cache = scratch / "cache";
+    std::filesystem::create_directories(cache);
+    const auto now = std::filesystem::file_time_type::clock::now();
+    const auto touch = [&](const std::filesystem::path& path,
+                           std::chrono::seconds age)
+    {
+      std::ofstream {path} << "es";
+      std::filesystem::last_write_time(path, now - age);
+    };
+    constexpr std::size_t extra = 4;
+    const std::size_t total = standby::k_cache_max_entries + extra;
+    for (std::size_t i = 0; i < total; ++i) {
+      const auto key = std::format("{:016x}", i);
+      // Entry 0 is the oldest; each one after it is a little more recent.
+      const auto age = standby::k_cache_quiet_period
+          + std::chrono::minutes {(total - i) * 5};
+      touch(cache / (key + ".h264"), age);
+      touch(cache / (key + ".aac"), age);
+    }
+    standby::prune_slate_cache(cache.string());
+
+    std::size_t entries = 0;
+    for (const auto& entry : std::filesystem::directory_iterator {cache}) {
+      if (entry.path().extension() == ".h264") {
+        ++entries;
+      }
+    }
+    expect(entries == standby::k_cache_max_entries,
+           "prune keeps exactly the entry cap");
+
+    for (std::size_t i = 0; i < total; ++i) {
+      const auto key = std::format("{:016x}", i);
+      const bool present =
+          std::filesystem::exists(cache / (key + ".h264"))
+          && std::filesystem::exists(cache / (key + ".aac"));
+      // The oldest `extra` entries go, and a removed entry loses both halves:
+      // half a slate is not reusable, so it must not be left behind.
+      expect(present == (i >= extra),
+             "prune evicts oldest-first, both halves of an entry");
+    }
+
+    // The byte cap is the second bound: eight 9 MiB entries are 72 MiB, over
+    // k_cache_max_bytes, so the oldest has to go even though the count fits.
+    for (const auto& entry : std::filesystem::directory_iterator {cache}) {
+      std::filesystem::remove(entry.path());
+    }
+    std::uint64_t bytes = 0;
+    for (std::size_t i = 0; i < standby::k_cache_max_entries; ++i) {
+      const auto key = std::format("{:016x}", i);
+      // resize_file stamps the file, so the age is set afterwards: the byte
+      // cap case is about entries that are old enough to evict.
+      const auto age = standby::k_cache_quiet_period
+          + std::chrono::minutes {(total - i) * 5};
+      touch(cache / (key + ".h264"), age);
+      std::filesystem::resize_file(cache / (key + ".h264"), 9ull * 1024 * 1024);
+      std::filesystem::last_write_time(cache / (key + ".h264"), now - age);
+    }
+    standby::prune_slate_cache(cache.string());
+    for (const auto& entry : std::filesystem::directory_iterator {cache}) {
+      if (entry.is_regular_file()) {
+        bytes += entry.file_size();
+      }
+    }
+    expect(bytes <= standby::k_cache_max_bytes,
+           "prune keeps the directory under the byte cap");
   }
 
   std::filesystem::remove_all(scratch);

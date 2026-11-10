@@ -192,6 +192,9 @@ struct session
   // Why the slate is running below what was asked (render failure reason or
   // "geometry defaulted"). Empty is healthy; /status echoes it verbatim.
   std::string standby_degraded;
+  // The shared slate cache directory this session rendered into, so teardown
+  // can trim what earlier sessions left behind.
+  std::string slate_cache_dir;
 };
 }  // namespace
 
@@ -458,8 +461,8 @@ auto main(int argc, char** argv) -> int
                    "--rist-port or --token\n";
       return 2;
     }
-    std::cerr << "relay: starting " << relay_cfg.in_url << " -> "
-              << relay_cfg.out_url << "\n";
+    std::cerr << "relay: starting " << loggable_endpoint(relay_cfg.in_url)
+              << " -> " << loggable_endpoint(relay_cfg.out_url) << "\n";
     return relay::run_relay(relay_cfg, &stderr_log);
   }
 
@@ -553,6 +556,10 @@ auto main(int argc, char** argv) -> int
     sess.es_audio.reset();
     sess.ring.reset();
     sess.standby_degraded.clear();
+    if (!sess.slate_cache_dir.empty()) {
+      standby::prune_slate_cache(sess.slate_cache_dir);
+      sess.slate_cache_dir.clear();
+    }
   };
 
   // Warn once per process about slate art that was asked for but is not on
@@ -739,6 +746,7 @@ auto main(int argc, char** argv) -> int
         const auto dir = std::filesystem::temp_directory_path(ec)
             / "open-broadcast-slate";
         req.out_dir = dir.string();
+        sess.slate_cache_dir = req.out_dir;
       }
       // The shipped mark is optional: the image may not be installed on a
       // minimal host, and a missing file must cost the slate its logo, never

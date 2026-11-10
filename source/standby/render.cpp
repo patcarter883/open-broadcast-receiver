@@ -549,10 +549,129 @@ auto plan_slate(const slate_request& req,
   return plan;
 }
 
+namespace
+{
+// One cache entry: the two ES files that share a 16-hex key. The audio half is
+// optional on disk (a half-written entry is still prunable).
+struct cache_entry
+{
+  std::filesystem::path files[2];
+  std::uint64_t bytes = 0;
+  // Default-constructed is not "never written": file_time_type's epoch sits
+  // ahead of every real timestamp on this platform, so the flag is explicit.
+  std::filesystem::file_time_type access {};
+  bool stamped = false;
+};
+
+// The entry key of a cache file: the 16-hex stem of <key>.<ext> / <key>.aac.
+// Anything else in the directory is not ours and is left alone.
+auto cache_key_of(const std::filesystem::directory_entry& entry,
+                  std::string& key) -> bool
+{
+  const std::string stem = entry.path().stem().string();
+  if (stem.size() != 16) {
+    return false;
+  }
+  const bool hex = std::ranges::all_of(stem,
+      [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+  if (!hex) {
+    return false;
+  }
+  key = stem;
+  return true;
+}
+
+auto collect_cache_entries(const std::string& dir)
+    -> std::vector<cache_entry>
+{
+  std::vector<cache_entry> entries;
+  std::error_code ec;
+  std::filesystem::directory_iterator it {dir, ec};
+  if (ec) {
+    return entries;
+  }
+  std::vector<std::string> keys;
+  for (const auto& entry : it) {
+    std::string key;
+    std::error_code file_ec;
+    if (!entry.is_regular_file(file_ec) || !cache_key_of(entry, key)) {
+      continue;
+    }
+    auto found = std::ranges::find(keys, key);
+    std::size_t idx = 0;
+    if (found == keys.end()) {
+      keys.push_back(key);
+      entries.push_back(cache_entry {});
+      idx = entries.size() - 1;
+    } else {
+      idx = static_cast<std::size_t>(found - keys.begin());
+    }
+    cache_entry& slot = entries[idx];
+    const std::size_t half = slot.files[0].empty() ? 0 : 1;
+    slot.files[half] = entry.path();
+    slot.bytes += static_cast<std::uint64_t>(entry.file_size(file_ec));
+    const auto written = entry.last_write_time(file_ec);
+    if (!file_ec && (!slot.stamped || written > slot.access)) {
+      slot.access = written;
+      slot.stamped = true;
+    }
+  }
+  return entries;
+}
+}  // namespace
+
+// Keep the most recently used entries within the count and byte caps. Eviction
+// order is last access (written or re-read), so the slate a session is actually
+// using is the last thing to go; anything touched inside k_cache_quiet_period
+// is skipped outright.
+auto prune_slate_cache(const std::string& dir) -> void
+{
+  auto entries = collect_cache_entries(dir);
+  if (entries.empty()) {
+    return;
+  }
+  std::ranges::sort(entries,
+                    [](const cache_entry& a, const cache_entry& b)
+                    { return a.access > b.access; });
+  const auto now = std::filesystem::file_time_type::clock::now();
+  std::size_t kept = 0;
+  std::uint64_t bytes = 0;
+  bool trimming = false;
+  for (const cache_entry& entry : entries) {
+    const bool quiet = now - entry.access > k_cache_quiet_period;
+    if (!trimming) {
+      const bool fits = kept + 1 <= k_cache_max_entries
+          && bytes + entry.bytes <= k_cache_max_bytes;
+      if (fits) {
+        ++kept;
+        bytes += entry.bytes;
+        continue;
+      }
+      // Over a cap. The entry is spare only when nothing has touched it
+      // recently; if it was just used, it stays and the ones behind it go.
+      if (quiet) {
+        trimming = true;
+      } else {
+        ++kept;
+        bytes += entry.bytes;
+        continue;
+      }
+    }
+    if (!quiet) {
+      continue;  // in use: not this prune's to remove
+    }
+    for (const std::filesystem::path& file : entry.files) {
+      if (!file.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(file, ec);
+      }
+    }
+  }
+}
+
 auto render_slate(const slate_request& req, std::string& err)
     -> std::optional<slate_assets>
 {
-  // Before anything probes the registry: gst_element_factory_find finds nothing
   // until GStreamer is initialised, and a caller that never touched the library
   // (a test, a probe) would otherwise be told no encoder is installed. Safe to
   // call repeatedly; main.cpp has usually already done it.
@@ -569,6 +688,22 @@ auto render_slate(const slate_request& req, std::string& err)
   // reusable -- a session that lost only the audio file would otherwise push
   // video into an unnegotiated audio branch for its whole life.
   if (non_empty_file(plan->video_path) && non_empty_file(plan->audio_path)) {
+    // A hit is a use. The stamp is the LRU key, so it is refreshed -- but only
+    // once it has aged past the quiet period: re-writing it on every hit would
+    // make mtime useless as "when this entry was rendered", and nothing inside
+    // the quiet window is evictable anyway.
+    std::error_code touched;
+    const auto now = std::filesystem::file_time_type::clock::now();
+    const auto stamp = [&](const std::string& path)
+    {
+      const auto written = std::filesystem::last_write_time(path, touched);
+      if (!touched && now - written > k_cache_quiet_period) {
+        std::filesystem::last_write_time(path, now, touched);
+      }
+    };
+    stamp(plan->video_path);
+    stamp(plan->audio_path);
+    prune_slate_cache(req.out_dir);
     err.clear();
     return slate_assets {plan->video_path, plan->audio_path};
   }
@@ -598,6 +733,10 @@ auto render_slate(const slate_request& req, std::string& err)
     remove_quietly(plan->audio_path);
     return std::nullopt;
   }
+
+  // The new entry is stamped by the render itself; prune what this /start made
+  // redundant rather than waiting for the next one.
+  prune_slate_cache(req.out_dir);
 
   err.clear();
   return slate_assets {plan->video_path, plan->audio_path};

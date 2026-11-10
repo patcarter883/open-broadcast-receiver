@@ -80,6 +80,12 @@ add_test(NAME relay_srp_test COMMAND relay_srp_test)
 add_test(NAME rist_counter_test COMMAND rist_counter_test)
 add_test(NAME appsrc_cap_test COMMAND appsrc_cap_test)
 
+# The SRP password never reaches a log line. Greps every log sink in source/
+# for a credential, and every logged URL for the query that carries one; see
+# the script's header for the two rules.
+add_test(NAME secret_log_grep
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/harness/secret_log_grep_test.sh)
+
 # GStreamer pipeline-string tests need the media stack, so they are only added
 # outside the tests-only lane (OBR_TESTS_ONLY).
 if(NOT OBR_TESTS_ONLY)
@@ -103,6 +109,24 @@ if(NOT OBR_TESTS_ONLY)
   target_compile_features(audio_branch_test PRIVATE cxx_std_20)
   add_test(NAME audio_branch_test COMMAND audio_branch_test)
   set_tests_properties(audio_branch_test PROPERTIES TIMEOUT 180)
+
+  # copy_stall_test is the regression gate for the copy tier's stall watchdog:
+  # a real RTMP sink (mediamtx) behind a proxy that stops reading, a paced
+  # 10 Mbps TS feed, and a second output that must keep publishing while the
+  # first is rebuilt. Fails on the pre-fix tree by never rebuilding and by
+  # letting the appsrc level grow with the feed.
+  add_executable(copy_stall_test source/copy_stall_test.cpp)
+  target_link_libraries(copy_stall_test PRIVATE
+    fanout_lib
+    PkgConfig::gstreamer
+    PkgConfig::gstreamer-app
+    Threads::Threads)
+  target_compile_features(copy_stall_test PRIVATE cxx_std_20)
+  add_test(NAME copy_stall_test COMMAND copy_stall_test)
+  set_tests_properties(copy_stall_test PROPERTIES
+    SKIP_RETURN_CODE 77
+    TIMEOUT 180
+    LABELS "e2e;media")
 
   # decode_fallback_test exercises decoder selection with real pipelines: it
   # generates AV1 fixtures in-process, forces a hardware refusal (4:4:4 against

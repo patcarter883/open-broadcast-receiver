@@ -633,6 +633,14 @@ auto ingest_is_connect_mode(const ingest_config& ingest) noexcept -> bool
   return !ingest.connect_url.empty();
 }
 
+// The query of a RIST URL carries the SRP credentials (`username=`,
+// `password=`) and the tuning block. Only scheme, host and port are loggable:
+// every log line that names an endpoint goes through this.
+auto loggable_endpoint(std::string_view url) -> std::string
+{
+  return std::string {url.substr(0, url.find('?'))};
+}
+
 auto build_connect_url(const ingest_config& ingest) -> std::string
 {
   if (ingest.connect_url.empty()) {

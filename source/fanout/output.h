@@ -311,6 +311,11 @@ private:
   // Sinks a demux src pad the output does not consume into the drop funnel, so
   // it cannot fail the pipeline with not-linked.
   auto sink_into_drop(GstPad* pad) -> void;
+  // Copy-tier gate: holds the feed's ring cursor while the video appsrc is at
+  // its cap, then defers to wait_appsrc_drain's verdict. Returns false when the
+  // attempt should end (stopping, a stalled sink, or a connect that never
+  // reached publish).
+  auto gate_copy_appsrc() -> bool;
   // Blocks until the video appsrc is below `cap`, bounded by the connect window
   // before this attempt has published and by the stall window after. Returns
   // false when the attempt should end (stopping, a stalled sink, or a connect
