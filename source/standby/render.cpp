@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <format>
 #include <string>
+#include <sys/stat.h>
 #include <string_view>
 
 namespace standby
@@ -222,18 +223,49 @@ auto slate_codec_name(slate_codec cod) -> const char*
   return "h264";
 }
 
+// A VA encoder needs a DRM RENDER node, not just the plugin. Every image we ship
+// carries the VA elements, so presence alone says nothing about the host: a VPS
+// with only /dev/dri/card0 selects vah264enc, encodes, and emits garbage. Measured
+// on such a host: 60 access units, 43 of them a uniform grey card, so the slate
+// published as a flicker while every log line said the slate was ready.
+auto has_drm_render_node() -> bool
+{
+  for (int i = 128; i < 136; ++i) {
+    const auto path = std::format("/dev/dri/renderD{}", i);
+    struct stat st {};
+    if (::stat(path.c_str(), &st) == 0 && S_ISCHR(st.st_mode)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+auto is_va_encoder(std::string_view name) -> bool
+{
+  return name.starts_with("va") && name.ends_with("enc");
+}
+
 auto slate_encoder_alternatives(slate_codec cod) -> std::vector<std::string>
 {
   // Hardware first, software fallback. The slate is generated once and then
   // never re-encoded, so unlike the transcode tier a CPU fallback here cannot
   // be mistaken for a GPU tier that ran: it is a two-second still.
+  //
+  // The VA candidates are dropped outright when the host has no render node,
+  // rather than left to fail at run time: a broken slate is worse than a slow
+  // one, and this is the only branch that cannot be validated by the encoder's
+  // own exit status.
+  const bool va_usable = has_drm_render_node();
   switch (cod) {
     case slate_codec::h264:
-      return {"vah264enc", "x264enc"};
+      return va_usable ? std::vector<std::string> {"vah264enc", "x264enc"}
+                       : std::vector<std::string> {"x264enc"};
     case slate_codec::h265:
-      return {"vah265enc", "x265enc"};
+      return va_usable ? std::vector<std::string> {"vah265enc", "x265enc"}
+                       : std::vector<std::string> {"x265enc"};
     case slate_codec::av1:
-      return {"vaav1enc", "av1enc"};
+      return va_usable ? std::vector<std::string> {"vaav1enc", "av1enc"}
+                       : std::vector<std::string> {"av1enc"};
   }
   return {};
 }
@@ -418,6 +450,13 @@ auto plan_slate(const slate_request& req,
     if (present != nullptr && !present(req.encoder_override.c_str())) {
       err = std::format("slate encoder '{}' is not installed",
                         req.encoder_override);
+      return std::nullopt;
+    }
+    if (is_va_encoder(req.encoder_override) && !has_drm_render_node()) {
+      err = std::format(
+          "slate encoder '{}' needs a DRM render node (/dev/dri/renderD*), and "
+          "this host has none: pin a software encoder instead",
+          req.encoder_override);
       return std::nullopt;
     }
     plan.encoder = req.encoder_override;
