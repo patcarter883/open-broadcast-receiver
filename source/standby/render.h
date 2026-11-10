@@ -4,7 +4,9 @@
 #ifndef OPEN_BROADCAST_RECEIVER_SOURCE_STANDBY_RENDER_H
 #define OPEN_BROADCAST_RECEIVER_SOURCE_STANDBY_RENDER_H
 
+#include <chrono>
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <optional>
 #include <string>
@@ -42,18 +44,18 @@ struct slate_request
   std::string brand_path;      // optional per-account image, top-right
   std::string text = "stream standby";
   std::string out_dir;         // cache directory (created if absent)
-  // Empty = pick the first present encoder, hardware first. Set to pin one
-  // (tests pin the software encoder so a missing VA render node cannot make a
-  // logic test fail).
+  // Empty = the software encoder for the codec. Set to pin one (tests pin it,
+  // and a pinned VA encoder is refused: see plan_slate).
   std::string encoder_override;
 };
 
 auto parse_slate_codec(std::string_view name, slate_codec& out) -> bool;
 auto slate_codec_name(slate_codec cod) -> const char*;
 
-// Encoder alternatives, hardware first. No silent CPU fallback at the *policy*
-// level is not possible here (a slate on the /start path must be able to fall
-// back), so the list carries both and the first present one wins.
+// Encoder alternatives for the slate: software only, on every node. The slate
+// is one still re-encoded once per /start, so a hardware encoder buys nothing
+// and costs correctness (a VA element that is present but cannot encode the
+// host's render node produced a grey flicker no exit status reported).
 auto slate_encoder_alternatives(slate_codec cod) -> std::vector<std::string>;
 
 // The ES parser that terminates each access unit: h264parse / h265parse /
@@ -105,6 +107,22 @@ auto plan_slate(const slate_request& req,
 // a slow or broken encoder must degrade the slate, never the session.
 auto render_slate(const slate_request& req, std::string& err)
     -> std::optional<slate_assets>;
+
+// Cache bounds: the number of slate entries kept, their total size, and how
+// recently an entry must have been used before it may be evicted. An entry is
+// one slate's two ES files (~1-3 MB at 1080p), so the count is what actually
+// bounds a long-lived host and the byte cap is the backstop for 4K slates.
+inline constexpr std::size_t k_cache_max_entries = 8;
+inline constexpr std::uint64_t k_cache_max_bytes = 64ull * 1024 * 1024;
+inline constexpr std::chrono::seconds k_cache_quiet_period {600};
+
+// Bound the shared cache directory. The cache is per host, keyed by geometry/
+// text/branding, so distinct sessions (and a per-account brand image) add
+// entries indefinitely: keep the most recently used k_cache_max_entries within
+// k_cache_max_bytes and drop the rest, oldest access first. Entries touched in
+// the last few minutes are never evicted, so a render in another session cannot
+// have its files deleted underneath it. Safe on a missing or empty directory.
+auto prune_slate_cache(const std::string& dir) -> void;
 
 }  // namespace standby
 
