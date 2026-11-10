@@ -581,6 +581,11 @@ auto build_connect_url(const ingest_config& ingest) -> std::string;
 // True when this ingest config dials a peer instead of binding a listener.
 auto ingest_is_connect_mode(const ingest_config& ingest) noexcept -> bool;
 
+// The part of a RIST URL that may be logged: scheme, host and port, with the
+// query (SRP credentials and tuning) removed. Every log line that names an
+// endpoint goes through this.
+auto loggable_endpoint(std::string_view url) -> std::string;
+
 // Parse the numeric port from a "rist://@[::]:PORT" / "rist://@host:PORT"
 // listen URL. Returns -1 if it cannot be determined.
 auto listen_port_from_url(const std::string& rist_listen) noexcept -> int;

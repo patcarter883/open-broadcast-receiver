@@ -3,6 +3,8 @@
 
 #include "relay/relay.h"
 
+#include "lib/lib.h"
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -314,7 +316,7 @@ auto run_relay(const relay_config& cfg, log_fn log) -> int
       || in_peer_config == nullptr)
   {
     std::fprintf(stderr, "relay: cannot parse --relay-in: %s\n",
-                 cfg.in_url.c_str());
+                 loggable_endpoint(cfg.in_url).c_str());
     return 1;
   }
   in_peer_config->profile = RIST_PROFILE_ADVANCED;
@@ -333,7 +335,7 @@ auto run_relay(const relay_config& cfg, log_fn log) -> int
   std::free(in_peer_config);
   if (in_rc != 0) {
     std::fprintf(stderr, "relay: in leg failed to bind: %s\n",
-                 cfg.in_url.c_str());
+                 loggable_endpoint(cfg.in_url).c_str());
     return 1;
   }
   if (!cfg.srp_path.empty()) {
@@ -353,7 +355,9 @@ auto run_relay(const relay_config& cfg, log_fn log) -> int
       return 1;
     }
   }
-  say(state, "relay: in leg URL listening mode: " + cfg.in_url + "\n");
+  say(state,
+      "relay: in leg URL listening mode: " + loggable_endpoint(cfg.in_url)
+          + "\n");
 
   // ---- out leg: a bound (listening) sender --------------------------------
   if (rist_sender_create(&state.sender_ctx, RIST_PROFILE_ADVANCED, k_flow_id,
@@ -369,7 +373,7 @@ auto run_relay(const relay_config& cfg, log_fn log) -> int
       || out_peer_config == nullptr)
   {
     std::fprintf(stderr, "relay: cannot parse --relay-out: %s\n",
-                 cfg.out_url.c_str());
+                 loggable_endpoint(cfg.out_url).c_str());
     return 1;
   }
   out_peer_config->profile = RIST_PROFILE_ADVANCED;
@@ -386,7 +390,7 @@ auto run_relay(const relay_config& cfg, log_fn log) -> int
   std::free(out_peer_config);
   if (out_rc != 0) {
     std::fprintf(stderr, "relay: out leg failed to bind: %s\n",
-                 cfg.out_url.c_str());
+                 loggable_endpoint(cfg.out_url).c_str());
     return 1;
   }
   if (!cfg.srp_path.empty()) {
@@ -399,7 +403,8 @@ auto run_relay(const relay_config& cfg, log_fn log) -> int
       return 1;
     }
   }
-  say(state, "relay: out leg URL listening mode: " + cfg.out_url
+  say(state, "relay: out leg URL listening mode: "
+                 + loggable_endpoint(cfg.out_url)
                  + " (Initialized Sender Peer, listening mode)\n");
 
   if (rist_start(state.sender_ctx) != 0) {

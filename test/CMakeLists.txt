@@ -80,6 +80,12 @@ add_test(NAME relay_srp_test COMMAND relay_srp_test)
 add_test(NAME rist_counter_test COMMAND rist_counter_test)
 add_test(NAME appsrc_cap_test COMMAND appsrc_cap_test)
 
+# The SRP password never reaches a log line. Greps every log sink in source/
+# for a credential, and every logged URL for the query that carries one; see
+# the script's header for the two rules.
+add_test(NAME secret_log_grep
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/harness/secret_log_grep_test.sh)
+
 # GStreamer pipeline-string tests need the media stack, so they are only added
 # outside the tests-only lane (OBR_TESTS_ONLY).
 if(NOT OBR_TESTS_ONLY)

@@ -461,8 +461,8 @@ auto main(int argc, char** argv) -> int
                    "--rist-port or --token\n";
       return 2;
     }
-    std::cerr << "relay: starting " << relay_cfg.in_url << " -> "
-              << relay_cfg.out_url << "\n";
+    std::cerr << "relay: starting " << loggable_endpoint(relay_cfg.in_url)
+              << " -> " << loggable_endpoint(relay_cfg.out_url) << "\n";
     return relay::run_relay(relay_cfg, &stderr_log);
   }
 

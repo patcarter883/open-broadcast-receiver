@@ -323,9 +323,9 @@ auto rist_receive::start(const receiver_config& cfg,
   // and has no port for anything to reach. Say which direction this listener is
   // going, once, because "no media yet" looks identical from the stats side.
   log(connect_mode
-          ? "RIST connecting to: " + url.substr(0, url.find('?')) + "\n"
-          : std::string("RIST listening on: ")
-                + url.substr(0, url.find('?')) + "\n");
+          ? "RIST connecting to: " + loggable_endpoint(url) + "\n"
+          : std::string("RIST listening on: ") + loggable_endpoint(url)
+                + "\n");
 
   wire_receiver();
   std::vector<std::string> urls {url};
