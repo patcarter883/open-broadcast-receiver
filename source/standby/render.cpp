@@ -86,9 +86,18 @@ auto encoder_fragment(const std::string& encoder, int bitrate_kbps)
         bitrate_kbps);
   }
   if (encoder == "x264enc" || encoder == "x265enc") {
+    // CONSTANT QUALITY, not a rate cap. Every slate frame is a keyframe, so a
+    // bitrate target divides into a per-frame budget that a 1080p intra frame
+    // cannot fit: at the 1500 kbps default that is ~6 KB a frame, and the
+    // encoder spends it and emits a flat grey card. Measured: a /start with no
+    // bitrate_kbps rendered 46 of 60 frames blank, while the same body at
+    // 2500 kbps rendered all 60. The slate is a two-second still looped
+    // forever, so its size does not matter and its quality does.
+    (void)bitrate_kbps;
     return std::format(
-        "{} bitrate={} speed-preset=ultrafast tune=zerolatency key-int-max=1",
-        encoder, bitrate_kbps);
+        "{} pass=qual quantizer=18 speed-preset=ultrafast tune=zerolatency "
+        "key-int-max=1",
+        encoder);
   }
   if (encoder == "vah264enc" || encoder == "vah265enc"
       || encoder == "vaav1enc") {
