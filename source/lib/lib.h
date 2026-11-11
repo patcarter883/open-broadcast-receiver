@@ -543,6 +543,15 @@ struct session_stats
 };
 
 // ---------------------------------------------------------------------------
+// librist log sink: consecutive identical librist lines collapse to the first
+// plus a periodic repeat count (librist emits the same ERROR once a second for
+// as long as the condition holds — e.g. "the peer sent clear communication"
+// during an encoder's keying window — which otherwise floods the container
+// log and hides everything else).
+// ---------------------------------------------------------------------------
+void librist_log_write(const char* msg);
+
+// ---------------------------------------------------------------------------
 // Enum <-> string helpers (docs/CONTRACT.md §3)
 // ---------------------------------------------------------------------------
 
