@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <string>
@@ -1245,4 +1246,36 @@ auto rist_flow_accumulator::reset() -> void
   m_window = rist_flow_delta {};
   m_total = rist_flow_delta {};
   m_samples = 0;
+}
+
+namespace
+{
+std::mutex g_librist_log_mutex;
+std::string g_librist_log_last;
+int g_librist_log_repeats = 0;
+// Every Nth repeat of an unchanged line gets one summary line; 10 keeps a
+// keyed-startup burst at two lines over ~20 s instead of twenty.
+constexpr int k_librist_log_repeat_every = 10;
+}  // namespace
+
+auto librist_log_write(const char* msg) -> void
+{
+  if (msg == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(g_librist_log_mutex);
+  if (g_librist_log_last == msg) {
+    ++g_librist_log_repeats;
+    if (g_librist_log_repeats % k_librist_log_repeat_every != 0) {
+      return;
+    }
+    std::fputs(std::format("(last librist line repeated {} times)\n",
+                           g_librist_log_repeats).c_str(), stderr);
+    std::fflush(stderr);
+    return;
+  }
+  g_librist_log_last = msg;
+  g_librist_log_repeats = 0;
+  std::fputs(msg, stderr);
+  std::fflush(stderr);
 }

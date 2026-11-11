@@ -51,10 +51,7 @@ auto librist_log_cb(void* /*arg*/,
                     enum rist_log_level /*level*/,
                     const char* msg) -> int
 {
-  if (msg != nullptr) {
-    std::fputs(msg, stderr);
-    std::fflush(stderr);
-  }
+  librist_log_write(msg);
   return 0;
 }
 

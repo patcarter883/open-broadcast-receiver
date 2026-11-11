@@ -3,6 +3,7 @@
 
 #include "receive/receive.h"
 
+#include "lib/lib.h"
 #include <chrono>
 #include <string_view>
 #include <cstdint>
@@ -23,9 +24,7 @@ auto librist_log_cb(void* /*arg*/,
                     enum rist_log_level /*level*/,
                     const char* msg) -> int
 {
-  if (msg != nullptr) {
-    std::fputs(msg, stderr);
-  }
+  librist_log_write(msg);
   return 0;
 }
 
