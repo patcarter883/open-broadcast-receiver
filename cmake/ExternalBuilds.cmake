@@ -14,7 +14,10 @@
 # NOTE: external/rist-cpp is a submodule of github.com/patcarter883/rist-cpp, the
 # same repository the encoder pins, so key-size selection, SRP from URL
 # credentials and non-fatal OOB telemetry live in one copy. Initialise it with
-# `git submodule update --init external/rist-cpp`.
+# `git submodule update --init external/rist-cpp`. A builder that clones
+# non-recursively (Komodo's periphery does) must run that init as its pre-build
+# step before `docker build` — the build context carries the submodule contents,
+# not the gitlink.
 
 include(ExternalProject)
 
