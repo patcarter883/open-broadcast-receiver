@@ -1,7 +1,4 @@
 # syntax=docker/dockerfile:1
-# The source label links the GHCR package to this repository, so the package
-# inherits the repository's visibility.
-LABEL org.opencontainers.image.source=https://github.com/patcarter883/open-broadcast-receiver
 # Production receiver image (BACKPLANE §13.9 / FIXPLAN M3). Built by Komodo →
 # GHCR; the node agent runs one container per session with the OBR_* env the
 # entrypoint maps to CLI flags (node/infra/README.md in the backplane repo).
@@ -21,6 +18,10 @@ LABEL org.opencontainers.image.source=https://github.com/patcarter883/open-broad
 # reproducible path pins the digest recorded in docker/base-image.lock.
 ARG BASE_IMAGE=debian:sid
 FROM ${BASE_IMAGE} AS build
+
+# The source label links the GHCR package to this repository, so the package
+# inherits the repository's visibility.
+LABEL org.opencontainers.image.source=https://github.com/patcarter883/open-broadcast-receiver
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential cmake meson ninja-build pkg-config git \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev nlohmann-json3-dev \
