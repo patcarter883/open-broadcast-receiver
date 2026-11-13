@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1
+# The source label links the GHCR package to this repository, so the package
+# inherits the repository's visibility.
+LABEL org.opencontainers.image.source=https://github.com/patcarter883/open-broadcast-receiver
 # Production receiver image (BACKPLANE §13.9 / FIXPLAN M3). Built by Komodo →
 # GHCR; the node agent runs one container per session with the OBR_* env the
 # entrypoint maps to CLI flags (node/infra/README.md in the backplane repo).
