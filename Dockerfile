@@ -20,8 +20,6 @@ ARG BASE_IMAGE=debian:sid
 FROM ${BASE_IMAGE} AS build
 
 # The source label links the GHCR package to this repository, so the package
-# inherits the repository's visibility.
-LABEL org.opencontainers.image.source=https://github.com/patcarter883/open-broadcast-receiver
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     build-essential cmake meson ninja-build pkg-config git \
     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev nlohmann-json3-dev \
@@ -42,6 +40,9 @@ RUN set -eux; tool="$(find /src -type f -name ristsrppasswd | head -1)"; \
     test -n "$tool"; install -m 0755 "$tool" /usr/local/bin/ristsrppasswd
 
 FROM ${BASE_IMAGE} AS runtime
+# inherits the repository's visibility.
+LABEL org.opencontainers.image.source=https://github.com/patcarter883/open-broadcast-receiver
+
 # libva2 + mesa-va-drivers are REQUIRED, not optional: the transcode tier prefers
 # vah264enc/vah265enc/vaav1dec (see transcode_encoder_alternatives), and without
 # the VAAPI *driver* those elements exist but fail to initialise -- the tier then
